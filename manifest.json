@@ -1,0 +1,104 @@
+{
+  "manifest_version": 3,
+  "name": "Smart Citations",
+  "version": "1.11.1",
+  "description": "Smart Citations provides citation autocomplete, BibTeX management, Nextcloud synchronization, and linked Nextcloud project-file import and refresh for Collabtex/Overleaf.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "unlimitedStorage"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*/*"
+      ],
+      "js": [
+        "page-bridge.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN",
+      "include_globs": [
+        "https://collabtex.*/*",
+        "https://overleaf.com/*",
+        "https://*.overleaf.com/*"
+      ]
+    },
+    {
+      "matches": [
+        "https://*/*"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "js": [
+        "bibtex-parser.js",
+        "search-tools.js",
+        "attachments.js",
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "include_globs": [
+        "https://collabtex.*/*",
+        "https://overleaf.com/*",
+        "https://*.overleaf.com/*"
+      ]
+    }
+  ],
+  "action": {
+    "default_title": "Open Smart Citations bibliography manager"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "collabtex-citation-assistant@t-kluge.de",
+      "strict_min_version": "128.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
+  },
+  "host_permissions": [
+    "https://api.crossref.org/*",
+    "https://api.datacite.org/*",
+    "https://doi.org/*"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ],
+    "service_worker": "background.js"
+  },
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*",
+    "file:///*",
+    "<all_urls>"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "pdf-viewer.html",
+        "pdf-viewer.css",
+        "pdf-viewer.js",
+        "attachments.js",
+        "pdf-lib/pdf-lib.min.js",
+        "pdfjs/pdf.mjs",
+        "pdfjs/pdf.worker.mjs",
+        "pdfjs/pdf_viewer.mjs",
+        "pdfjs/pdf_viewer.css",
+        "pdfjs/images/*"
+      ],
+      "matches": [
+        "https://*/*"
+      ]
+    }
+  ]
+}

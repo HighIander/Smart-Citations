@@ -1,0 +1,308 @@
+html, body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #f6f8fa;
+}
+
+#ctca-bib-manager.ctca-standalone-manager {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  display: block;
+  visibility: visible;
+  opacity: 1;
+  pointer-events: auto;
+  background: #f6f8fa;
+}
+
+.ctca-standalone-manager .ctca-manager-dialog {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  transform: none;
+}
+
+.ctca-standalone-manager .ctca-manager-header {
+  min-height: 74px;
+}
+
+.ctca-global-pending {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 4px 10px;
+  color: #9a6700;
+  background: #fff8c5;
+  border: 1px solid #d4a72c;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.ctca-global-pending[hidden] {
+  display: none;
+}
+
+.ctca-global-empty {
+  position: absolute;
+  inset: 39px 0 0;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 10px;
+  padding: 32px;
+  color: #57606a;
+  background: #fff;
+  text-align: center;
+}
+
+.ctca-global-empty[hidden] {
+  display: none;
+}
+
+.ctca-global-empty h3 {
+  margin: 0;
+  color: #24292f;
+  font-size: 18px;
+}
+
+.ctca-global-empty p {
+  max-width: 680px;
+  margin: 0 0 8px;
+  line-height: 1.45;
+}
+
+.ctca-global-empty-add {
+  min-height: 34px;
+  padding: 6px 12px;
+  color: #fff;
+  background: #1f883d;
+  border: 1px solid #1a7f37;
+  border-radius: 5px;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+}
+
+.ctca-global-empty-add:hover {
+  background: #1a7f37;
+}
+
+.ctca-standalone-manager .ctca-manager-list-pane {
+  position: relative;
+}
+
+.ctca-standalone-manager .ctca-manager-list {
+  min-height: 0;
+  overflow: auto;
+}
+
+.ctca-standalone-manager .ctca-manager-update {
+  min-width: 130px;
+}
+
+.ctca-standalone-manager .ctca-manager-details-actionbar {
+  min-height: 46px;
+}
+
+.ctca-standalone-manager.ctca-manager-resizing,
+.ctca-standalone-manager.ctca-manager-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+.ctca-standalone-manager .ctca-manager-row-active {
+  box-shadow: inset 3px 0 0 #0969da;
+}
+
+.ctca-standalone-manager .ctca-manager-row-selected {
+  background: #ddf4ff;
+}
+
+.ctca-standalone-manager .ctca-manager-detail-head {
+  align-items: flex-start;
+}
+
+.ctca-global-dialog-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.ctca-global-dialog-form .ctca-app-dialog-field-wide {
+  grid-column: 1 / -1;
+}
+
+.ctca-global-dialog-doi {
+  grid-column: 1 / -1;
+  padding: 11px;
+  background: #eef7ff;
+  border: 1px solid #80ccff;
+  border-radius: 7px;
+}
+
+.ctca-global-dialog-extra {
+  grid-column: 1 / -1;
+  padding-top: 12px;
+  border-top: 1px solid #d0d7de;
+}
+
+.ctca-global-dialog-extra h3 {
+  margin: 0 0 9px;
+  font-size: 13px;
+}
+
+@media (max-width: 820px) {
+  .ctca-global-dialog-form {
+    grid-template-columns: 1fr;
+  }
+
+  .ctca-global-dialog-form .ctca-app-dialog-field-wide,
+  .ctca-global-dialog-doi,
+  .ctca-global-dialog-extra {
+    grid-column: 1;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  html, body,
+  #ctca-bib-manager.ctca-standalone-manager {
+    background: #0d1117;
+  }
+
+  .ctca-global-empty {
+    color: #8c959f;
+    background: #0d1117;
+  }
+
+  .ctca-global-empty h3 {
+    color: #e6edf3;
+  }
+
+  .ctca-global-dialog-doi {
+    background: #102a43;
+    border-color: #388bfd;
+  }
+}
+
+/* Version 1.7.8: full-workspace standalone empty state. */
+.ctca-standalone-manager .ctca-manager-content {
+  position: relative;
+}
+
+.ctca-global-empty {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 16px;
+  padding: 48px;
+  color: #57606a;
+  background: #fff;
+  text-align: center;
+}
+
+.ctca-global-empty p {
+  max-width: 780px;
+  margin: 0;
+  color: #24292f;
+  font-size: 17px;
+  font-weight: 650;
+  line-height: 1.55;
+}
+
+.ctca-global-empty-add {
+  min-width: 156px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .ctca-global-empty {
+    background: #0d1117;
+  }
+
+  .ctca-global-empty p {
+    color: #e6edf3;
+  }
+}
+
+/* Version 1.8.0 standalone tab workspace. */
+.ctca-standalone-manager .ctca-manager-bibliography-view,
+.ctca-standalone-manager .ctca-manager-body,
+.ctca-standalone-manager .ctca-manager-pdf-view {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+.ctca-standalone-manager .ctca-manager-bibliography-view { overflow: hidden; }
+.ctca-standalone-manager .ctca-manager-pdf-view { display: block; }
+.ctca-standalone-manager .ctca-manager-pdf-view[hidden] { display: none !important; }
+
+/* Version 1.8.5: Nextcloud conflict resolution. */
+.ctca-nextcloud-conflict-list{display:grid;gap:12px;max-height:min(58vh,520px);overflow:auto;padding-right:4px}
+.ctca-nextcloud-conflict{min-width:0;margin:0;padding:11px;border:1px solid #d0d7de;border-radius:7px;background:#f6f8fa}
+.ctca-nextcloud-conflict legend{padding:0 5px;font-weight:750}
+.ctca-nextcloud-conflict-identity{margin-bottom:7px;color:#57606a;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;overflow-wrap:anywhere}
+.ctca-nextcloud-conflict label{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start;gap:8px;margin-top:7px;cursor:pointer}
+.ctca-nextcloud-conflict label span,.ctca-nextcloud-conflict label small{min-width:0;overflow-wrap:anywhere}
+.ctca-nextcloud-conflict label small{display:block;margin-top:2px;color:#57606a}
+.ctca-nextcloud-settings-actions{display:flex;flex-wrap:wrap;gap:8px}
+@media(prefers-color-scheme:dark){.ctca-nextcloud-conflict{background:#161b22;border-color:#30363d}.ctca-nextcloud-conflict-identity,.ctca-nextcloud-conflict label small{color:#8c959f}}
+
+/* Version 1.8.6 local-file permission status. */
+.ctca-local-permission-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px 12px; margin-top:8px; }
+.ctca-local-permission-button { min-height:32px; padding:5px 10px; border:1px solid #b6bec8; border-radius:5px; background:#fff; color:#24292f; cursor:pointer; font:inherit; font-weight:650; }
+.ctca-local-permission-button:hover { background:#eef2f6; }
+.ctca-local-permission-status { min-width:0; color:#9a6700; font-size:11px; overflow-wrap:anywhere; }
+.ctca-local-permission-status.ctca-local-permission-granted { color:#1a7f37; }
+@media (prefers-color-scheme: dark) {
+  .ctca-local-permission-button { color:#e6edf3; background:#0d1117; border-color:#484f58; }
+  .ctca-local-permission-button:hover { background:#21262d; }
+  .ctca-local-permission-status { color:#d29922; }
+  .ctca-local-permission-status.ctca-local-permission-granted { color:#3fb950; }
+}
+
+
+/* Version 1.9.9: shared empty-state start actions. */
+.ctca-global-empty.ctca-bibliography-empty-start {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 36px;
+}
+.ctca-global-empty.ctca-bibliography-empty-start[hidden] { display: none !important; }
+.ctca-global-empty.ctca-bibliography-empty-start > strong {
+  color: #24292f;
+  font-size: 18px;
+}
+.ctca-global-empty.ctca-bibliography-empty-start > p {
+  max-width: 680px;
+  margin: 0;
+  color: #57606a;
+  font-size: 13px;
+  font-weight: 400;
+}
+@media (prefers-color-scheme: dark) {
+  .ctca-global-empty.ctca-bibliography-empty-start > strong { color: #e6edf3; }
+  .ctca-global-empty.ctca-bibliography-empty-start > p { color: #8c959f; }
+}
+
+/* Version 1.10.4: bulk Nextcloud conflict choices. */
+.ctca-nextcloud-conflict-bulk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 12px;
+}

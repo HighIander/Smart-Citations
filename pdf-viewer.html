@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PDF viewer and annotation editor</title>
+  <link rel="stylesheet" href="pdfjs/pdf_viewer.css">
+  <link rel="stylesheet" href="pdf-viewer.css">
+</head>
+<body>
+  <header class="pv-toolbar" aria-label="PDF tools">
+    <div class="pv-toolbar-group pv-navigation" aria-label="Page navigation">
+      <button id="pv-prev" type="button" title="Previous page" aria-label="Previous page">◀</button>
+      <label>Page <input id="pv-page" type="number" min="1" value="1" aria-label="Page number"> / <span id="pv-pages">—</span></label>
+      <button id="pv-next" type="button" title="Next page" aria-label="Next page">▶</button>
+    </div>
+    <div class="pv-toolbar-group pv-zoom-tools" aria-label="Zoom controls">
+      <button id="pv-zoom-out" type="button" title="Zoom out" aria-label="Zoom out">−</button>
+      <span id="pv-zoom">100%</span>
+      <button id="pv-zoom-in" type="button" title="Zoom in" aria-label="Zoom in">+</button>
+      <button id="pv-fit" type="button" title="Fit page width">Fit width</button>
+    </div>
+    <span class="pv-separator" aria-hidden="true"></span>
+    <div class="pv-toolbar-group pv-editor-tools" role="group" aria-label="PDF annotation tools">
+      <button type="button" class="pv-mode pv-mode-active" data-mode="select" title="Select text and existing annotations">Select</button>
+      <button type="button" class="pv-mode" data-mode="highlight" title="Select text to highlight it">Highlight</button>
+      <button type="button" class="pv-mode" data-mode="text" title="Click on the PDF to insert visible text">Insert text</button>
+      <button type="button" class="pv-mode" data-mode="comment" title="Click on the PDF to add a sticky-note comment">Comment <span id="pv-comment-count" class="pv-comment-count" hidden>0</span></button>
+      <button type="button" class="pv-mode" data-mode="draw" title="Draw directly on the PDF">Draw</button>
+      <label class="pv-color-label" title="Color for the active annotation tool"><span>Color</span><input id="pv-color" type="color" value="#fff066" aria-label="Annotation color"></label>
+      <label class="pv-thickness-label" title="Line or free-highlight thickness"><span>Width</span><input id="pv-thickness" type="range" min="1" max="20" step="1" value="3" aria-label="Annotation width"></label>
+    </div>
+    <span class="pv-toolbar-spacer"></span>
+    <div class="pv-toolbar-group pv-history-tools" aria-label="Edit and save controls">
+      <button id="pv-undo" type="button" title="Undo annotation change" disabled>Undo</button>
+      <button id="pv-redo" type="button" title="Redo annotation change" disabled>Redo</button>
+      <button id="pv-save" type="button" class="pv-save" title="Save annotations into the PDF" disabled>Save PDF</button>
+      <span id="pv-dirty" class="pv-dirty" hidden>Unsaved</span>
+    </div>
+  </header>
+
+  <div class="pv-workspace">
+    <div id="pv-container" role="main" tabindex="0" aria-label="PDF document">
+      <div id="pv-viewer" class="pdfViewer"></div>
+    </div>
+    <aside id="pv-comments" class="pv-comments" aria-label="PDF comments" hidden>
+      <header class="pv-comments-header">
+        <div><strong>Comments</strong><small id="pv-comments-summary">No comments</small></div>
+        <button id="pv-comments-close" type="button" title="Close comments pane" aria-label="Close comments pane">×</button>
+      </header>
+      <div id="pv-comments-list" class="pv-comments-list"></div>
+      <section id="pv-comment-editor" class="pv-comment-editor" hidden>
+        <div class="pv-comment-editor-meta"><span id="pv-comment-page"></span><span id="pv-comment-author"></span></div>
+        <label for="pv-comment-text">Comment</label>
+        <textarea id="pv-comment-text" rows="7" placeholder="Enter the comment text…"></textarea>
+        <div class="pv-comment-editor-actions">
+          <button id="pv-comment-delete" type="button">Delete</button>
+          <button id="pv-comment-done" type="button" class="pv-comment-done">Done</button>
+        </div>
+      </section>
+    </aside>
+  </div>
+
+  <div id="pv-status" role="status">Loading PDF…</div>
+
+  <script src="attachments.js"></script>
+  <script src="pdf-lib/pdf-lib.min.js"></script>
+  <script type="module" src="pdf-viewer.js"></script>
+</body>
+</html>

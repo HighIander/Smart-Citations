@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Global Bibliography — Smart Citations</title>
+  <link rel="stylesheet" href="content.css">
+  <link rel="stylesheet" href="manager.css">
+</head>
+<body>
+  <div id="ctca-bib-manager" class="ctca-manager-visible ctca-standalone-manager" aria-hidden="false">
+    <section class="ctca-manager-dialog" role="application" aria-labelledby="ctca-manager-title">
+      <header class="ctca-manager-header">
+        <div>
+          <h2 id="ctca-manager-title">Global Bibliography</h2>
+          <div class="ctca-manager-subtitle">Browse, edit, synchronize, and reuse BibTeX entries</div>
+        </div>
+        <div class="ctca-manager-header-actions">
+          <label class="ctca-manager-global-sync" title="Synchronize the global bibliography BibTeX file with Nextcloud in the background.">
+            <input type="checkbox" class="ctca-manager-global-sync-checkbox" role="switch">
+            <span class="ctca-manager-global-sync-track" aria-hidden="true"><span></span></span>
+            <span class="ctca-manager-global-sync-label">Sync with Nextcloud</span>
+          </label>
+          <button type="button" class="ctca-manager-cloud-settings" aria-label="Configure Nextcloud and PDF storage" title="Configure Nextcloud and PDF storage">☁</button>
+          <button type="button" class="ctca-manager-close" aria-label="Close global bibliography manager" title="Close tab">×</button>
+        </div>
+      </header>
+
+      <nav class="ctca-manager-tabs" role="tablist" aria-label="Bibliography and PDF tabs" hidden>
+        <button type="button" class="ctca-manager-tab ctca-manager-tab-active" data-tab-id="bibliography" role="tab" aria-selected="true">Bibliography</button>
+        <span class="ctca-manager-tab-spacer"></span>
+      </nav>
+
+      <section class="ctca-manager-view ctca-manager-bibliography-view" data-view-id="bibliography">
+      <div class="ctca-manager-body">
+        <aside class="ctca-manager-categories" aria-label="Bibliography categories">
+          <div class="ctca-manager-categories-head">
+            <strong>Categories</strong>
+            <button type="button" class="ctca-manager-add-category" title="Create category" aria-label="Create category">+</button>
+          </div>
+          <div class="ctca-manager-category-tree"></div>
+        </aside>
+        <div class="ctca-manager-resizer ctca-manager-resizer-categories" role="separator" aria-orientation="vertical" tabindex="0" title="Drag to resize the category pane"></div>
+
+        <div class="ctca-manager-workspace">
+          <div class="ctca-manager-topline">
+          <div class="ctca-manager-searchbar">
+            <div class="ctca-manager-add-menu-wrap">
+              <button type="button" class="ctca-manager-add-entry" title="Add or import bibliography entries" aria-label="Add or import bibliography entries" aria-haspopup="menu" aria-expanded="false">+</button>
+              <div class="ctca-manager-add-menu" role="menu" aria-label="Add bibliography content">
+                <button type="button" class="ctca-manager-add-new-entry" role="menuitem">Add new entry</button>
+                <button type="button" class="ctca-manager-import-bib" role="menuitem">Import BibTeX file</button>
+              </div>
+            </div>
+            <div class="ctca-manager-search-wrap">
+  <label for="ctca-manager-search-input">Search</label>
+  <span class="ctca-manager-search-composite">
+    <span class="ctca-manager-search-input-wrap">
+      <input id="ctca-manager-search-input" type="search" class="ctca-manager-search" placeholder="Search text or use operators. Press ‘/’ for assistance." autocomplete="off">
+      <button type="button" class="ctca-manager-search-details" aria-expanded="false" aria-label="Open search and filter menu" title="Search operators and filters">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10M8 4v6M16 14v6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="16" cy="7" r="2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="8" cy="17" r="2" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+      </button>
+      <button type="button" class="ctca-manager-search-clear" aria-label="Clear search" title="Clear search" hidden>×</button>
+    </span>
+    <span class="ctca-manager-search-menu-wrap">
+      <span class="ctca-manager-search-menu" hidden role="dialog" aria-label="Search operators and filters">
+        <span class="ctca-search-tip"><strong>TIP:</strong> Type an operator in the search field or select it below.</span>
+        <span class="ctca-search-section">
+          <strong>Search operators</strong>
+          <em>Operators can be combined with field operators.</em>
+          <span class="ctca-search-chip-grid">
+            <button type="button" data-search-insert='""' data-search-cursor-back="1"><b>“</b><span>Exact phrase</span></button>
+            <button type="button" data-search-insert="!"><b>!</b><span>Exclude</span></button>
+          </span>
+        </span>
+        <span class="ctca-search-section">
+          <strong>Field search</strong>
+          <span class="ctca-search-field-chips">
+            <button type="button" data-search-insert="title:">title:</button>
+            <button type="button" data-search-insert="author:">author:</button>
+            <button type="button" data-search-insert="year:">year:</button>
+            <button type="button" data-search-insert="abstract:">abstract:</button>
+            <button type="button" data-search-insert="pdf:">pdf:</button>
+            <button type="button" data-search-insert="tag:">tag:</button>
+            <button type="button" data-search-insert="citekey:">citekey:</button>
+            <button type="button" data-search-insert="journal:">journal:</button>
+            <button type="button" data-search-insert="doi:">doi:</button>
+            <button type="button" data-search-insert="type:">type:</button>
+            <button type="button" data-search-insert="category:">category:</button>
+          </span>
+        </span>
+        <span class="ctca-search-section ctca-search-includes">
+          <strong>Include/exclude from unqualified search</strong>
+          <label><span>Abstract</span><input type="checkbox" class="ctca-search-include-abstract" checked></label>
+          <label><span>PDF text / PDF-related fields</span><input type="checkbox" class="ctca-search-include-pdf"></label>
+        </span>
+        <span class="ctca-search-section ctca-search-filters">
+          <span class="ctca-search-filter-heading"><strong>Filters</strong><button type="button" class="ctca-search-clear-filters">Clear filters</button></span>
+          <span class="ctca-search-filter-grid">
+            <label><span>Entry type</span><select class="ctca-search-filter-type"><option value="">Any type</option></select></label>
+            <label><span>Year from</span><input class="ctca-search-filter-year-from" inputmode="numeric" maxlength="4" placeholder="Any"></label>
+            <label><span>Year to</span><input class="ctca-search-filter-year-to" inputmode="numeric" maxlength="4" placeholder="Any"></label>
+            <label><span>DOI</span><select class="ctca-search-filter-doi"><option value="any">Any</option><option value="with">With DOI</option><option value="without">Without DOI</option></select></label>
+            <label><span>Tags</span><select class="ctca-search-filter-tagged"><option value="any">Any</option><option value="tagged">Tagged</option><option value="untagged">Untagged</option></select></label>
+          </span>
+        </span>
+        <span class="ctca-search-help"><kbd>↑</kbd><kbd>↓</kbd> Navigate <kbd>Enter</kbd> Use <kbd>Esc</kbd> Close</span>
+      </span>
+    </span>
+  </span>
+</div>
+          </div>
+          <div class="ctca-manager-details-actionbar ctca-manager-top-actions">
+            <button type="button" class="ctca-manager-update-all-doi" title="Update every global entry that contains a DOI">🌐 Update all from DOI</button>
+            <button type="button" class="ctca-manager-update" title="Export all global entries as a BibTeX file">
+              <span class="ctca-manager-update-main">Export as bib file</span>
+              <span class="ctca-manager-update-files">global-bibliography.bib</span>
+            </button>
+            <button type="button" class="ctca-manager-collapse-details" title="Collapse detail pane" aria-label="Collapse detail pane">▶</button>
+          </div>
+          </div>
+
+          <div class="ctca-manager-content">
+            <div class="ctca-manager-list-column">
+              <div class="ctca-manager-selection-actionbar" hidden>
+                <button type="button" class="ctca-manager-update-selected" title="Update the selected entries from DOI metadata">🌐 Update selected</button>
+                <button type="button" class="ctca-manager-remove-selected" title="Remove the selected entries from the global database">Remove selected</button>
+              </div>
+              <aside class="ctca-manager-list-pane">
+                <div class="ctca-manager-table-head" role="row">
+                  <label class="ctca-manager-select-visible" title="Select or clear all currently visible entries"><input type="checkbox" class="ctca-manager-select-visible-checkbox"> Select</label>
+                  <button type="button" data-manager-sort="author" title="Sort by first author">Title / authors <span>↕</span></button>
+                  <button type="button" data-manager-sort="year" title="Sort by year">Year <span>↕</span></button>
+                  <button type="button" data-manager-sort="key" title="Sort by citation key">Citation key <span>↕</span></button>
+                </div>
+                <div class="ctca-manager-list" role="listbox" aria-label="Global BibTeX entries" aria-multiselectable="true"></div>
+              </aside>
+            </div>
+
+            <div class="ctca-manager-resizer ctca-manager-resizer-details" role="separator" aria-orientation="vertical" tabindex="0" title="Drag to resize the list and details panes"></div>
+
+            <div class="ctca-manager-details-column">
+              <section class="ctca-manager-details" aria-label="BibTeX entry details">
+                <div class="ctca-manager-empty-details">Select a bibliography entry.</div>
+              </section>
+            </div>
+
+            <div class="ctca-global-empty ctca-bibliography-empty-start" hidden role="status">
+              <strong>Get started with your bibliography</strong>
+              <p>Import a BibTeX file or restore the global bibliography from an existing Nextcloud backup.</p>
+              <div class="ctca-bibliography-empty-actions">
+                <button type="button" class="ctca-global-empty-upload">Upload a .bib file</button>
+                <button type="button" class="ctca-global-empty-nextcloud">Sync with existing Nextcloud backup</button>
+                <button type="button" class="ctca-global-empty-add">+ Add new entry</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="ctca-category-context-menu" hidden role="menu">
+        <button type="button" class="ctca-category-remove" role="menuitem">Remove category…</button>
+      </div>
+
+      </section>
+
+      <section class="ctca-manager-view ctca-manager-pdf-view" data-view-id="pdf" hidden>
+        <div class="ctca-pdf-layout">
+          <section class="ctca-pdf-viewer-pane">
+            <div class="ctca-pdf-toolbar"><strong class="ctca-pdf-tab-title">PDF</strong><span class="ctca-pdf-provider"></span><button type="button" class="ctca-pdf-download">Download</button><button type="button" class="ctca-pdf-fullscreen" title="Maximize PDF view" aria-label="Maximize PDF view" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="ctca-pdf-icon-expand" d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5M4 4l6 6M20 4l-6 6M4 20l6-6M20 20l-6-6"/><path class="ctca-pdf-icon-reduce" d="M3 3l6 6M9 5v4H5M21 3l-6 6M15 5v4h4M3 21l6-6M9 19v-4H5M21 21l-6-6M15 19v-4h4"/></svg></button></div>
+            <iframe class="ctca-pdf-frame" title="PDF viewer"></iframe>
+            <div class="ctca-pdf-unavailable" hidden></div>
+          </section>
+          <div class="ctca-pdf-resizer ctca-pdf-resizer-notes" role="separator" aria-orientation="vertical" tabindex="0"></div>
+          <section class="ctca-pdf-notes-pane">
+            <div class="ctca-pdf-pane-head">
+              <strong>PDF notes</strong>
+              <button type="button" class="ctca-pdf-collapse-notes" title="Collapse PDF notes" aria-label="Collapse PDF notes" aria-expanded="true">▶</button>
+            </div>
+            <div class="ctca-pdf-notes-content">
+              <label class="ctca-pdf-note-label"><span>Note</span><textarea class="ctca-pdf-note" rows="10" placeholder="Notes for this PDF are saved automatically."></textarea></label>
+            </div>
+          </section>
+          <button type="button" class="ctca-pdf-restore-notes" title="Expand notes pane" aria-label="Expand notes pane">◀</button>
+          <div class="ctca-pdf-resizer ctca-pdf-resizer-details" role="separator" aria-orientation="vertical" tabindex="0"></div>
+          <aside class="ctca-pdf-entry-pane">
+            <div class="ctca-pdf-entry-pane-head"><strong>Entry details</strong><button type="button" class="ctca-pdf-collapse-details" title="Collapse entry details" aria-label="Collapse entry details">▶</button></div>
+            <div class="ctca-pdf-entry-details"></div>
+          </aside>
+          <button type="button" class="ctca-pdf-restore-details" title="Expand entry details" aria-label="Expand entry details">◀</button>
+        </div>
+      </section>
+
+      <footer class="ctca-manager-footer">
+        <div class="ctca-manager-footer-main">
+          <div class="ctca-manager-status" aria-live="polite"></div>
+          <div class="ctca-manager-progress" hidden>
+            <span class="ctca-manager-progress-label"></span>
+            <progress class="ctca-manager-progress-bar" value="0" max="1"></progress>
+            <button type="button" class="ctca-manager-abort-doi">Abort DOI update</button>
+          </div>
+        </div>
+        <div class="ctca-manager-count"></div>
+      </footer>
+    </section>
+  </div>
+
+  <div id="ctca-app-dialog" aria-hidden="true">
+    <div class="ctca-app-dialog-backdrop"></div>
+    <section class="ctca-app-dialog-card" role="dialog" aria-modal="true" aria-labelledby="ctca-app-dialog-title">
+      <button type="button" class="ctca-app-dialog-close" aria-label="Close dialog" title="Close">×</button>
+      <h2 id="ctca-app-dialog-title"></h2>
+      <div class="ctca-app-dialog-message"></div>
+      <div class="ctca-app-dialog-controls"></div>
+      <div class="ctca-app-dialog-actions"></div>
+    </section>
+  </div>
+
+  <script src="bibtex-parser.js"></script>
+  <script src="search-tools.js"></script>
+  <script src="attachments.js"></script>
+  <script src="manager.js"></script>
+</body>
+</html>
