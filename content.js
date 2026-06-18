@@ -782,19 +782,19 @@
       <section class="ctca-manager-dialog" role="dialog" aria-modal="true" aria-labelledby="ctca-manager-title">
         <header class="ctca-manager-header">
           <div>
-            <h2 id="ctca-manager-title">Bibliography</h2>
-            <div class="ctca-manager-subtitle">Browse, edit, synchronize, and reuse BibTeX entries</div>
+            <h2 id="ctca-manager-title">Smart Citations: TeX-document bibliography</h2>
+            <div class="ctca-manager-subtitle">Browse, edit, read, comment, annotate, synchronize, and reuse BibTeX entries in Overleaf and CollabTeX</div>
           </div>
           <div class="ctca-manager-header-actions">
             <label class="ctca-manager-global-sync" title="Keep this project's bibliography synchronized with the Smart Citations database. Global data wins only when both sides changed the same entry.">
               <input type="checkbox" class="ctca-manager-global-sync-checkbox" role="switch">
               <span class="ctca-manager-global-sync-track" aria-hidden="true"><span></span></span>
-              <span class="ctca-manager-global-sync-label">Sync with database</span>
+              <span class="ctca-manager-global-sync-label">Sync with Smart Citations central database</span>
             </label>
             <label class="ctca-manager-global-sync ctca-manager-nextcloud-sync ctca-nextcloud-disconnected" title="Connect to Nextcloud first to enable database synchronization.">
               <input type="checkbox" class="ctca-manager-nextcloud-sync-checkbox" role="switch" disabled>
               <span class="ctca-manager-global-sync-track" aria-hidden="true"><span></span></span>
-              <span class="ctca-manager-global-sync-label">Sync database with Nextcloud</span>
+              <span class="ctca-manager-global-sync-label">Sync central database with Nextcloud</span>
             </label>
             <button type="button" class="ctca-manager-cloud-settings" aria-label="Configure Nextcloud and PDF storage" title="Configure Nextcloud and PDF storage">☁</button>
             <button type="button" class="ctca-manager-close" aria-label="Close bibliography manager" title="Close">×</button>
@@ -914,7 +914,7 @@
               </div>
               <div class="ctca-bibliography-empty-start" hidden role="status">
                 <strong>Get started with your bibliography</strong>
-                <p>Import a BibTeX file or restore the global bibliography from an existing Nextcloud backup.</p>
+                <p>Import a BibTeX file, restore the bibliography from an existing Nextcloud backup, or get started by adding your first entry.</p>
                 <div class="ctca-bibliography-empty-actions">
                   <button type="button" class="ctca-bibliography-empty-upload">Upload a .bib file</button>
                   <button type="button" class="ctca-bibliography-empty-nextcloud">Sync with existing Nextcloud backup</button>
