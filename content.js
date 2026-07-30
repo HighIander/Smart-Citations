@@ -5075,7 +5075,12 @@
         danger: true
       });
       if (result) {
-        await globalThis.CollabTeXAttachmentStore.remove(attachment.id);
+        try {
+          await globalThis.CollabTeXAttachmentStore.remove(attachment.id);
+        } catch (error) {
+          managerSetStatus(`The attachment was kept because its file could not be deleted: ${error?.message || String(error)}`, true);
+          return;
+        }
         managerOpenPdfTabs.delete(`pdf:${attachment.id}`);
         if (managerWorkspaceTab === `pdf:${attachment.id}`) await managerActivatePdfTab("bibliography");
         await managerRenderPdfAttachmentList(draft);
