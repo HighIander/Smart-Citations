@@ -3530,7 +3530,12 @@
       });
       if (!confirmed) return;
       setStatus(`Removing attachments for ${entry.key}…`);
-      await globalThis.CollabTeXAttachmentStore.removeForEntries([entry]);
+      try {
+        await globalThis.CollabTeXAttachmentStore.removeForEntries([entry]);
+      } catch (error) {
+        setStatus(`The entry was kept because its attachments could not be deleted: ${error?.message || String(error)}`, true);
+        return;
+      }
       removeEntryKeys([entry.key]);
       await saveDatabase(`Removed ${entry.key}.`);
       await propagateRemovedEntriesToNextcloud([entry]);
@@ -3604,7 +3609,12 @@
         buttons: [{ label: "Keep PDF", value: false }, { label: "Remove PDF", value: true, danger: true }], closeValue: false, danger: true
       });
       if (confirmed) {
-        await globalThis.CollabTeXAttachmentStore.remove(attachment.id);
+        try {
+          await globalThis.CollabTeXAttachmentStore.remove(attachment.id);
+        } catch (error) {
+          setStatus(`The attachment was kept because its file could not be deleted: ${error?.message || String(error)}`, true);
+          return;
+        }
         await closePdfTab(`pdf:${attachment.id}`);
         await renderAttachmentList(entry);
       }
@@ -3832,7 +3842,12 @@
     });
     if (!confirmed) return;
     setStatus(`Removing attachments for ${count} entries…`);
-    await globalThis.CollabTeXAttachmentStore.removeForEntries(removedEntries);
+    try {
+      await globalThis.CollabTeXAttachmentStore.removeForEntries(removedEntries);
+    } catch (error) {
+      setStatus(`The entries were kept because their attachments could not all be deleted: ${error?.message || String(error)}`, true);
+      return;
+    }
     removeEntryKeys([...selectedKeys]);
     await saveDatabase(`Removed ${count} entries.`);
     await propagateRemovedEntriesToNextcloud(removedEntries);
