@@ -13,6 +13,7 @@
 #ctca-bib-manager {
   --ctca-manager-table-columns: 34px 24px minmax(360px,1fr) 72px 170px;
   --ctca-manager-table-width: 688px;
+  --ctca-manager-list-scrollbar-width: 0px;
 }
 .ctca-manager-table-head {
   position: relative;
@@ -35,6 +36,7 @@
 .ctca-manager-column-header > [data-manager-sort] {
   min-width: 0;
   flex: 1 1 auto;
+  padding-left: 7px;
   padding-right: 25px;
 }
 .ctca-manager-column-header[data-manager-column="title"] > [data-manager-sort] {
@@ -84,6 +86,9 @@
   width: 9px;
   cursor: col-resize;
   touch-action: none;
+}
+.ctca-manager-column-resizer[hidden] {
+  display: none !important;
 }
 .ctca-manager-column-resizer::after {
   position: absolute;
@@ -6476,8 +6481,8 @@ html.ctca-platform-overleaf #ctca-toolbar-button.ctca-overleaf-top-button {
   grid-template-columns: var(--ctca-manager-table-columns) !important;
   gap: 0 !important;
   box-sizing: border-box;
-  width: max(100%, calc(var(--ctca-manager-table-width) + 28px));
-  padding: 0 14px !important;
+  width: 100%;
+  padding: 0 calc(14px + var(--ctca-manager-list-scrollbar-width)) 0 14px !important;
   overflow: hidden;
 }
 #ctca-bib-manager .ctca-manager-row {
@@ -6487,8 +6492,27 @@ html.ctca-platform-overleaf #ctca-toolbar-button.ctca-overleaf-top-button {
   grid-template-areas: none !important;
   gap: 4px 0 !important;
   box-sizing: border-box;
-  width: max(100%, calc(var(--ctca-manager-table-width) + 28px));
+  width: 100%;
   padding: 10px 14px 11px !important;
+}
+#ctca-bib-manager .ctca-manager-list-virtualized .ctca-manager-row {
+  min-height: var(--ctca-manager-virtual-row-height);
+  overflow: hidden;
+}
+#ctca-bib-manager .ctca-manager-list-virtualized .ctca-manager-row-active .ctca-manager-row-author {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#ctca-bib-manager .ctca-manager-virtual-spacer {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 0;
+  pointer-events: none;
+}
+#ctca-bib-manager .ctca-manager-list {
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 #ctca-bib-manager .ctca-manager-row.ctca-manager-row-authors-hidden {
   grid-template-rows: auto auto !important;
@@ -6499,6 +6523,46 @@ html.ctca-platform-overleaf #ctca-toolbar-button.ctca-overleaf-top-button {
 }
 #ctca-bib-manager .ctca-manager-row.ctca-manager-row-authors-hidden .ctca-manager-row-publication {
   grid-row: 2 !important;
+}
+#ctca-bib-manager .ctca-manager-row.ctca-manager-row-authors-hidden.ctca-manager-row-publication-compact {
+  grid-template-rows: auto !important;
+}
+#ctca-bib-manager .ctca-manager-row.ctca-manager-row-authors-hidden.ctca-manager-row-publication-compact .ctca-manager-row-star,
+#ctca-bib-manager .ctca-manager-row.ctca-manager-row-authors-hidden.ctca-manager-row-publication-compact .ctca-manager-row-select {
+  grid-row: 1;
+  align-self: start;
+  height: 18px;
+}
+#ctca-bib-manager .ctca-manager-row.ctca-manager-row-authors-hidden.ctca-manager-row-publication-compact .ctca-manager-row-star {
+  display: grid;
+  place-items: center;
+  font-size: 18px;
+  line-height: 1;
+}
+#ctca-bib-manager .ctca-manager-row.ctca-manager-row-authors-hidden.ctca-manager-row-publication-compact .ctca-manager-row-select {
+  display: flex;
+  align-items: center;
+  padding-top: 0;
+}
+#ctca-bib-manager .ctca-manager-row.ctca-manager-row-authors-hidden.ctca-manager-row-publication-compact .ctca-manager-row-checkbox {
+  margin: 0;
+}
+#ctca-bib-manager .ctca-manager-row-title-publication-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  align-self: start;
+  justify-content: flex-start;
+  gap: 6px;
+}
+#ctca-bib-manager .ctca-manager-row-title-publication-stack .ctca-manager-row-title-text {
+  min-width: 0;
+}
+#ctca-bib-manager .ctca-manager-row-title-publication-stack .ctca-manager-row-publication-inline {
+  grid-row: auto !important;
+  grid-column: auto !important;
+  max-width: calc(100% - 7px);
+  margin: 0 0 0 7px !important;
 }
 
 

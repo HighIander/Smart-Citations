@@ -83,7 +83,22 @@
   let bulkAbortRequested = false;
   let activeDoiRequestId = "";
   let listRenderTimer = null;
+  let searchRenderTimer = null;
   let categoryListRenderRevision = 0;
+  let virtualListFrame = null;
+  let virtualListResizeObserver = null;
+  let virtualListState = {
+    entries: [],
+    visibleKeys: [],
+    entryByKey: new Map(),
+    attachmentsByKey: null,
+    estimatedRowHeight: 60,
+    rowHeights: [],
+    rowOffsets: [0],
+    start: -1,
+    end: -1,
+    revision: 0
+  };
   let activeWorkspaceTab = "bibliography";
   const openPdfTabs = new Map();
   const pdfAttachmentLoadingKeys = new Set();
@@ -96,8 +111,12 @@
   let bibliographyDetailsCollapsed = false;
   let nextcloudSyncTimer = null;
   let nextcloudSyncInProgress = false;
+  let nextcloudSyncWaiters = [];
   let standaloneManagerPort = null;
   let standaloneCommandQueue = Promise.resolve();
+  const SEARCH_RENDER_DELAY_MS = 150;
+  const VIRTUAL_LIST_OVERSCAN = 8;
+  const MAX_MANAGER_COLUMN_WIDTH = 2400;
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -454,7 +473,7 @@
     if (ui.columnWidths && typeof ui.columnWidths === "object") {
       for (const column of LIST_COLUMNS) {
         const width = Number(ui.columnWidths[column.id]);
-        if (Number.isFinite(width)) columnWidths[column.id] = Math.max(column.min, Math.min(700, width));
+        if (Number.isFinite(width)) columnWidths[column.id] = Math.max(column.min, Math.min(MAX_MANAGER_COLUMN_WIDTH, width));
       }
     }
     if (ui.columnVisibility && typeof ui.columnVisibility === "object") {
@@ -1108,16 +1127,298 @@
     updateCount(visibleKeys.length);
   }
 
+  function managerRowTitleAndPublication(title, publicationText, publicationHtml, condensedAuthor) {
+    const compact = !columnVisibility.authors && columnVisibility.title;
+    const publication = `
+      <span class="ctca-manager-row-publication${compact ? " ctca-manager-row-publication-inline" : ""}" title="${escapeHtml(publicationText)}">
+        ${columnVisibility.authors ? "" : `<button type="button" class="ctca-manager-condensed-author" title="Show full authors">${escapeHtml(condensedAuthor)}</button>, `}
+        ${publicationHtml}
+      </span>`;
+    const titleCell = compact
+      ? `<span class="ctca-manager-row-title ctca-manager-row-cell ctca-manager-row-title-publication-stack">
+          <span class="ctca-manager-row-title-text" title="${escapeHtml(title)}">${latexHtml(title)}</span>
+          ${publication}
+        </span>`
+      : `<span class="ctca-manager-row-title ctca-manager-row-cell" title="${escapeHtml(title)}">${latexHtml(title)}</span>`;
+    return {
+      compact,
+      titleCell,
+      trailingPublication: compact ? "" : publication
+    };
+  }
+
+  function virtualListRowHeight() {
+    return columnVisibility.authors ? 78 : 60;
+  }
+
+  function rebuildVirtualListOffsets() {
+    const offsets = [0];
+    for (const height of virtualListState.rowHeights) {
+      offsets.push(offsets[offsets.length - 1] + height);
+    }
+    virtualListState.rowOffsets = offsets;
+  }
+
+  function virtualListIndexAtOffset(offset) {
+    const count = virtualListState.entries.length;
+    if (!count) return 0;
+    const offsets = virtualListState.rowOffsets;
+    let low = 0;
+    let high = count;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (offsets[middle + 1] <= offset) low = middle + 1;
+      else high = middle;
+    }
+    return Math.min(count - 1, low);
+  }
+
+  function virtualListSpacer(height) {
+    const spacer = document.createElement("div");
+    spacer.className = "ctca-manager-virtual-spacer";
+    spacer.style.height = `${Math.max(0, height)}px`;
+    spacer.setAttribute("aria-hidden", "true");
+    return spacer;
+  }
+
+  function measureVirtualListRows(mounted, topSpacer, bottomSpacer) {
+    let changed = false;
+    for (const { row, index } of mounted) {
+      const height = Math.max(virtualListState.estimatedRowHeight, Math.ceil(row.getBoundingClientRect().height));
+      if (height === virtualListState.rowHeights[index]) continue;
+      virtualListState.rowHeights[index] = height;
+      changed = true;
+    }
+    if (!changed) return;
+    rebuildVirtualListOffsets();
+    const offsets = virtualListState.rowOffsets;
+    const totalHeight = offsets[offsets.length - 1] || 0;
+    topSpacer.style.height = `${offsets[virtualListState.start] || 0}px`;
+    bottomSpacer.style.height = `${Math.max(0, totalHeight - (offsets[virtualListState.end] || totalHeight))}px`;
+  }
+
+  function createManagerListRow(entry, visibleKeys, position, total) {
+    const row = document.createElement("div");
+    row.className = "ctca-manager-row";
+    row.dataset.managerRecordId = entry.key;
+    row.setAttribute("role", "option");
+    row.setAttribute("tabindex", "0");
+    row.setAttribute("aria-selected", selectedKeys.has(entry.key) ? "true" : "false");
+    row.setAttribute("aria-posinset", String(position + 1));
+    row.setAttribute("aria-setsize", String(total));
+    row.draggable = true;
+    row.classList.toggle("ctca-manager-row-active", selectedKeys.has(entry.key) && selectedKey === entry.key);
+    row.classList.toggle("ctca-manager-row-selected", selectedKeys.has(entry.key));
+    row.classList.toggle("ctca-manager-row-authors-hidden", !columnVisibility.authors);
+
+    const title = entry.fields?.title || "Untitled reference";
+    const authors = allAuthors(entry);
+    const year = entry.fields?.year || "";
+    const journal = publication(entry);
+    const volume = entry.fields?.volume || "";
+    const pages = entry.fields?.pages || "";
+    const addedOn = formatAddedOn(entry.addedOn);
+    const publicationValues = [journal, volume, pages].filter(Boolean);
+    const publicationBaseText = publicationValues.join(", ") || "Publication not specified";
+    const publicationText = `${publicationBaseText}${!columnVisibility.year && year ? ` (${year})` : ""}`;
+    const publicationBaseHtml = [
+      journal ? escapeHtml(journal) : "",
+      volume ? `<strong>${escapeHtml(volume)}</strong>` : "",
+      pages ? escapeHtml(pages) : ""
+    ].filter(Boolean).join(", ") || "Publication not specified";
+    const publicationHtml = `<span class="ctca-manager-publication-text">${publicationBaseHtml}${!columnVisibility.year && year ? ` (${escapeHtml(year)})` : ""}</span>`;
+    const specifiedUrl = specifiedHttpUrl(entry);
+    const doiSynchronized = wasUpdatedFromDoi(entry);
+    const doiSyncTitle = doiSynchronized
+      ? `${entry.doiSyncedAt ? `DOI synchronized ${entry.doiSyncedAt}` : "DOI synchronized"}. `
+      : "";
+    const urlGlobe = specifiedUrl
+      ? `<button type="button" class="ctca-manager-row-doi-sync${doiSynchronized ? " ctca-manager-row-doi-synced" : ""}" title="${escapeHtml(`${doiSyncTitle}Open ${specifiedUrl}`)}" aria-label="${escapeHtml(`Open URL for ${entry.key}`)}">${urlGlobeIconHtml()}</button>`
+      : `<span class="ctca-manager-row-doi-sync ctca-manager-row-doi-placeholder" aria-hidden="true">${urlGlobeIconHtml()}</span>`;
+    const condensedAuthor = abbreviatedFirstAuthor(entry);
+    const titleAndPublication = managerRowTitleAndPublication(title, publicationText, publicationHtml, condensedAuthor);
+    row.classList.toggle("ctca-manager-row-publication-compact", titleAndPublication.compact);
+    const cells = [];
+    if (columnVisibility.title) cells.push(titleAndPublication.titleCell);
+    if (columnVisibility.year) cells.push(`<span class="ctca-manager-row-year ctca-manager-row-cell" title="${escapeHtml(year)}">${escapeHtml(year)}</span>`);
+    if (columnVisibility.key) cells.push(`
+      <span class="ctca-manager-row-meta ctca-manager-row-cell">
+        <span class="ctca-manager-row-link-actions">
+          ${urlGlobe}
+          <span class="ctca-manager-row-pdf-slot"></span>
+        </span>
+        <span class="ctca-manager-row-key" title="${escapeHtml(entry.key)}">${escapeHtml(entry.key)}</span>
+      </span>`);
+    if (managerColumnVisible("addedOn")) cells.push(`<span class="ctca-manager-row-added ctca-manager-row-cell" title="${escapeHtml(addedOn)}">${escapeHtml(addedOn)}</span>`);
+    row.innerHTML = `
+      <button type="button" class="ctca-manager-row-star" title="${entry.starred ? "Remove star" : "Star entry"}" aria-label="${entry.starred ? "Remove star from" : "Star"} ${escapeHtml(entry.key)}" aria-pressed="${entry.starred ? "true" : "false"}">${entry.starred ? "★" : "☆"}</button>
+      <span class="ctca-manager-row-select"><input type="checkbox" class="ctca-manager-row-checkbox" aria-label="Select ${escapeHtml(entry.key)}" ${selectedKeys.has(entry.key) ? "checked" : ""}></span>
+      ${cells.join("")}
+      ${columnVisibility.authors ? `<span class="ctca-manager-row-author" title="${escapeHtml(authors)}"><span class="ctca-manager-row-author-text">${latexHtml(authors)}</span><button type="button" class="ctca-manager-author-eye" title="Hide authors" aria-label="Hide authors">👁</button></span>` : ""}
+      ${titleAndPublication.trailingPublication}
+    `;
+
+    const activate = (event) => {
+      const previousSelectedKeys = new Set(selectedKeys);
+      const previousActiveKey = selectedKey;
+      if (event.shiftKey) {
+        selectRange(visibleKeys, entry.key);
+      } else if (event.ctrlKey || event.metaKey) {
+        if (selectedKeys.has(entry.key)) selectedKeys.delete(entry.key);
+        else selectedKeys.add(entry.key);
+        selectionAnchorKey = entry.key;
+      } else {
+        selectedKeys = new Set([entry.key]);
+        selectionAnchorKey = entry.key;
+      }
+      selectedKey = entry.key;
+      updateListSelectionState(visibleKeys, previousSelectedKeys, previousActiveKey);
+      renderDetails();
+    };
+
+    row.addEventListener("click", (event) => {
+      if (event.target.closest(".ctca-manager-row-checkbox, .ctca-manager-row-star, .ctca-manager-row-doi-sync, .ctca-manager-row-pdf-action, .ctca-manager-author-eye, .ctca-manager-condensed-author")) return;
+      activate(event);
+    });
+    row.addEventListener("contextmenu", (event) => {
+      showEntryContextMenu(event, entry).catch((error) => {
+        hideEntryContextMenu();
+        setStatus(error?.message || String(error), true);
+      });
+    });
+    row.addEventListener("keydown", (event) => {
+      if (event.target.closest(".ctca-manager-row-doi-sync, .ctca-manager-row-pdf-action")) return;
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      activate(event);
+    });
+    $(".ctca-manager-row-checkbox", row).addEventListener("click", (event) => {
+      event.stopPropagation();
+      const previousSelectedKeys = new Set(selectedKeys);
+      const previousActiveKey = selectedKey;
+      if (event.target.checked) selectedKeys.add(entry.key);
+      else selectedKeys.delete(entry.key);
+      selectedKey = entry.key;
+      selectionAnchorKey = entry.key;
+      updateListSelectionState(visibleKeys, previousSelectedKeys, previousActiveKey);
+      renderDetails();
+    });
+    $(".ctca-manager-row-star", row).addEventListener("click", (event) => {
+      event.stopPropagation();
+      entry.starred = !entry.starred;
+      entry.updatedAt = new Date().toISOString();
+      markDirty(entry.starred ? "Starring entry…" : "Removing star…");
+      renderCategories();
+      renderList();
+    });
+    $("button.ctca-manager-row-doi-sync", row)?.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      window.open(specifiedUrl, "_blank", "noopener,noreferrer");
+    });
+    $(".ctca-manager-author-eye", row)?.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setColumnVisible("authors", false);
+    });
+    $(".ctca-manager-condensed-author", row)?.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setColumnVisible("authors", true);
+    });
+    row.addEventListener("dragstart", (event) => {
+      if (!selectedKeys.has(entry.key)) {
+        selectedKeys = new Set([entry.key]);
+        selectedKey = entry.key;
+        selectionAnchorKey = entry.key;
+      }
+      const keys = [...selectedKeys];
+      event.dataTransfer.effectAllowed = "copy";
+      event.dataTransfer.setData("application/x-ctca-entry-keys", JSON.stringify(keys));
+      row.classList.add("ctca-manager-row-dragging");
+    });
+    row.addEventListener("dragend", () => row.classList.remove("ctca-manager-row-dragging"));
+    bindPdfDropTarget(row, entry);
+    return row;
+  }
+
+  function updateMountedRowAttachments() {
+    if (!virtualListState.attachmentsByKey) return;
+    const list = $(".ctca-manager-list", root);
+    list.querySelectorAll(".ctca-manager-row[data-manager-record-id]").forEach((row) => {
+      const entry = virtualListState.entryByKey.get(row.dataset.managerRecordId || "");
+      if (entry) updateRowPdfAction(row, entry, virtualListState.attachmentsByKey.get(entry.key) || []);
+    });
+  }
+
+  function renderVirtualListWindow(force = false) {
+    const list = $(".ctca-manager-list", root);
+    const visible = virtualListState.entries;
+    if (!visible.length) return;
+    const viewportHeight = Math.max(list.clientHeight, virtualListState.estimatedRowHeight * 6);
+    const start = Math.max(0, virtualListIndexAtOffset(list.scrollTop) - VIRTUAL_LIST_OVERSCAN);
+    const end = Math.min(
+      visible.length,
+      virtualListIndexAtOffset(list.scrollTop + viewportHeight) + 1 + VIRTUAL_LIST_OVERSCAN
+    );
+    if (!force && start === virtualListState.start && end === virtualListState.end) return;
+    virtualListState.start = start;
+    virtualListState.end = end;
+
+    const offsets = virtualListState.rowOffsets;
+    const totalHeight = offsets[offsets.length - 1] || 0;
+    const fragment = document.createDocumentFragment();
+    const topSpacer = virtualListSpacer(offsets[start] || 0);
+    fragment.appendChild(topSpacer);
+    const mounted = [];
+    const openAlexDescriptors = [];
+    for (let index = start; index < end; index += 1) {
+      const entry = visible[index];
+      const row = createManagerListRow(entry, virtualListState.visibleKeys, index, visible.length);
+      mounted.push({ row, entry, index });
+      fragment.appendChild(row);
+      const descriptor = globalThis.SmartCitationsOpenAlex.descriptor(entry, entry.key);
+      if (descriptor.identity) openAlexDescriptors.push(descriptor);
+    }
+    const bottomSpacer = virtualListSpacer(Math.max(0, totalHeight - (offsets[end] || totalHeight)));
+    fragment.appendChild(bottomSpacer);
+    list.replaceChildren(fragment);
+    if (virtualListState.attachmentsByKey) {
+      mounted.forEach(({ row, entry }) => {
+        updateRowPdfAction(row, entry, virtualListState.attachmentsByKey.get(entry.key) || []);
+      });
+    }
+    measureVirtualListRows(mounted, topSpacer, bottomSpacer);
+    syncPdfAttachmentLoadingIndicators();
+    globalThis.SmartCitationsOpenAlex.hydrateCitations(list, openAlexDescriptors).catch(() => {});
+  }
+
+  function scheduleVirtualListWindow() {
+    if (virtualListFrame !== null) return;
+    virtualListFrame = window.requestAnimationFrame(() => {
+      virtualListFrame = null;
+      renderVirtualListWindow();
+    });
+  }
+
+  function loadVisibleRowAttachments(visible, revision) {
+    globalThis.CollabTeXAttachmentStore.listMany(visible).then((attachmentsByKey) => {
+      if (revision !== virtualListState.revision) return;
+      virtualListState.attachmentsByKey = attachmentsByKey;
+      updateMountedRowAttachments();
+    }).catch(() => {
+      if (revision !== virtualListState.revision) return;
+      virtualListState.attachmentsByKey = new Map();
+      updateMountedRowAttachments();
+    });
+  }
+
   function renderList() {
     applyManagerTableColumns();
     const list = $(".ctca-manager-list", root);
     const visible = filteredEntries();
-    const openAlexDescriptors = [];
     const visibleKeys = visible.map((entry) => entry.key);
     selectedKeys = new Set([...selectedKeys].filter((key) => entries.some((entry) => entry.key === key)));
     if (!selectedKeys.size) selectedKey = "";
     else if (!selectedKeys.has(selectedKey)) selectedKey = selectedKeys.values().next().value || "";
-    list.replaceChildren();
 
     root.querySelectorAll("[data-manager-sort]").forEach((button) => {
       const active = button.dataset.managerSort === (selectedCategoryId === "recent" ? "addedOn" : sortState.field);
@@ -1127,163 +1428,46 @@
     const starSort = $(".ctca-manager-star-sort", root);
     starSort.setAttribute("aria-pressed", starredFirst ? "true" : "false");
     starSort.textContent = starredFirst ? "★" : "☆";
-
     $(".ctca-global-empty", root).hidden = entries.length !== 0;
 
-    if (!visible.length && entries.length) {
-      const empty = document.createElement("div");
-      empty.className = "ctca-manager-empty-list";
-      empty.textContent = "No entries match this search or category.";
-      list.appendChild(empty);
-    }
-
-    for (const entry of visible) {
-      const row = document.createElement("div");
-      row.className = "ctca-manager-row";
-      row.dataset.managerRecordId = entry.key;
-      row.setAttribute("role", "option");
-      row.setAttribute("tabindex", "0");
-      row.setAttribute("aria-selected", selectedKeys.has(entry.key) ? "true" : "false");
-      row.draggable = true;
-      row.classList.toggle("ctca-manager-row-active", selectedKeys.has(entry.key) && selectedKey === entry.key);
-      row.classList.toggle("ctca-manager-row-selected", selectedKeys.has(entry.key));
-      row.classList.toggle("ctca-manager-row-authors-hidden", !columnVisibility.authors);
-      const title = entry.fields?.title || "Untitled reference";
-      const authors = allAuthors(entry);
-      const year = entry.fields?.year || "";
-      const journal = publication(entry);
-      const volume = entry.fields?.volume || "";
-      const pages = entry.fields?.pages || "";
-      const addedOn = formatAddedOn(entry.addedOn);
-      const publicationValues = [journal, volume, pages].filter(Boolean);
-      const publicationBaseText = publicationValues.join(", ") || "Publication not specified";
-      const publicationText = `${publicationBaseText}${!columnVisibility.year && year ? ` (${year})` : ""}`;
-      const publicationBaseHtml = [
-        journal ? escapeHtml(journal) : "",
-        volume ? `<strong>${escapeHtml(volume)}</strong>` : "",
-        pages ? escapeHtml(pages) : ""
-      ].filter(Boolean).join(", ") || "Publication not specified";
-      const openAlexDescriptor = globalThis.SmartCitationsOpenAlex.descriptor(entry, entry.key);
-      // Keep citation-count lookup/cache warming active even though the list does not display it.
-      if (openAlexDescriptor.identity) openAlexDescriptors.push(openAlexDescriptor);
-      const publicationHtml = `<span class="ctca-manager-publication-text">${publicationBaseHtml}${!columnVisibility.year && year ? ` (${escapeHtml(year)})` : ""}</span>`;
-      const specifiedUrl = specifiedHttpUrl(entry);
-      const doiSynchronized = wasUpdatedFromDoi(entry);
-      const doiSyncTitle = doiSynchronized
-        ? `${entry.doiSyncedAt ? `DOI synchronized ${entry.doiSyncedAt}` : "DOI synchronized"}. `
-        : "";
-      const urlGlobe = specifiedUrl
-        ? `<button type="button" class="ctca-manager-row-doi-sync${doiSynchronized ? " ctca-manager-row-doi-synced" : ""}" title="${escapeHtml(`${doiSyncTitle}Open ${specifiedUrl}`)}" aria-label="${escapeHtml(`Open URL for ${entry.key}`)}">${urlGlobeIconHtml()}</button>`
-        : `<span class="ctca-manager-row-doi-sync ctca-manager-row-doi-placeholder" aria-hidden="true">${urlGlobeIconHtml()}</span>`;
-      const cells = [];
-      if (columnVisibility.title) cells.push(`<span class="ctca-manager-row-title ctca-manager-row-cell" title="${escapeHtml(title)}">${latexHtml(title)}</span>`);
-      if (columnVisibility.year) cells.push(`<span class="ctca-manager-row-year ctca-manager-row-cell" title="${escapeHtml(year)}">${escapeHtml(year)}</span>`);
-      if (columnVisibility.key) cells.push(`
-        <span class="ctca-manager-row-meta ctca-manager-row-cell">
-          <span class="ctca-manager-row-link-actions">
-            ${urlGlobe}
-            <span class="ctca-manager-row-pdf-slot"></span>
-          </span>
-          <span class="ctca-manager-row-key" title="${escapeHtml(entry.key)}">${escapeHtml(entry.key)}</span>
-        </span>`);
-      if (managerColumnVisible("addedOn")) cells.push(`<span class="ctca-manager-row-added ctca-manager-row-cell" title="${escapeHtml(addedOn)}">${escapeHtml(addedOn)}</span>`);
-      const condensedAuthor = abbreviatedFirstAuthor(entry);
-      row.innerHTML = `
-        <button type="button" class="ctca-manager-row-star" title="${entry.starred ? "Remove star" : "Star entry"}" aria-label="${entry.starred ? "Remove star from" : "Star"} ${escapeHtml(entry.key)}" aria-pressed="${entry.starred ? "true" : "false"}">${entry.starred ? "★" : "☆"}</button>
-        <span class="ctca-manager-row-select"><input type="checkbox" class="ctca-manager-row-checkbox" aria-label="Select ${escapeHtml(entry.key)}" ${selectedKeys.has(entry.key) ? "checked" : ""}></span>
-        ${cells.join("")}
-        ${columnVisibility.authors ? `<span class="ctca-manager-row-author" title="${escapeHtml(authors)}"><span class="ctca-manager-row-author-text">${latexHtml(authors)}</span><button type="button" class="ctca-manager-author-eye" title="Hide authors" aria-label="Hide authors">👁</button></span>` : ""}
-        <span class="ctca-manager-row-publication" title="${escapeHtml(publicationText)}">${columnVisibility.authors ? "" : `<button type="button" class="ctca-manager-condensed-author" title="Show full authors">${escapeHtml(condensedAuthor)}</button>, `}${publicationHtml}</span>
-      `;
-
-      const activate = (event) => {
-        const previousSelectedKeys = new Set(selectedKeys);
-        const previousActiveKey = selectedKey;
-        if (event.shiftKey) {
-          selectRange(visibleKeys, entry.key);
-        } else if (event.ctrlKey || event.metaKey) {
-          if (selectedKeys.has(entry.key)) selectedKeys.delete(entry.key);
-          else selectedKeys.add(entry.key);
-          selectionAnchorKey = entry.key;
-        } else {
-          selectedKeys = new Set([entry.key]);
-          selectionAnchorKey = entry.key;
-        }
-        selectedKey = entry.key;
-        updateListSelectionState(visibleKeys, previousSelectedKeys, previousActiveKey);
-        renderDetails();
-      };
-
-      row.addEventListener("click", (event) => {
-        if (event.target.closest(".ctca-manager-row-checkbox, .ctca-manager-row-star, .ctca-manager-row-doi-sync, .ctca-manager-row-pdf-action, .ctca-manager-author-eye, .ctca-manager-condensed-author")) return;
-        activate(event);
-      });
-      row.addEventListener("contextmenu", (event) => {
-        showEntryContextMenu(event, entry).catch((error) => {
-          hideEntryContextMenu();
-          setStatus(error?.message || String(error), true);
-        });
-      });
-      row.addEventListener("keydown", (event) => {
-        if (event.target.closest(".ctca-manager-row-doi-sync, .ctca-manager-row-pdf-action")) return;
-        if (event.key !== "Enter" && event.key !== " ") return;
-        event.preventDefault();
-        activate(event);
-      });
-      $(".ctca-manager-row-checkbox", row).addEventListener("click", (event) => {
-        event.stopPropagation();
-        const previousSelectedKeys = new Set(selectedKeys);
-        const previousActiveKey = selectedKey;
-        if (event.target.checked) selectedKeys.add(entry.key);
-        else selectedKeys.delete(entry.key);
-        selectedKey = entry.key;
-        selectionAnchorKey = entry.key;
-        updateListSelectionState(visibleKeys, previousSelectedKeys, previousActiveKey);
-        renderDetails();
-      });
-      $(".ctca-manager-row-star", row).addEventListener("click", (event) => {
-        event.stopPropagation();
-        entry.starred = !entry.starred;
-        entry.updatedAt = new Date().toISOString();
-        markDirty(entry.starred ? "Starring entry…" : "Removing star…");
-        renderCategories();
-        renderList();
-      });
-      $("button.ctca-manager-row-doi-sync", row)?.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        window.open(specifiedUrl, "_blank", "noopener,noreferrer");
-      });
-      $(".ctca-manager-author-eye", row)?.addEventListener("click", (event) => {
-        event.stopPropagation();
-        setColumnVisible("authors", false);
-      });
-      $(".ctca-manager-condensed-author", row)?.addEventListener("click", (event) => {
-        event.stopPropagation();
-        setColumnVisible("authors", true);
-      });
-      row.addEventListener("dragstart", (event) => {
-        if (!selectedKeys.has(entry.key)) {
-          selectedKeys = new Set([entry.key]);
-          selectedKey = entry.key;
-          selectionAnchorKey = entry.key;
-        }
-        const keys = [...selectedKeys];
-        event.dataTransfer.effectAllowed = "copy";
-        event.dataTransfer.setData("application/x-ctca-entry-keys", JSON.stringify(keys));
-        row.classList.add("ctca-manager-row-dragging");
-      });
-      row.addEventListener("dragend", () => row.classList.remove("ctca-manager-row-dragging"));
-      bindPdfDropTarget(row, entry);
-      list.appendChild(row);
-      loadRowPdfAction(row, entry);
+    const revision = virtualListState.revision + 1;
+    const estimatedRowHeight = virtualListRowHeight();
+    virtualListState = {
+      entries: visible,
+      visibleKeys,
+      entryByKey: new Map(visible.map((entry) => [entry.key, entry])),
+      attachmentsByKey: null,
+      estimatedRowHeight,
+      rowHeights: visible.map(() => estimatedRowHeight),
+      rowOffsets: [0],
+      start: -1,
+      end: -1,
+      revision
+    };
+    rebuildVirtualListOffsets();
+    list.style.setProperty("--ctca-manager-virtual-row-height", `${estimatedRowHeight}px`);
+    if (!visible.length) {
+      list.classList.remove("ctca-manager-list-virtualized");
+      list.replaceChildren();
+      if (entries.length) {
+        const empty = document.createElement("div");
+        empty.className = "ctca-manager-empty-list";
+        empty.textContent = "No entries match this search or category.";
+        list.appendChild(empty);
+      }
+    } else {
+      list.classList.add("ctca-manager-list-virtualized");
+      const totalHeight = virtualListState.rowOffsets[virtualListState.rowOffsets.length - 1] || 0;
+      const maximumScrollTop = Math.max(0, totalHeight - list.clientHeight);
+      if (list.scrollTop > maximumScrollTop) list.scrollTop = maximumScrollTop;
+      renderVirtualListWindow(true);
+      loadVisibleRowAttachments(visible, revision);
     }
 
     updateSelectionControls(visibleKeys);
     updateCount(visible.length);
     renderDetails();
-    syncPdfAttachmentLoadingIndicators();
-    globalThis.SmartCitationsOpenAlex.hydrateCitations(list, openAlexDescriptors).catch(() => {});
+    syncManagerTableHeader();
   }
 
   function managerInput(label, field, value, options = {}) {
@@ -1594,20 +1778,6 @@
       });
     }
     slot.replaceChildren(button);
-  }
-
-  async function loadRowPdfAction(row, entry) {
-    const request = `${Date.now()}-${Math.random()}`;
-    row.dataset.pdfActionRequest = request;
-    try {
-      const attachments = await globalThis.CollabTeXAttachmentStore.list(entry);
-      if (row.dataset.pdfActionRequest !== request) return;
-      updateRowPdfAction(row, entry, attachments);
-    } catch (_error) {
-      if (row.dataset.pdfActionRequest !== request) return;
-      delete row.dataset.pdfActionRequest;
-      $(".ctca-manager-row-pdf-slot", row)?.replaceChildren();
-    }
   }
 
   function allKnownTags(exceptKey = "") {
@@ -2354,8 +2524,22 @@
       setStatus(`Nextcloud synchronization failed: ${error.message || String(error)}`, true);
       return null;
     } finally {
-      nextcloudSyncInProgress = false;
+      finishCurrentNextcloudSync();
     }
+  }
+
+  function waitForCurrentNextcloudSync() {
+    if (!nextcloudSyncInProgress) return Promise.resolve();
+    return new Promise((resolve) => {
+      nextcloudSyncWaiters.push(resolve);
+    });
+  }
+
+  function finishCurrentNextcloudSync() {
+    nextcloudSyncInProgress = false;
+    const waiters = nextcloudSyncWaiters;
+    nextcloudSyncWaiters = [];
+    waiters.forEach((resolve) => resolve());
   }
 
   function scheduleNextcloudSync(delay = 900) {
@@ -2402,7 +2586,7 @@
       );
       return;
     } finally {
-      nextcloudSyncInProgress = false;
+      finishCurrentNextcloudSync();
     }
     scheduleNextcloudSync(0);
   }
@@ -3709,8 +3893,10 @@
 
   async function updateEntriesFromDoi(targets, { showBatchConfirmation = false } = {}) {
     if (nextcloudSyncInProgress) {
-      setStatus("Wait for the current Nextcloud synchronization to finish before updating DOI metadata.", true);
-      return;
+      const targetKeys = targets.map((entry) => entry.key);
+      setStatus("DOI metadata update queued; it will start when Nextcloud synchronization is complete.");
+      await waitForCurrentNextcloudSync();
+      targets = targetKeys.map(entryByKey).filter(Boolean);
     }
     const allDoiTargets = targets.filter((entry) => normalizeDoi(entry.fields?.doi));
     if (!allDoiTargets.length) {
@@ -4584,22 +4770,38 @@
     }
   }
 
+  function syncManagerTableHeader() {
+    const header = $(".ctca-manager-table-head", root);
+    const list = $(".ctca-manager-list", root);
+    if (!header || !list) return;
+    const scrollbarWidth = Math.max(0, list.offsetWidth - list.clientWidth);
+    root.style.setProperty("--ctca-manager-list-scrollbar-width", `${scrollbarWidth}px`);
+    header.scrollLeft = list.scrollLeft;
+  }
+
   function applyManagerTableColumns() {
     const visible = LIST_COLUMNS.filter((column) => managerColumnVisible(column.id));
-    const widths = [34, 24, ...visible.map((column) => columnWidths[column.id])];
     const flexibleColumnId = visible.some((column) => column.id === "title") ? "title" : visible[0]?.id;
+    const widths = [
+      34,
+      24,
+      ...visible.map((column) => column.id === flexibleColumnId ? 0 : columnWidths[column.id])
+    ];
     const template = [
       "34px",
       "24px",
       ...visible.map((column) => column.id === flexibleColumnId
-        ? `minmax(${Math.round(columnWidths[column.id])}px,1fr)`
+        ? "minmax(0,1fr)"
         : `${Math.round(columnWidths[column.id])}px`)
     ];
     root.style.setProperty("--ctca-manager-table-columns", template.join(" "));
     root.style.setProperty("--ctca-manager-table-width", `${widths.reduce((sum, width) => sum + width, 0)}px`);
     for (const column of LIST_COLUMNS) {
       const header = root.querySelector(`.ctca-manager-column-header[data-manager-column="${column.id}"]`);
-      if (header) header.hidden = !managerColumnVisible(column.id);
+      if (!header) continue;
+      header.hidden = !managerColumnVisible(column.id);
+      const resizer = $(".ctca-manager-column-resizer", header);
+      if (resizer) resizer.hidden = header.hidden || column.id === visible[visible.length - 1]?.id;
     }
   }
 
@@ -4645,6 +4847,7 @@
     const menu = $(".ctca-manager-column-menu", root);
     root.appendChild(menu);
     applyManagerTableColumns();
+    syncManagerTableHeader();
 
     header.addEventListener("contextmenu", (event) => {
       event.preventDefault();
@@ -4666,32 +4869,37 @@
         const definition = LIST_COLUMNS.find((item) => item.id === column);
         if (!definition) return;
         const startX = event.clientX;
-        const startWidth = handle.closest("[data-manager-column]").getBoundingClientRect().width;
-        const visibleColumns = LIST_COLUMNS.filter((item) => columnVisibility[item.id] !== false);
-        const flexibleColumnId = visibleColumns.some((item) => item.id === "title") ? "title" : visibleColumns[0]?.id;
-        const nextColumn = column === flexibleColumnId
-          ? visibleColumns[visibleColumns.findIndex((item) => item.id === column) + 1]
-          : null;
-        const startNextWidth = nextColumn ? columnWidths[nextColumn.id] : 0;
+        const visibleColumns = LIST_COLUMNS.filter((item) => managerColumnVisible(item.id));
+        const columnIndex = visibleColumns.findIndex((item) => item.id === column);
+        const nextDefinition = visibleColumns[columnIndex + 1];
+        if (!nextDefinition) return;
+        const currentHeader = header.querySelector(`[data-manager-column="${column}"]`);
+        const nextHeader = header.querySelector(`[data-manager-column="${nextDefinition.id}"]`);
+        const startWidth = currentHeader?.getBoundingClientRect().width || columnWidths[column];
+        const startNextWidth = nextHeader?.getBoundingClientRect().width || columnWidths[nextDefinition.id];
         root.classList.add("ctca-manager-resizing-columns");
         const move = (moveEvent) => {
           const delta = moveEvent.clientX - startX;
-          if (nextColumn) {
-            const minimumDelta = Math.max(definition.min - startWidth, startNextWidth - 700);
-            const maximumDelta = Math.min(700 - startWidth, startNextWidth - nextColumn.min);
-            const effectiveDelta = Math.max(minimumDelta, Math.min(maximumDelta, delta));
-            columnWidths[column] = startWidth + effectiveDelta;
-            columnWidths[nextColumn.id] = startNextWidth - effectiveDelta;
-          } else {
-            columnWidths[column] = Math.max(definition.min, Math.min(700, startWidth + delta));
-          }
+          const minimumDelta = Math.max(
+            definition.min - startWidth,
+            startNextWidth - MAX_MANAGER_COLUMN_WIDTH
+          );
+          const maximumDelta = Math.min(
+            MAX_MANAGER_COLUMN_WIDTH - startWidth,
+            startNextWidth - nextDefinition.min
+          );
+          const effectiveDelta = Math.max(minimumDelta, Math.min(maximumDelta, delta));
+          columnWidths[column] = startWidth + effectiveDelta;
+          columnWidths[nextDefinition.id] = startNextWidth - effectiveDelta;
           applyManagerTableColumns();
+          syncManagerTableHeader();
         };
         const finish = () => {
           document.removeEventListener("pointermove", move, true);
           document.removeEventListener("pointerup", finish, true);
           document.removeEventListener("pointercancel", finish, true);
           root.classList.remove("ctca-manager-resizing-columns");
+          renderList();
           saveUiState().catch(() => {});
         };
         document.addEventListener("pointermove", move, true);
@@ -4710,7 +4918,18 @@
         input.checked = columnVisibility[input.dataset.managerVisibleColumn] !== false;
       }
     });
-    list.addEventListener("scroll", () => { header.scrollLeft = list.scrollLeft; }, { passive: true });
+    list.addEventListener("scroll", () => {
+      header.scrollLeft = list.scrollLeft;
+      scheduleVirtualListWindow();
+    }, { passive: true });
+    if (typeof ResizeObserver === "function") {
+      virtualListResizeObserver?.disconnect();
+      virtualListResizeObserver = new ResizeObserver(() => {
+        syncManagerTableHeader();
+        scheduleVirtualListWindow();
+      });
+      virtualListResizeObserver.observe(list);
+    }
   }
 
   function applyColumnWidths() {
@@ -4808,6 +5027,8 @@
     input.setRangeText(insertion, start, end, "end");
     const next = Math.max(0, (input.selectionStart || input.value.length) - Number(cursorBack || 0));
     input.setSelectionRange(next, next);
+    window.clearTimeout(searchRenderTimer);
+    searchRenderTimer = null;
     query = input.value;
     $(".ctca-manager-search-clear", root).hidden = !query;
     renderList();
@@ -5392,11 +5613,17 @@
     const searchInput = $(".ctca-manager-search", root);
     const searchClear = $(".ctca-manager-search-clear", root);
     searchInput.addEventListener("input", () => {
-      query = searchInput.value || "";
-      searchClear.hidden = !query;
-      renderList();
+      window.clearTimeout(searchRenderTimer);
+      searchClear.hidden = !searchInput.value;
+      searchRenderTimer = window.setTimeout(() => {
+        searchRenderTimer = null;
+        query = searchInput.value || "";
+        renderList();
+      }, SEARCH_RENDER_DELAY_MS);
     });
     searchClear.addEventListener("click", () => {
+      window.clearTimeout(searchRenderTimer);
+      searchRenderTimer = null;
       searchInput.value = "";
       query = "";
       searchClear.hidden = true;

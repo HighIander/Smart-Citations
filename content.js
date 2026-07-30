@@ -3981,6 +3981,88 @@
     });
   }
 
+  async function managerOfferAttachedPdfDoiUpdate(draft, attachedSources) {
+    if (
+      !draft
+      || draft.centralPreview === true
+      || normalizeDoiInput(draft.fields?.doi || "")
+      || !attachedSources.length
+    ) {
+      return false;
+    }
+
+    const shouldUpdate = await showAppDialog({
+      title: "Find a DOI in the attached manuscript?",
+      message:
+        `${draft.key} does not have a DOI yet. Would you like Smart Citations to scan the newly attached ` +
+        `PDF${attachedSources.length === 1 ? "" : "s"} for a DOI and update the entry with its publication details?`,
+      buttons: [
+        { label: "Not now", value: false },
+        { label: "Find DOI and update", value: true, primary: true }
+      ],
+      closeValue: false
+    });
+    if (!shouldUpdate) return false;
+
+    managerSetStatus(`Scanning the attached manuscript${attachedSources.length === 1 ? "" : "s"} for a DOI…`);
+    let doi = "";
+    let readableSources = 0;
+    const readFailures = [];
+    for (const source of attachedSources) {
+      try {
+        const file = source.file
+          || await globalThis.CollabTeXAttachmentStore.getBlob(source.attachment);
+        if (!file) throw new Error("the PDF data is not available");
+        readableSources += 1;
+        doi = await globalThis.CollabTeXPdfImport.extractDoi(file);
+        if (doi) break;
+      } catch (error) {
+        readFailures.push(`${source.attachment?.fileName || source.file?.name || "PDF"}: ${error?.message || String(error)}`);
+      }
+    }
+
+    if (!doi) {
+      if (!readableSources && readFailures.length) {
+        managerSetStatus(`The PDF was attached, but the manuscript could not be scanned: ${readFailures.join("; ")}`, true);
+      } else {
+        managerSetStatus(`The PDF was attached, but no DOI was found in the manuscript${attachedSources.length === 1 ? "" : "s"}.`);
+      }
+      return false;
+    }
+
+    managerSetStatus(`Found DOI ${doi}. Retrieving publication details…`);
+    try {
+      const metadata = await fetchDoiMetadata(doi);
+      const existingRecord = managerDraftToRecord(draft);
+      const merged = metadataToBibFields({ ...metadata, doi: metadata.doi || doi }, existingRecord);
+      for (const [name, value] of Object.entries(merged)) {
+        draft.fields[name] = stripOneBibDelimiter(value);
+      }
+      draft.fields.abstract = normalizeAbstractText(draft.fields.abstract || "");
+      if (metadata.entryType && draft.type === "misc") draft.type = metadata.entryType;
+      managerMarkDoiSynced(draft);
+      managerMarkDirty(draft, false);
+      renderManagerCategories();
+      renderManagerList();
+      renderManagerDetails();
+      managerSetStatus(
+        `Found DOI ${doi} and updated ${draft.key} from DOI metadata. Click Update Bib or close the window to write the changes to the document.`
+      );
+      showDoiSuccessToast(draft.key, metadata.source);
+      return true;
+    } catch (error) {
+      draft.fields.doi = doi;
+      managerMarkDirty(draft, false);
+      renderManagerList();
+      renderManagerDetails();
+      managerSetStatus(
+        `Found and added DOI ${doi}, but the publication details could not be retrieved: ${error?.message || String(error)}`,
+        true
+      );
+      return false;
+    }
+  }
+
   async function managerOpenAddPdfDialog(draft, options = {}) {
     const config = await globalThis.CollabTeXAttachmentStore.getConfig();
     const sourceUrl = managerSpecifiedHttpUrl(draft);
@@ -4259,15 +4341,17 @@
     syncManagerPdfAttachmentLoadingIndicators();
     try {
       const entryRef = { key: draft.key, fields: draft.fields };
+      const attachedSources = [];
       if (result.provider === 'local') {
         if (result.files.length) {
           for (let i = 0; i < result.files.length; i += 1) {
-            await globalThis.CollabTeXPdfImport.attach(
+            const attachment = await globalThis.CollabTeXPdfImport.attach(
               entryRef,
               { file: result.files[i], handle: null },
               'local',
               result.names[i]
             );
+            attachedSources.push({ attachment, file: result.files[i] });
           }
           managerSetStatus('Local PDF link saved for this browser session.');
         } else {
@@ -4275,7 +4359,8 @@
           let permitted = true;
           try { permitted = await globalThis.CollabTeXAttachmentStore.ensureLocalFilePermission(); } catch (_error) { permitted = false; }
           for (let i = 0; i < result.paths.length; i += 1) {
-            await globalThis.CollabTeXAttachmentStore.addLocalLink(entryRef, result.paths[i], result.names[i]);
+            const attachment = await globalThis.CollabTeXAttachmentStore.addLocalLink(entryRef, result.paths[i], result.names[i]);
+            attachedSources.push({ attachment, file: null });
           }
           managerSetStatus(permitted
             ? 'Local PDF link saved. The PDF remains at its current disk location.'
@@ -4318,8 +4403,10 @@
         const file = item.file;
         const name = item.name || file.name.replace(/\.pdf$/i, '');
         try {
-          if (result.provider === 'nextcloud') await globalThis.CollabTeXAttachmentStore.addNextcloud(entryRef, file, name);
-          else await globalThis.CollabTeXAttachmentStore.addBrowser(entryRef, file, name);
+          const attachment = result.provider === 'nextcloud'
+            ? await globalThis.CollabTeXAttachmentStore.addNextcloud(entryRef, file, name)
+            : await globalThis.CollabTeXAttachmentStore.addBrowser(entryRef, file, name);
+          attachedSources.push({ attachment, file });
           attached += 1;
         } catch (error) {
           failures.push(`${file.name}: ${error.message || String(error)}`);
@@ -4331,6 +4418,7 @@
         : `${attached} PDF${attached === 1 ? '' : 's'} attached${result.provider === 'nextcloud' ? ' and uploaded to Nextcloud' : ''}.`,
         failures.length > 0);
       }
+      await managerOfferAttachedPdfDoiUpdate(draft, attachedSources);
       await managerRenderPdfAttachmentList(draft);
     } finally {
       await Promise.allSettled(

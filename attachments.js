@@ -508,6 +508,55 @@
     return orderedAttachmentsForEntry(index, ref);
   }
 
+  async function listMany(entries) {
+    const requested = (Array.isArray(entries) ? entries : [])
+      .filter((entry) => entry && entry.key)
+      .map((entry) => ({ lookupKey: String(entry.key), ref: entryRef(entry) }));
+    const grouped = new Map(requested.map(({ lookupKey }) => [lookupKey, []]));
+    if (!requested.length) return grouped;
+
+    const identityLookup = new Map();
+    const doiLookup = new Map();
+    const keyLookup = new Map();
+    const addLookup = (lookup, value, lookupKey) => {
+      const normalized = String(value || "").trim().toLowerCase();
+      if (!normalized) return;
+      if (!lookup.has(normalized)) lookup.set(normalized, new Set());
+      lookup.get(normalized).add(lookupKey);
+    };
+    for (const { lookupKey, ref } of requested) {
+      ref.identities.forEach((identity) => addLookup(identityLookup, identity, lookupKey));
+      if (ref.doi) addLookup(doiLookup, ref.doi, lookupKey);
+      ref.keys.forEach((key) => addLookup(keyLookup, key, lookupKey));
+    }
+
+    const index = await loadIndex();
+    index.attachments.forEach((attachment, indexPosition) => {
+      const matchingKeys = new Set();
+      const attachmentIdentity = String(attachment?.entry?.identity || "").trim().toLowerCase();
+      const attachmentDoi = normalizeDoi(attachment?.entry?.doi || "");
+      const attachmentKey = String(attachment?.entry?.key || "").trim().toLowerCase();
+      for (const lookupKey of identityLookup.get(attachmentIdentity) || []) matchingKeys.add(lookupKey);
+      for (const lookupKey of doiLookup.get(attachmentDoi) || []) matchingKeys.add(lookupKey);
+      for (const lookupKey of keyLookup.get(attachmentKey) || []) matchingKeys.add(lookupKey);
+      for (const lookupKey of matchingKeys) grouped.get(lookupKey)?.push({ attachment, indexPosition });
+    });
+
+    for (const [lookupKey, matches] of grouped) {
+      matches.sort((left, right) => {
+        const leftPosition = Number.isFinite(Number(left.attachment.position))
+          ? Number(left.attachment.position)
+          : 1_000_000 + left.indexPosition;
+        const rightPosition = Number.isFinite(Number(right.attachment.position))
+          ? Number(right.attachment.position)
+          : 1_000_000 + right.indexPosition;
+        return leftPosition - rightPosition || left.indexPosition - right.indexPosition;
+      });
+      grouped.set(lookupKey, matches.map(({ attachment }) => attachment));
+    }
+    return grouped;
+  }
+
   function attachmentMatchesEntry(attachment, ref) {
     const attachmentIdentity = String(attachment?.entry?.identity || "").toLowerCase();
     const attachmentKey = String(attachment?.entry?.key || "").trim().toLowerCase();
@@ -1822,7 +1871,7 @@
   globalThis.CollabTeXAttachmentStore = {
     INDEX_KEY, CONFIG_KEY, GLOBAL_DATABASE_KEY, entryRef, getConfig, saveConfig, checkNextcloudConnection, connectNextcloud, syncNextcloud,
     syncBibliographyNextcloud, deleteBibliographyEntriesNextcloud, resolveBibliographyConflicts, databaseToBib, bibToDatabase, isPdfFile,
-    list, reorder, addBrowser, addLocalLink, addLocalSession, addLocalHandle, addNextcloud, getBlob, update, replaceFile, remove, removeForEntries,
+    list, listMany, reorder, addBrowser, addLocalLink, addLocalSession, addLocalHandle, addNextcloud, getBlob, update, replaceFile, remove, removeForEntries,
     normalizeLocalPath, ensureLocalFilePermission, isLocalFilePermissionGranted, openLocalFilePermissionSettings,
     discoverWebPdfs, showWebHumanCheck, closeWebTab, downloadWebPdf,
     listNextcloudDirectory, getNextcloudFileInfo, downloadNextcloudFile, normalizeNextcloudPath
