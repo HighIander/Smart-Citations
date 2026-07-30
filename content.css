@@ -1,9 +1,280 @@
+/* SPDX-License-Identifier: CC-BY-NC-SA-4.0 */
+
 #ctca-popup,
 #ctca-toolbar-button,
 #ctca-abstract-overlay,
+#ctca-document-bibliography-update-overlay,
 #ctca-bib-manager {
   box-sizing: border-box;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+/* Resizable bibliography columns, visibility controls, and starred entries. */
+#ctca-bib-manager {
+  --ctca-manager-table-columns: 34px 24px minmax(360px,1fr) 72px 170px;
+  --ctca-manager-table-width: 688px;
+}
+.ctca-manager-table-head {
+  position: relative;
+  display: grid !important;
+  grid-template-columns: var(--ctca-manager-table-columns) !important;
+  gap: 0 !important;
+  box-sizing: border-box;
+  width: max(100%, calc(var(--ctca-manager-table-width) + 28px));
+  min-height: 36px;
+  padding: 0 14px !important;
+  overflow: hidden;
+}
+.ctca-manager-column-header {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  align-items: stretch;
+}
+.ctca-manager-column-header[hidden] { display: none !important; }
+.ctca-manager-column-header > [data-manager-sort] {
+  min-width: 0;
+  flex: 1 1 auto;
+  padding-right: 25px;
+}
+.ctca-manager-column-header[data-manager-column="title"] > [data-manager-sort] {
+  padding-left: 0;
+}
+.ctca-manager-column-eye {
+  position: absolute;
+  top: 50%;
+  right: 7px;
+  z-index: 2;
+  display: grid;
+  width: 20px;
+  min-width: 20px !important;
+  height: 20px;
+  min-height: 20px;
+  place-items: center;
+  padding: 0 !important;
+  color: #57606a !important;
+  background: #f6f8fa !important;
+  border: 0 !important;
+  border-radius: 4px;
+  font-size: 13px !important;
+  line-height: 1;
+  opacity: 0;
+  transform: translateY(-50%);
+}
+.ctca-manager-column-header:hover .ctca-manager-column-eye,
+.ctca-manager-column-eye:focus-visible { opacity: 1; }
+.ctca-manager-column-eye::after,
+.ctca-manager-author-eye::after {
+  position: absolute;
+  width: 16px;
+  height: 1.5px;
+  content: "";
+  background: currentColor;
+  opacity: 0;
+  transform: rotate(-42deg);
+}
+.ctca-manager-column-eye:hover::after,
+.ctca-manager-author-eye:hover::after { opacity: 1; }
+.ctca-manager-column-resizer {
+  position: absolute;
+  top: 2px;
+  right: -4px;
+  bottom: 2px;
+  z-index: 4;
+  width: 9px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.ctca-manager-column-resizer::after {
+  position: absolute;
+  top: 0;
+  right: 4px;
+  bottom: 0;
+  width: 1px;
+  content: "";
+  background: #d0d7de;
+}
+.ctca-manager-column-resizer:hover::after,
+.ctca-manager-column-resizer:focus-visible::after,
+.ctca-manager-resizing-columns .ctca-manager-column-resizer::after {
+  width: 2px;
+  background: #0969da;
+}
+.ctca-manager-star-sort {
+  display: grid;
+  min-width: 0 !important;
+  place-items: center;
+  padding: 0 !important;
+  color: #6e7781 !important;
+  font-size: 18px !important;
+  text-align: center !important;
+}
+.ctca-manager-star-sort[aria-pressed="true"] {
+  color: #9a6700 !important;
+  background: #fff8c5 !important;
+}
+.ctca-manager-list { overflow: auto; }
+.ctca-manager-row {
+  display: grid !important;
+  grid-template-columns: var(--ctca-manager-table-columns) !important;
+  grid-template-rows: auto auto auto;
+  gap: 4px 0 !important;
+  box-sizing: border-box;
+  width: max(100%, calc(var(--ctca-manager-table-width) + 28px));
+  padding: 10px 14px 11px !important;
+}
+.ctca-manager-row-star {
+  grid-column: 1;
+  grid-row: 1 / 4;
+  align-self: start;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  color: #8c959f;
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 20px;
+  line-height: 28px;
+}
+.ctca-manager-row-star:hover { color: #9a6700; background: #fff8c5; }
+.ctca-manager-row-star[aria-pressed="true"] { color: #bf8700; }
+.ctca-manager-row-select {
+  grid-column: 2;
+  grid-row: 1 / 4;
+  align-self: start;
+  min-width: 0;
+  padding-top: 6px;
+}
+.ctca-manager-row-cell {
+  grid-row: 1;
+  min-width: 0;
+  align-self: center;
+  padding: 0 7px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ctca-manager-row-title.ctca-manager-row-cell {
+  padding-left: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.ctca-manager-row-meta.ctca-manager-row-cell {
+  justify-content: flex-start;
+}
+.ctca-manager-row-added {
+  color: #57606a;
+  font-size: 10px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+.ctca-manager-row-author,
+.ctca-manager-row-publication {
+  grid-column: 3 / -1 !important;
+  margin-left: 7px !important;
+  margin-right: 7px;
+}
+.ctca-manager-row-author {
+  position: relative;
+  grid-row: 2 !important;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding-right: 26px;
+}
+.ctca-manager-row-author-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ctca-manager-row-active .ctca-manager-row-author-text {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+.ctca-manager-author-eye {
+  position: absolute;
+  top: 50%;
+  right: 2px;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  padding: 0;
+  color: #6e7781;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+  opacity: 0;
+  transform: translateY(-50%);
+}
+.ctca-manager-row-author:hover .ctca-manager-author-eye,
+.ctca-manager-author-eye:focus-visible { opacity: 1; }
+.ctca-manager-row-publication { grid-row: 3 !important; }
+.ctca-manager-condensed-author {
+  display: inline;
+  margin: 0;
+  padding: 0;
+  color: #0969da;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 400;
+}
+.ctca-manager-condensed-author:hover { text-decoration: underline; }
+.ctca-manager-column-menu {
+  position: fixed;
+  z-index: 2147483647;
+  display: grid;
+  min-width: 215px;
+  gap: 2px;
+  padding: 7px;
+  color: #24292f;
+  background: #fff;
+  border: 1px solid #8c959f;
+  border-radius: 7px;
+  box-shadow: 0 8px 24px rgba(31,35,40,.2);
+}
+.ctca-manager-column-menu[hidden] { display: none !important; }
+.ctca-manager-column-menu::before {
+  padding: 3px 7px 5px;
+  color: #57606a;
+  content: "Visible fields";
+  font-size: 10px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+.ctca-manager-column-menu label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.ctca-manager-column-menu label:hover { background: #f6f8fa; }
+.ctca-manager-column-menu input { margin: 0; }
+.ctca-manager-resizing-columns,
+.ctca-manager-resizing-columns * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+@media (prefers-color-scheme: dark) {
+  .ctca-manager-column-eye { color: #8c959f !important; background: #161b22 !important; }
+  .ctca-manager-column-resizer::after { background: #30363d; }
+  .ctca-manager-row-star:hover,
+  .ctca-manager-star-sort[aria-pressed="true"] { color: #e3b341 !important; background: #3d2f00 !important; }
+  .ctca-manager-row-star[aria-pressed="true"] { color: #e3b341; }
+  .ctca-manager-column-menu { color: #e6edf3; background: #161b22; border-color: #484f58; }
+  .ctca-manager-column-menu::before { color: #8c959f; }
+  .ctca-manager-column-menu label:hover { background: #21262d; }
 }
 
 #ctca-popup *,
@@ -12,6 +283,9 @@
 #ctca-abstract-overlay *,
 #ctca-abstract-overlay *::before,
 #ctca-abstract-overlay *::after,
+#ctca-document-bibliography-update-overlay *,
+#ctca-document-bibliography-update-overlay *::before,
+#ctca-document-bibliography-update-overlay *::after,
 #ctca-bib-manager *,
 #ctca-bib-manager *::before,
 #ctca-bib-manager *::after {
@@ -733,6 +1007,12 @@
   }
 
   .ctca-manager-row-doi-sync {
+    color: #8c959f;
+    background: #21262d;
+    border-color: #484f58;
+  }
+
+  .ctca-manager-row-doi-sync.ctca-manager-row-doi-synced {
     color: #7ee787;
     background: #12261a;
     border-color: #238636;
@@ -1048,6 +1328,7 @@
 .ctca-manager-toolbar button,
 .ctca-manager-detail-actions button,
 .ctca-manager-doi-row button,
+.ctca-manager-url-row button,
 .ctca-manager-add-field-row button,
 .ctca-manager-extra-field button {
   min-height: 32px;
@@ -1066,6 +1347,7 @@
 .ctca-manager-toolbar button:hover,
 .ctca-manager-detail-actions button:hover,
 .ctca-manager-doi-row button:hover,
+.ctca-manager-url-row button:hover,
 .ctca-manager-add-field-row button:hover,
 .ctca-manager-extra-field button:hover {
   background: #eef2f6;
@@ -1075,16 +1357,10 @@
 .ctca-manager-toolbar button:disabled,
 .ctca-manager-detail-actions button:disabled,
 .ctca-manager-doi-row button:disabled,
+.ctca-manager-url-row button:disabled,
 .ctca-manager-add-field-row button:disabled {
   cursor: wait;
   opacity: 0.55;
-}
-
-.ctca-manager-close {
-  width: 34px;
-  padding: 0 !important;
-  font-size: 22px !important;
-  line-height: 30px;
 }
 
 .ctca-manager-toolbar {
@@ -1173,6 +1449,7 @@
 }
 
 .ctca-manager-list-pane {
+  position: relative;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   min-width: 0;
@@ -1221,6 +1498,56 @@
   overflow: auto;
 }
 
+.ctca-manager-central-sync-overlay {
+  position: absolute;
+  z-index: 6;
+  inset: 35px 0 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 9px;
+  color: #0969da;
+  background: rgba(255, 255, 255, 0.58);
+  pointer-events: none;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.ctca-manager-central-sync-overlay[hidden] {
+  display: none;
+}
+
+.ctca-manager-list-loading-overlay {
+  position: absolute;
+  z-index: 30;
+  inset: 36px 0 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.72);
+  pointer-events: none;
+}
+
+.ctca-manager-list-loading-overlay[hidden] {
+  display: none;
+}
+
+.ctca-manager-central-sync-spinner,
+.ctca-manager-list-loading-spinner {
+  width: 34px;
+  height: 34px;
+  border: 3px solid #b6d7ff;
+  border-top-color: #0969da;
+  border-radius: 50%;
+  box-shadow: 0 0 0 7px rgba(255, 255, 255, 0.76);
+  animation: ctca-manager-central-sync-spin 720ms linear infinite;
+}
+
+@keyframes ctca-manager-central-sync-spin {
+  to { transform: rotate(360deg); }
+}
+
 .ctca-manager-row {
   position: relative;
   display: grid;
@@ -1241,12 +1568,16 @@
   text-align: left;
 }
 
-.ctca-manager-row:hover,
-.ctca-manager-row-selected {
+.ctca-manager-row:hover {
+  background: #f6f8fa;
+}
+
+.ctca-manager-row-selected,
+.ctca-manager-row-selected:hover {
   background: #ddf4ff;
 }
 
-.ctca-manager-row-dirty::before {
+.ctca-manager-row-new::before {
   position: absolute;
   top: 12px;
   left: 4px;
@@ -1275,13 +1606,12 @@
 }
 
 .ctca-manager-row-title {
-  overflow: hidden;
   color: #24292f;
   font-size: 13px;
   font-weight: 700;
   line-height: 1.35;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .ctca-manager-row-year {
@@ -1298,6 +1628,18 @@
   justify-content: flex-end;
   gap: 5px;
   min-width: 0;
+}
+
+.ctca-manager-row-link-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+}
+
+.ctca-manager-row-pdf-slot {
+  display: flex;
 }
 
 .ctca-manager-row-key {
@@ -1322,20 +1664,79 @@
   justify-content: center;
   flex: 0 0 auto;
   width: 24px;
+  min-width: 24px;
+  max-width: 24px;
   height: 22px;
+  margin: 0;
   padding: 0;
-  color: #116329;
-  background: #dafbe1;
-  border: 1px solid #82d99a;
+  color: #57606a;
+  background: #f6f8fa;
+  border: 1px solid #d0d7de;
   border-radius: 999px;
+  font-family: inherit;
   font-size: 12px;
   font-weight: 700;
   line-height: 1;
   white-space: nowrap;
 }
 
+button.ctca-manager-row-doi-sync,
+.ctca-manager-row-pdf-action {
+  appearance: none;
+  cursor: pointer;
+}
+
+button.ctca-manager-row-doi-sync:hover,
+.ctca-manager-row-pdf-action:hover {
+  filter: brightness(0.96);
+}
+
+button.ctca-manager-row-doi-sync:focus-visible,
+.ctca-manager-row-pdf-action:focus-visible {
+  outline: 2px solid #0969da;
+  outline-offset: 1px;
+}
+
+.ctca-manager-row-pdf-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 24px;
+  min-width: 24px;
+  max-width: 24px;
+  height: 22px;
+  margin: 0;
+  padding: 0;
+  color: #57606a;
+  background: #f6f8fa;
+  border: 1px solid #d0d7de;
+  border-radius: 999px;
+}
+
+.ctca-manager-row-globe-icon,
+.ctca-manager-row-pdf-icon {
+  display: block;
+  width: 15px;
+  height: 15px;
+  color: inherit;
+  pointer-events: none;
+}
+
+.ctca-manager-row-doi-sync.ctca-manager-row-doi-synced {
+  color: #116329;
+  background: #dafbe1;
+  border-color: #82d99a;
+}
+
+.ctca-manager-row-doi-placeholder {
+  visibility: hidden;
+  pointer-events: none;
+}
+
 .ctca-manager-row-author {
   grid-area: author;
+  margin-left: 80px;
   overflow: hidden;
   color: #6e7781;
   font-size: 11px;
@@ -1345,8 +1746,15 @@
   white-space: nowrap;
 }
 
+.ctca-manager-row-active .ctca-manager-row-author {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
 .ctca-manager-row-publication {
   grid-area: publication;
+  margin-left: 80px;
   overflow: hidden;
   color: #57606a;
   font-size: 11px;
@@ -1413,6 +1821,12 @@
   gap: 6px;
 }
 
+.ctca-manager-detail-get-pdf {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .ctca-manager-form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1455,13 +1869,15 @@
   resize: vertical;
 }
 
-.ctca-manager-doi-row {
+.ctca-manager-doi-row,
+.ctca-manager-url-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 38px;
   gap: 6px;
 }
 
-.ctca-manager-doi-row button {
+.ctca-manager-doi-row button,
+.ctca-manager-url-row button {
   min-width: 38px;
   padding: 0;
   font-size: 16px;
@@ -1723,6 +2139,7 @@
   .ctca-manager-toolbar button,
   .ctca-manager-detail-actions button,
   .ctca-manager-doi-row button,
+  .ctca-manager-url-row button,
   .ctca-manager-add-field-row button,
   .ctca-manager-extra-field button {
     color: #e6edf3;
@@ -1764,8 +2181,12 @@
     border-color: #30363d;
   }
 
-  .ctca-manager-row:hover,
-  .ctca-manager-row-selected {
+  .ctca-manager-row:hover {
+    background: #21262d;
+  }
+
+  .ctca-manager-row-selected,
+  .ctca-manager-row-selected:hover {
     background: #1f3a4d;
   }
 
@@ -1785,8 +2206,15 @@
     color: #ff7b72;
   }
 
+  .ctca-manager-row-doi-sync,
+  .ctca-manager-row-pdf-action {
+    color: #8c959f;
+    background: #21262d;
+    border-color: #484f58;
+  }
+
   .ctca-doi-update.ctca-doi-update-synced,
-  .ctca-manager-row-doi-sync {
+  .ctca-manager-row-doi-sync.ctca-manager-row-doi-synced {
     color: #7ee787;
     background: #0f3b22;
     border-color: #238636;
@@ -1843,7 +2271,7 @@
 .ctca-app-dialog-card {
   position: relative;
   width: min(590px, calc(100vw - 32px));
-  max-height: calc(100vh - 40px);
+  max-height: calc(100vh - min(12vh, 110px) - 20px);
   padding: 20px 22px 18px;
   overflow: auto;
   background: #fff;
@@ -1957,6 +2385,62 @@
 .ctca-app-dialog-actions .ctca-app-dialog-primary:hover { background: #0550ae; }
 .ctca-app-dialog-actions .ctca-app-dialog-danger { color: #fff; background: #cf222e; border-color: #a40e26; }
 .ctca-app-dialog-actions .ctca-app-dialog-danger:hover { background: #a40e26; }
+
+.ctca-global-import-dialog-card {
+  width: min(760px, calc(100vw - 32px));
+}
+
+.ctca-global-import-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ctca-global-import-toolbar button {
+  min-height: 30px;
+  padding: 4px 9px;
+  color: #24292f;
+  background: #fff;
+  border: 1px solid #b6bec8;
+  border-radius: 5px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ctca-global-import-toolbar button:hover { background: #eef2f6; }
+
+.ctca-global-import-count {
+  margin-left: auto;
+  color: #57606a;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ctca-global-import-list {
+  display: grid;
+  max-height: min(430px, 50vh);
+  overflow: auto;
+  background: #fff;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+}
+
+.ctca-global-import-entry {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px 11px;
+  cursor: pointer;
+}
+
+.ctca-global-import-entry + .ctca-global-import-entry { border-top: 1px solid #d8dee4; }
+.ctca-global-import-entry:hover { background: #f6f8fa; }
+.ctca-global-import-entry input { margin-top: 3px; }
+.ctca-global-import-entry-details { display: grid; min-width: 0; gap: 3px; }
+.ctca-global-import-entry-title { color: #24292f; font-size: 13px; font-weight: 700; line-height: 1.35; }
+.ctca-global-import-entry-meta { overflow: hidden; color: #57606a; font-size: 11px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
 
 .ctca-manager-main {
   grid-template-columns: 190px minmax(0, 2fr) minmax(320px, 1fr);
@@ -2081,6 +2565,12 @@
 .ctca-manager-category-drop-before::before { top: -2px; }
 .ctca-manager-category-drop-after::after { bottom: -2px; }
 
+.ctca-manager-category-separator {
+  height: 1px;
+  margin: 7px 8px;
+  background: #d0d7de;
+}
+
 .ctca-category-context-menu {
   position: fixed;
   z-index: 2147483647;
@@ -2107,6 +2597,50 @@
 }
 .ctca-category-context-menu button:hover { background: #ffebe9; }
 
+.ctca-entry-context-menu {
+  position: fixed;
+  z-index: 2147483647;
+  min-width: 245px;
+  max-width: min(360px, calc(100vw - 16px));
+  padding: 5px;
+  background: #fff;
+  border: 1px solid #8c959f;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(27, 31, 36, 0.24);
+}
+
+.ctca-entry-context-menu[hidden] { display: none; }
+
+.ctca-entry-context-menu button {
+  display: block;
+  width: 100%;
+  padding: 7px 9px;
+  overflow: hidden;
+  color: #24292f;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ctca-entry-context-menu button:hover,
+.ctca-entry-context-menu button:focus-visible {
+  background: #eaeef2;
+  outline: none;
+}
+
+.ctca-entry-context-menu .ctca-entry-context-danger {
+  margin-top: 4px;
+  color: #cf222e;
+  border-top: 1px solid #d0d7de;
+  border-radius: 0 0 4px 4px;
+}
+
 .ctca-manager-remove-selected {
   color: #cf222e !important;
   border-color: #cf222e !important;
@@ -2129,6 +2663,7 @@
   font-weight: 700;
   text-transform: uppercase;
 }
+.ctca-manager-select-visible { padding-right: 0; padding-left: 0; }
 .ctca-manager-select-visible input { margin: 0; }
 
 .ctca-manager-row-firstline {
@@ -2217,7 +2752,10 @@
   .ctca-app-dialog-card,
   .ctca-app-dialog-field input,
   .ctca-app-dialog-actions button,
-  .ctca-category-context-menu {
+  .ctca-global-import-toolbar button,
+  .ctca-global-import-list,
+  .ctca-category-context-menu,
+  .ctca-entry-context-menu {
     color: #e6edf3;
     background: #0d1117;
     border-color: #484f58;
@@ -2229,6 +2767,8 @@
   }
   .ctca-app-dialog-message,
   .ctca-app-dialog-field,
+  .ctca-global-import-count,
+  .ctca-global-import-entry-meta,
   .ctca-manager-categories-head,
   .ctca-manager-category-count,
   .ctca-manager-category-handle,
@@ -2238,12 +2778,24 @@
   }
   .ctca-manager-category-fixed,
   .ctca-manager-category-row,
-  .ctca-manager-category-name { color: #e6edf3; }
+  .ctca-manager-category-name,
+  .ctca-global-import-entry-title { color: #e6edf3; }
+  .ctca-manager-category-separator { background: #30363d; }
+  .ctca-global-import-entry + .ctca-global-import-entry { border-top-color: #30363d; }
+  .ctca-global-import-entry:hover,
+  .ctca-global-import-toolbar button:hover { background: #21262d; }
   .ctca-manager-category-fixed:hover,
   .ctca-manager-category-row:hover,
   .ctca-manager-category-selected,
   .ctca-manager-row-selected { background: #1f3a4d; border-color: #388bfd; }
   .ctca-category-context-menu button:hover { background: #3d1418; }
+  .ctca-entry-context-menu button { color: #e6edf3; }
+  .ctca-entry-context-menu button:hover,
+  .ctca-entry-context-menu button:focus-visible { background: #21262d; }
+  .ctca-entry-context-menu .ctca-entry-context-danger {
+    color: #ff7b72;
+    border-color: #30363d;
+  }
   .ctca-manager-entry-category-chip { color: #79c0ff; background: #1f3a4d; border-color: #388bfd; }
   .ctca-manager-entry-category-chip button:hover { background: #264f6a; }
 }
@@ -2411,6 +2963,7 @@
 .ctca-manager-list-column { grid-column: 1; grid-template-rows: auto minmax(0,1fr); border-right: 1px solid #d0d7de; }
 .ctca-manager-details-column { grid-column: 3; grid-template-rows: auto minmax(0,1fr); }
 .ctca-manager-list-pane { min-height: 0; border-right: 0; }
+.ctca-manager-list-column > .ctca-manager-list-pane { grid-row: 2; }
 .ctca-manager-selection-actionbar,
 .ctca-manager-details-actionbar {
   display: flex;
@@ -2453,21 +3006,142 @@
 }
 .ctca-manager-detail-heading-text { flex: 1 1 auto; min-width: 0; }
 .ctca-manager-detail-title {
-  overflow: hidden;
   color: #24292f;
   font-size: 17px;
   font-weight: 750;
   line-height: 1.28;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 .ctca-manager-detail-authors {
   margin-top: 4px;
-  overflow: hidden;
+  max-height: calc(1.35em * 5);
+  padding-right: 4px;
+  overflow-x: hidden;
+  overflow-y: auto;
   color: #57606a;
   font-size: 11px;
   line-height: 1.35;
+  overflow-wrap: anywhere;
+  scrollbar-gutter: stable;
+  white-space: pre-line;
+}
+.ctca-manager-detail-title[data-manager-inline-field],
+.ctca-manager-detail-authors[data-manager-inline-field] {
+  border-radius: 4px;
+  cursor: text;
+}
+.ctca-manager-detail-title[data-manager-inline-field]:hover,
+.ctca-manager-detail-authors[data-manager-inline-field]:hover,
+.ctca-manager-detail-title[data-manager-inline-field]:focus-visible,
+.ctca-manager-detail-authors[data-manager-inline-field]:focus-visible {
+  background: #eef6ff;
+  outline: 2px solid rgba(9, 105, 218, 0.28);
+  outline-offset: 2px;
+}
+.ctca-manager-inline-editing {
+  position: relative;
+  max-height: none;
+  overflow: visible;
+}
+.ctca-manager-inline-editor {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 2.8em;
+  max-height: 11em;
+  padding: 6px 8px;
+  resize: vertical;
+  color: #24292f;
+  background: #fff;
+  border: 1px solid #0969da;
+  border-radius: 5px;
+  font: inherit;
+  line-height: 1.35;
+  outline: 2px solid rgba(9, 105, 218, 0.18);
+}
+.ctca-manager-detail-authors .ctca-manager-inline-editor {
+  min-height: calc(1.35em * 5 + 14px);
+}
+.ctca-author-completion {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 30;
+  display: grid;
+  box-sizing: border-box;
+  width: min(100%, 520px);
+  min-width: 220px;
+  max-height: 240px;
+  padding: 4px;
+  overflow-y: auto;
+  color: #24292f;
+  background: #fff;
+  border: 1px solid #8c959f;
+  border-radius: 5px;
+  box-shadow: 0 4px 12px rgba(31, 35, 40, 0.16);
+  white-space: normal;
+}
+.ctca-author-completion[hidden] {
+  display: none;
+}
+.ctca-field-completion-wrap {
+  position: relative;
+  display: block;
+  min-width: 0;
+}
+.ctca-field-completion {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  left: 0;
+  z-index: 30;
+  display: grid;
+  max-height: 240px;
+  padding: 4px;
+  overflow-y: auto;
+  color: #24292f;
+  background: #fff;
+  border: 1px solid #8c959f;
+  border-radius: 5px;
+  box-shadow: 0 4px 12px rgba(31, 35, 40, 0.16);
+}
+.ctca-field-completion[hidden] {
+  display: none;
+}
+.ctca-completion-option {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 8px;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+.ctca-completion-option:hover,
+.ctca-completion-option:focus-visible {
+  background: #ddf4ff;
+  outline: none;
+}
+.ctca-completion-option-name {
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 650;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ctca-completion-option-hint {
+  flex: 0 0 auto;
+  color: #57606a;
+  font-size: 10px;
+  font-weight: 550;
   white-space: nowrap;
 }
 .ctca-manager-resizer {
@@ -2486,8 +3160,23 @@
 .ctca-manager-resizer-categories { grid-column: 2; grid-row: 1; }
 .ctca-manager-resizer-details { grid-column: 2; }
 .ctca-manager-resizing { cursor: col-resize; user-select: none; }
+.ctca-add-entry-dialog-card {
+  width: min(920px, calc(100vw - 32px));
+  max-height: calc(100vh - 40px);
+}
+#ctca-app-dialog:has(.ctca-add-entry-dialog-card) {
+  align-items: center;
+  padding: 20px;
+}
+.ctca-add-entry-dialog-card .ctca-add-entry-form,
+.ctca-add-entry-dialog-card .ctca-global-dialog-form {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
 .ctca-add-entry-form { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 10px; }
 .ctca-add-entry-wide { grid-column: 1/-1; }
+.ctca-add-entry-third { grid-column: span 2; }
+.ctca-add-entry-two-thirds { grid-column: span 4; }
+.ctca-add-entry-half { grid-column: span 3; }
 .ctca-add-entry-doi-row { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 8px; }
 .ctca-add-entry-extra-section { padding-top: 12px; border-top: 1px solid #d0d7de; }
 .ctca-add-entry-extra-section h3 { margin: 0 0 9px; font-size: 13px; }
@@ -2520,10 +3209,62 @@
 .ctca-global-banner-actions { display: flex; flex: 0 0 auto; gap: 8px; }
 .ctca-global-banner-actions button,
 .ctca-global-banner-close { min-height: 32px; padding: 5px 11px; border: 1px solid #8c959f; border-radius: 5px; cursor: pointer; font: inherit; font-weight: 700; }
-.ctca-global-banner-later { color: #24292f; background: #fff; }
+.ctca-global-banner-later,
+.ctca-global-banner-select { color: #24292f; background: #fff; }
 .ctca-global-banner-yes { color: #fff; background: #1f883d; border-color: #1a7f37 !important; }
 .ctca-global-banner-close { position: absolute; top: 7px; right: 8px; width: 30px; padding: 0; color: #116329; background: transparent; border: 0; font-size: 20px; }
 .ctca-global-banner-busy { opacity: .88; }
+
+#ctca-document-bibliography-update-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  color: #24292f;
+  background: rgba(27, 31, 36, 0.34);
+  backdrop-filter: blur(2px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease, visibility 140ms ease;
+  visibility: hidden;
+}
+
+#ctca-document-bibliography-update-overlay.ctca-document-bibliography-update-visible {
+  opacity: 1;
+  pointer-events: auto;
+  visibility: visible;
+}
+
+.ctca-document-bibliography-update-card {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  min-width: min(390px, calc(100vw - 40px));
+  padding: 20px 24px;
+  background: #ffffff;
+  border: 1px solid #d0d7de;
+  border-radius: 12px;
+  box-shadow: 0 18px 48px rgba(27, 31, 36, 0.32);
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.ctca-document-bibliography-update-spinner {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border: 3px solid #b6e3c2;
+  border-top-color: #1a7f37;
+  border-radius: 50%;
+  animation: ctca-document-bibliography-spin 720ms linear infinite;
+}
+
+@keyframes ctca-document-bibliography-spin {
+  to { transform: rotate(360deg); }
+}
 
 @media (max-width: 820px) {
   .ctca-manager-body { grid-template-columns: minmax(140px,var(--ctca-category-width)) 6px minmax(0,1fr); }
@@ -2531,6 +3272,21 @@
   .ctca-manager-resizer-details { display: none; }
   .ctca-manager-details-column { grid-column: 1; border-top: 1px solid #d0d7de; }
   .ctca-manager-details-actionbar { justify-content: flex-start; }
+}
+@media (max-width: 820px) {
+  .ctca-add-entry-dialog-card .ctca-add-entry-form,
+  .ctca-add-entry-dialog-card .ctca-global-dialog-form {
+    grid-template-columns: 1fr;
+  }
+  .ctca-add-entry-dialog-card .ctca-add-entry-wide,
+  .ctca-add-entry-dialog-card .ctca-app-dialog-field-wide,
+  .ctca-add-entry-dialog-card .ctca-global-dialog-doi,
+  .ctca-add-entry-dialog-card .ctca-global-dialog-extra,
+  .ctca-add-entry-dialog-card .ctca-add-entry-third,
+  .ctca-add-entry-dialog-card .ctca-add-entry-two-thirds,
+  .ctca-add-entry-dialog-card .ctca-add-entry-half {
+    grid-column: 1;
+  }
 }
 @media (max-width: 580px) {
   .ctca-manager-body { grid-template-columns: 1fr; grid-template-rows: 150px minmax(0,1fr); }
@@ -2550,6 +3306,35 @@
   .ctca-manager-global-sync { color: #8c959f; }
   .ctca-manager-resizer { background: #21262d; }
   #ctca-global-banner { color: #aff5b4; background: #0f3b22; border-color: #238636; }
+  .ctca-document-bibliography-update-card {
+    color: #f0f6fc;
+    background: #161b22;
+    border-color: #30363d;
+  }
+  .ctca-document-bibliography-update-spinner {
+    border-color: #264f36;
+    border-top-color: #56d364;
+  }
+  .ctca-manager-central-sync-overlay {
+    color: #58a6ff;
+    background: rgba(13, 17, 23, 0.58);
+  }
+  .ctca-manager-central-sync-spinner,
+  .ctca-manager-list-loading-spinner {
+    border-color: #244b74;
+    border-top-color: #58a6ff;
+    box-shadow: 0 0 0 7px rgba(13, 17, 23, 0.76);
+  }
+  .ctca-manager-list-loading-overlay {
+    background: rgba(13, 17, 23, 0.72);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #ctca-document-bibliography-update-overlay { transition: none; }
+  .ctca-document-bibliography-update-spinner { animation-duration: 1.4s; }
+  .ctca-manager-central-sync-spinner,
+  .ctca-manager-list-loading-spinner { animation-duration: 1.4s; }
 }
 
 /* Version 1.7.9 advanced search, filters, and tag editor. */
@@ -3069,10 +3854,10 @@
 .ctca-manager-pdf-attachments h3 { margin: 0; font-size: 13px; }
 .ctca-manager-add-pdf { min-height:30px; padding:4px 9px; color:#fff; background:#1f883d; border:1px solid #1a7f37; border-radius:5px; cursor:pointer; font-weight:700; }
 .ctca-manager-pdf-list { display:grid; gap:7px; margin-top:9px; }
-.ctca-manager-pdf-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:4px 8px; padding:8px; border:1px solid #d0d7de; border-radius:6px; background:#f6f8fa; }
+.ctca-manager-pdf-row { display:grid; grid-template-columns:minmax(0,1fr); gap:4px; padding:8px; border:1px solid #d0d7de; border-radius:6px; background:#f6f8fa; }
 .ctca-manager-pdf-name { overflow:hidden; font-weight:700; text-overflow:ellipsis; white-space:nowrap; }
 .ctca-manager-pdf-meta { color:#6e7781; font-size:10px; }
-.ctca-manager-pdf-actions { grid-row:1/3; grid-column:2; display:flex; align-items:center; gap:4px; }
+.ctca-manager-pdf-actions { grid-row:3; grid-column:1; display:flex; align-items:center; gap:4px; flex-wrap:wrap; padding-top:3px; }
 .ctca-manager-pdf-actions button { min-height:27px; padding:3px 7px; border:1px solid #b6bec8; border-radius:4px; background:#fff; cursor:pointer; }
 .ctca-manager-no-pdf { color:#6e7781; font-size:11px; }
 
@@ -3225,7 +4010,9 @@
 
 .ctca-pdf-frame { background:#525659; }
 .ctca-pdf-browse-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-.ctca-pdf-browse {
+.ctca-pdf-browse,
+.ctca-pdf-get-web,
+.ctca-web-pdf-continue {
   min-height:34px;
   padding:6px 11px;
   color:#24292f;
@@ -3237,6 +4024,69 @@
   font-weight:700;
 }
 .ctca-pdf-browse-summary { color:#57606a; font-size:11px; }
+
+.ctca-web-pdf-panel {
+  display:grid;
+  gap:9px;
+  padding:10px;
+  border:1px solid #54aeff;
+  border-radius:7px;
+  background:#ddf4ff;
+}
+.ctca-web-pdf-panel[hidden] { display:none !important; }
+.ctca-web-pdf-continue { justify-self:start; }
+.ctca-web-pdf-continue[hidden] { display:none !important; }
+.ctca-web-pdf-status { flex:1 1 240px; color:#57606a; font-size:11px; overflow-wrap:anywhere; }
+.ctca-web-pdf-status-error { color:#cf222e; }
+.ctca-web-file-permission {
+  display:block;
+  padding:4px 6px;
+  color:#57606a;
+  background:#f6f8fa;
+  border:1px solid #d0d7de;
+  border-radius:4px;
+  font-size:10px;
+  line-height:1.35;
+}
+.ctca-web-file-permission[hidden] { display:none !important; }
+.ctca-web-file-permission-link {
+  color:#0969da;
+  font-weight:600;
+  text-decoration:none;
+  white-space:nowrap;
+}
+.ctca-web-file-permission-link:hover,
+.ctca-web-file-permission-link:focus-visible {
+  text-decoration:underline;
+}
+.ctca-web-pdf-status-loading::before {
+  content:"";
+  display:inline-block;
+  width:12px;
+  height:12px;
+  margin-right:7px;
+  border:2px solid currentColor;
+  border-right-color:transparent;
+  border-radius:50%;
+  vertical-align:-2px;
+  animation:ctca-web-pdf-spin .7s linear infinite;
+}
+@keyframes ctca-web-pdf-spin { to { transform:rotate(360deg); } }
+.ctca-web-pdf-results { display:grid; gap:7px; }
+.ctca-web-pdf-result {
+  display:grid;
+  grid-template-columns:auto minmax(0,1fr);
+  gap:8px;
+  align-items:start;
+  padding:8px;
+  border:1px solid #b6bec8;
+  border-radius:6px;
+  background:#fff;
+}
+.ctca-web-pdf-result > input { margin-top:9px; }
+.ctca-web-pdf-result-copy { display:grid; gap:5px; min-width:0; }
+.ctca-web-pdf-result-copy strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px; }
+.ctca-web-pdf-result-copy input { width:100%; }
 
 @media (max-width: 900px) {
   .ctca-pdf-layout,
@@ -3260,8 +4110,16 @@
   .ctca-pdf-collapse-notes,
   .ctca-pdf-restore-notes,
   .ctca-pdf-restore-details,
-  .ctca-pdf-browse { color:#e6edf3; background:#0d1117; border-color:#484f58; }
+  .ctca-pdf-browse,
+  .ctca-pdf-get-web,
+  .ctca-web-pdf-continue { color:#e6edf3; background:#0d1117; border-color:#484f58; }
   .ctca-pdf-browse-summary { color:#8c959f; }
+  .ctca-web-pdf-panel { background:#0c2d48; border-color:#1f6feb; }
+  .ctca-web-pdf-status { color:#b1bac4; }
+  .ctca-web-pdf-status-error { color:#ff7b72; }
+  .ctca-web-file-permission { color:#8c959f; background:#161b22; border-color:#30363d; }
+  .ctca-web-file-permission-link { color:#58a6ff; }
+  .ctca-web-pdf-result { color:#e6edf3; background:#0d1117; border-color:#484f58; }
 }
 
 /* Version 1.8.1: PDF tabs inside the ColLabTeX bibliography manager. */
@@ -3493,7 +4351,9 @@
 .ctca-app-dialog-card:has(.ctca-pdf-dialog-grid) {
   width: min(900px, calc(100vw - 32px));
 }
-
+.ctca-app-dialog-card:has(.ctca-pdf-import-dialog) {
+  width: min(980px, calc(100vw - 32px));
+}
 .ctca-app-dialog-controls,
 .ctca-pdf-dialog-grid,
 .ctca-pdf-provider-choices,
@@ -3583,6 +4443,22 @@
   padding-inline: 9px !important;
   font-size: 17px !important;
   line-height: 1;
+}
+.ctca-manager-options {
+  display:grid;
+  width:36px;
+  min-width:36px;
+  place-items:center;
+  padding:0 !important;
+}
+.ctca-manager-options svg {
+  width:18px;
+  height:18px;
+  fill:none;
+  stroke:currentColor;
+  stroke-width:1.9;
+  stroke-linecap:round;
+  stroke-linejoin:round;
 }
 
 .ctca-nextcloud-settings-actions {
@@ -3967,7 +4843,7 @@
 }
 
 
-/* Version 1.10.0: add/import hover menu next to the bibliography search. */
+/* Version 1.10.0: add/import menu next to the bibliography search. */
 .ctca-manager-add-menu-wrap {
   position: relative;
   flex: 0 0 auto;
@@ -3995,7 +4871,6 @@
   box-shadow: 0 8px 24px rgba(140,149,159,.28);
   transition: opacity 100ms ease, transform 100ms ease, visibility 100ms ease;
 }
-.ctca-manager-add-menu-wrap:hover .ctca-manager-add-menu,
 .ctca-manager-add-menu-wrap.ctca-manager-add-menu-open .ctca-manager-add-menu {
   opacity: 1;
   visibility: visible;
@@ -4134,6 +5009,31 @@
     background: #0d1117;
     border-color: #30363d;
     box-shadow: 0 3px 8px rgba(0, 0, 0, 0.32);
+  }
+  .ctca-manager-detail-title[data-manager-inline-field]:hover,
+  .ctca-manager-detail-authors[data-manager-inline-field]:hover,
+  .ctca-manager-detail-title[data-manager-inline-field]:focus-visible,
+  .ctca-manager-detail-authors[data-manager-inline-field]:focus-visible {
+    background: #162b45;
+  }
+  .ctca-manager-inline-editor {
+    color: #f0f6fc;
+    background: #0d1117;
+    border-color: #58a6ff;
+  }
+  .ctca-author-completion,
+  .ctca-field-completion {
+    color: #f0f6fc;
+    background: #161b22;
+    border-color: #484f58;
+    box-shadow: 0 4px 12px rgba(1, 4, 9, 0.5);
+  }
+  .ctca-completion-option:hover,
+  .ctca-completion-option:focus-visible {
+    background: #1f3a4d;
+  }
+  .ctca-completion-option-hint {
+    color: #8c959f;
   }
 }
 
@@ -4593,6 +5493,1012 @@ html.ctca-platform-overleaf #ctca-toolbar-button.ctca-overleaf-top-button {
   .ctca-nextcloud-picker-meta {
     display: none;
   }
+}
+
+/* OpenAlex citation counts and author-impact summary */
+.ctca-manager-details-column.ctca-openalex-impact-visible {
+  grid-template-rows: minmax(120px, var(--ctca-openalex-impact-height, 300px)) minmax(0, 1fr) !important;
+}
+
+.ctca-manager-details-column.ctca-openalex-impact-visible.ctca-openalex-impact-collapsed {
+  grid-template-rows: 42px minmax(0, 1fr) !important;
+}
+
+.ctca-openalex-impact-slot {
+  position: sticky;
+  top: 0;
+  z-index: 16;
+  box-sizing: border-box;
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  overflow: auto;
+  padding: 12px 12px 20px;
+  border-bottom: 1px solid #d0d7de;
+  background: #f6f8fa;
+  box-shadow: 0 4px 10px rgba(27, 31, 36, .08);
+}
+
+.ctca-openalex-impact-slot[hidden] {
+  display: none;
+}
+
+.ctca-openalex-impact-slot .ctca-openalex-impact {
+  margin: 0;
+}
+
+.ctca-openalex-impact-toggle {
+  display: grid;
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #8c959f;
+  border-radius: 5px;
+  background: #fff;
+  color: #24292f;
+  font: 700 18px/1 inherit;
+  cursor: pointer;
+}
+
+.ctca-openalex-impact-toggle:hover {
+  background: #f3f4f6;
+}
+
+.ctca-openalex-impact-slot.ctca-openalex-impact-collapsed {
+  padding: 0;
+  overflow: hidden;
+}
+
+.ctca-openalex-impact-slot.ctca-openalex-impact-collapsed .ctca-openalex-impact {
+  height: 100%;
+  padding: 0 8px 0 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.ctca-openalex-impact-slot.ctca-openalex-impact-collapsed .ctca-openalex-impact-head {
+  height: 100%;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-bottom: 0;
+}
+
+.ctca-openalex-impact-slot.ctca-openalex-impact-collapsed .ctca-openalex-kicker,
+.ctca-openalex-impact-slot.ctca-openalex-impact-collapsed .ctca-openalex-impact-state,
+.ctca-openalex-impact-slot.ctca-openalex-impact-collapsed .ctca-openalex-impact-body,
+.ctca-openalex-impact-slot.ctca-openalex-impact-collapsed .ctca-openalex-impact-resizer {
+  display: none;
+}
+
+.ctca-openalex-impact-slot.ctca-openalex-impact-collapsed .ctca-openalex-impact-head h3 {
+  margin: 0;
+  font-size: 13px;
+  line-height: 28px;
+  text-align: right;
+}
+
+.ctca-openalex-impact-resizer {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 10px;
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.ctca-openalex-impact-resizer::after {
+  position: absolute;
+  top: 4px;
+  left: 50%;
+  width: 52px;
+  height: 3px;
+  content: "";
+  background: #8c959f;
+  border-radius: 999px;
+  opacity: .75;
+  transform: translateX(-50%);
+}
+
+.ctca-openalex-impact-resizer:focus-visible {
+  outline: 2px solid #0969da;
+  outline-offset: -2px;
+}
+
+.ctca-openalex-citation {
+  display: inline-block;
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding-left: 10px;
+  color: #57606a;
+  font-size: .92em;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+#ctca-bib-manager .ctca-manager-row-publication {
+  display: flex;
+  align-items: baseline;
+}
+
+#ctca-bib-manager .ctca-manager-publication-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ctca-openalex-citation[hidden] {
+  display: none;
+}
+
+.ctca-orcid-works-dialog-card {
+  width: min(760px, calc(100vw - 32px));
+}
+
+.ctca-orcid-work-list {
+  display: grid;
+  gap: 8px;
+  max-height: min(480px, 55vh);
+  overflow: auto;
+}
+
+.ctca-orcid-work-loading {
+  display: flex;
+  flex-direction: column;
+  min-height: 120px;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: #57606a;
+  font-weight: 650;
+}
+
+.ctca-orcid-work-loading-main {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+}
+
+.ctca-orcid-work-loading-progress {
+  width: min(360px, 80%);
+  height: 8px;
+  accent-color: #0969da;
+}
+
+.ctca-orcid-work-loading-spinner {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  border: 3px solid #b6d7ff;
+  border-top-color: #0969da;
+  border-radius: 50%;
+  animation: ctca-manager-central-sync-spin 720ms linear infinite;
+}
+
+.ctca-orcid-work-choice {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 10px;
+  border: 1px solid #d0d7de;
+  border-radius: 7px;
+  background: #f6f8fa;
+  cursor: pointer;
+}
+
+.ctca-orcid-work-choice input {
+  margin-top: 3px;
+}
+
+.ctca-orcid-work-choice span,
+.ctca-orcid-work-choice strong,
+.ctca-orcid-work-choice small {
+  display: block;
+  min-width: 0;
+}
+
+.ctca-orcid-work-choice small {
+  margin-top: 3px;
+  color: #57606a;
+}
+
+.ctca-orcid-work-authors {
+  margin-top: 4px;
+  color: #24292f;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.ctca-openalex-impact {
+  margin: 0 0 16px;
+  padding: 14px;
+  border: 1px solid #b6d7f2;
+  border-radius: 10px;
+  background:
+    radial-gradient(circle at 100% 0, rgba(84, 174, 255, .14), transparent 42%),
+    #f6faff;
+  box-shadow: 0 2px 8px rgba(31, 111, 235, .07);
+}
+
+.ctca-openalex-impact-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.ctca-openalex-impact-head h3 {
+  margin: 1px 0 0;
+  color: #1f2328;
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.ctca-openalex-kicker {
+  color: #0969da;
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.ctca-openalex-impact-state {
+  max-width: 55%;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: #ddf4ff;
+  color: #0550ae;
+  font-size: 10px;
+  line-height: 1.25;
+  text-align: right;
+}
+
+.ctca-openalex-author-identity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 5px 9px;
+  margin-bottom: 10px;
+}
+
+.ctca-openalex-author-identity a {
+  color: #0969da;
+  font-size: 14px;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.ctca-openalex-author-identity a:hover {
+  text-decoration: underline;
+}
+
+.ctca-openalex-author-identity span {
+  color: #57606a;
+  font-size: 10px;
+}
+
+.ctca-openalex-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(88px, 1fr));
+  gap: 7px;
+}
+
+.ctca-openalex-metric {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid #d8dee4;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, .84);
+  cursor: help;
+}
+
+.ctca-openalex-metric:focus-visible {
+  outline: 2px solid #0969da;
+  outline-offset: 1px;
+}
+
+.ctca-openalex-metric strong,
+.ctca-openalex-metric span {
+  display: block;
+}
+
+.ctca-openalex-metric strong {
+  overflow: hidden;
+  color: #1f2328;
+  font-size: 17px;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+}
+
+.ctca-openalex-metric span {
+  margin-top: 3px;
+  color: #57606a;
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.ctca-openalex-chart-section {
+  margin-top: 14px;
+}
+
+.ctca-openalex-chart-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 7px;
+}
+
+.ctca-openalex-chart-heading strong {
+  color: #1f2328;
+  font-size: 12px;
+}
+
+.ctca-openalex-chart-heading span {
+  color: #6e7781;
+  cursor: help;
+  font-size: 9px;
+}
+
+.ctca-openalex-chart {
+  display: flex;
+  align-items: stretch;
+  gap: 3px;
+  min-height: 124px;
+  overflow-x: auto;
+  padding: 4px 2px 1px;
+  border-bottom: 1px solid #afb8c1;
+}
+
+.ctca-openalex-chart-column {
+  display: grid;
+  flex: 1 0 23px;
+  grid-template-rows: 18px 88px 16px;
+  min-width: 23px;
+  color: #57606a;
+  cursor: help;
+  text-align: center;
+}
+
+.ctca-openalex-chart-count {
+  overflow: hidden;
+  align-self: end;
+  font-size: 8px;
+  line-height: 1;
+  text-overflow: ellipsis;
+}
+
+.ctca-openalex-chart-track {
+  position: relative;
+  display: block;
+  margin: 3px 3px 0;
+}
+
+.ctca-openalex-chart-bar {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: block;
+  min-height: 0;
+  border-radius: 3px 3px 0 0;
+  background: linear-gradient(180deg, #54aeff, #0969da);
+}
+
+.ctca-openalex-chart-year {
+  padding-top: 3px;
+  font-size: 8px;
+  line-height: 1;
+}
+
+.ctca-openalex-chart-empty,
+.ctca-openalex-impact-message {
+  color: #57606a;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.ctca-openalex-impact-message {
+  margin: 0 0 10px;
+}
+
+.ctca-openalex-options-button {
+  padding: 5px 9px;
+  border: 1px solid #0969da;
+  border-radius: 6px;
+  background: #0969da;
+  color: #fff;
+  font: 650 11px/1.2 inherit;
+  cursor: pointer;
+}
+
+.ctca-openalex-impact-footnote {
+  margin: 10px 0 0;
+  color: #6e7781;
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+@media (prefers-color-scheme: dark) {
+  .ctca-openalex-impact-slot {
+    border-bottom-color: #30363d;
+    background: #0d1117;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, .28);
+  }
+
+  .ctca-openalex-citation {
+    color: #8c959f;
+  }
+
+  .ctca-openalex-impact {
+    border-color: #244f70;
+    background:
+      radial-gradient(circle at 100% 0, rgba(56, 139, 253, .18), transparent 42%),
+      #111d2a;
+    box-shadow: none;
+  }
+
+  .ctca-openalex-impact-head h3,
+  .ctca-openalex-metric strong,
+  .ctca-openalex-chart-heading strong {
+    color: #f0f6fc;
+  }
+
+  .ctca-openalex-kicker,
+  .ctca-openalex-author-identity a {
+    color: #58a6ff;
+  }
+
+  .ctca-openalex-impact-state {
+    background: #0c2d4a;
+    color: #79c0ff;
+  }
+
+  .ctca-openalex-metric {
+    border-color: #30363d;
+    background: rgba(22, 27, 34, .82);
+  }
+
+  .ctca-openalex-author-identity span,
+  .ctca-openalex-metric span,
+  .ctca-openalex-chart-count,
+  .ctca-openalex-chart-year,
+  .ctca-openalex-chart-empty,
+  .ctca-openalex-impact-message,
+  .ctca-openalex-impact-footnote,
+  .ctca-openalex-chart-heading span {
+    color: #8c959f;
+  }
+
+  .ctca-openalex-chart {
+    border-bottom-color: #484f58;
+  }
+}
+
+/* Compact PDF workspace: one editor toolbar, labeled collapsed rails, and full-height viewing. */
+.ctca-pdf-viewer-pane {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.ctca-pdf-frame,
+.ctca-pdf-unavailable {
+  grid-area: 1 / 1;
+}
+
+.ctca-pdf-unavailable[hidden] {
+  display: none !important;
+  pointer-events: none;
+}
+
+.ctca-pdf-frame[hidden] {
+  display: none !important;
+}
+
+
+#ctca-bib-manager.ctca-manager-pdf-active .ctca-manager-footer {
+  display: none;
+}
+
+.ctca-pdf-restore-notes,
+.ctca-pdf-restore-details {
+  width: 38px;
+  height: 100%;
+  min-height: 0;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 0;
+  border-bottom: 0;
+}
+
+.ctca-pdf-restore-icon {
+  flex: 0 0 auto;
+}
+
+.ctca-pdf-collapsed-label {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  color: #57606a;
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.ctca-pdf-layout.ctca-pdf-notes-collapsed .ctca-pdf-restore-notes,
+.ctca-pdf-layout.ctca-pdf-details-collapsed .ctca-pdf-restore-details {
+  display: flex;
+}
+
+#ctca-bib-manager.ctca-pdf-maximized .ctca-manager-header,
+#ctca-bib-manager.ctca-pdf-maximized .ctca-manager-tabs,
+#ctca-bib-manager.ctca-pdf-maximized .ctca-manager-footer,
+#ctca-bib-manager.ctca-pdf-maximized .ctca-manager-bibliography-view,
+#ctca-bib-manager.ctca-pdf-maximized .ctca-manager-body {
+  display: none !important;
+}
+
+#ctca-bib-manager.ctca-pdf-maximized .ctca-manager-pdf-view,
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout {
+  position: absolute;
+  inset: 0;
+  display: grid !important;
+  width: 100%;
+  height: 100%;
+}
+
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout {
+  grid-template-columns: minmax(0, 1fr) 6px var(--ctca-pdf-notes-width) 0 6px var(--ctca-pdf-details-width) 0 !important;
+  grid-template-rows: minmax(0, 1fr) !important;
+}
+
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout.ctca-pdf-notes-collapsed {
+  grid-template-columns: minmax(0, 1fr) 0 0 38px 6px var(--ctca-pdf-details-width) 0 !important;
+}
+
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout.ctca-pdf-details-collapsed {
+  grid-template-columns: minmax(0, 1fr) 6px var(--ctca-pdf-notes-width) 0 0 0 38px !important;
+}
+
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout.ctca-pdf-notes-collapsed.ctca-pdf-details-collapsed {
+  grid-template-columns: minmax(0, 1fr) 0 0 38px 0 0 38px !important;
+}
+
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-viewer-pane {
+  position: relative;
+  inset: auto;
+  display: grid !important;
+  grid-column: 1;
+  grid-row: 1;
+  width: auto;
+  height: auto;
+}
+
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-frame {
+  position: static;
+  inset: auto;
+}
+
+/* The bibliography details pane uses the same right-hand restore rail as the PDF view. */
+.ctca-manager-restore-details {
+  display: none;
+  grid-column: 4;
+  width: 38px;
+  height: 100%;
+  min-height: 0;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 8px 0;
+  border: 0;
+  border-left: 1px solid #d0d7de;
+  background: #f6f8fa;
+  color: #24292f;
+  cursor: pointer;
+}
+
+.ctca-manager-collapsed-label {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  color: #57606a;
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+#ctca-bib-manager .ctca-manager-content {
+  grid-template-columns: minmax(320px, 1fr) 6px minmax(360px, var(--ctca-details-width)) 0;
+}
+
+#ctca-bib-manager.ctca-details-collapsed .ctca-manager-content {
+  grid-template-columns: minmax(0, 1fr) 0 0 38px !important;
+}
+
+#ctca-bib-manager.ctca-details-collapsed .ctca-manager-list-column {
+  grid-column: 1;
+}
+
+#ctca-bib-manager.ctca-details-collapsed .ctca-manager-restore-details {
+  display: flex;
+}
+
+#ctca-bib-manager.ctca-details-collapsed .ctca-manager-collapse-details {
+  display: none;
+}
+
+@media (max-width: 900px) {
+  #ctca-bib-manager:not(.ctca-details-collapsed) .ctca-manager-content {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(260px, 45%) minmax(0, 1fr);
+  }
+
+  #ctca-bib-manager:not(.ctca-details-collapsed) .ctca-manager-details-column {
+    grid-column: 1;
+    border-top: 1px solid #d0d7de;
+  }
+
+  #ctca-bib-manager .ctca-manager-resizer-details {
+    display: none;
+  }
+
+  #ctca-bib-manager.ctca-details-collapsed .ctca-manager-content {
+    grid-template-columns: minmax(0, 1fr) 38px !important;
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  #ctca-bib-manager.ctca-details-collapsed .ctca-manager-restore-details {
+    grid-column: 2;
+  }
+}
+
+/* With no selected bibliography entry, use the full list width without a restore rail. */
+#ctca-bib-manager.ctca-details-no-selection .ctca-manager-content {
+  grid-template-columns: minmax(0, 1fr) 0 0 0 !important;
+}
+
+#ctca-bib-manager.ctca-details-no-selection .ctca-manager-restore-details {
+  display: none !important;
+}
+
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout:not(.ctca-pdf-notes-collapsed) .ctca-pdf-notes-pane,
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout:not(.ctca-pdf-details-collapsed) .ctca-pdf-entry-pane {
+  display: grid !important;
+}
+
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout.ctca-pdf-notes-collapsed .ctca-pdf-notes-pane,
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout.ctca-pdf-details-collapsed .ctca-pdf-entry-pane {
+  display: none !important;
+}
+
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout:not(.ctca-pdf-notes-collapsed) .ctca-pdf-resizer-notes,
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout:not(.ctca-pdf-details-collapsed) .ctca-pdf-resizer-details {
+  display: block !important;
+}
+
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout.ctca-pdf-notes-collapsed .ctca-pdf-resizer-notes,
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout.ctca-pdf-details-collapsed .ctca-pdf-resizer-details {
+  display: none !important;
+}
+
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout.ctca-pdf-notes-collapsed .ctca-pdf-restore-notes,
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout.ctca-pdf-details-collapsed .ctca-pdf-restore-details {
+  display: flex !important;
+}
+
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout:not(.ctca-pdf-notes-collapsed) .ctca-pdf-restore-notes,
+#ctca-bib-manager.ctca-pdf-maximized .ctca-pdf-layout:not(.ctca-pdf-details-collapsed) .ctca-pdf-restore-details {
+  display: none !important;
+}
+
+@media (prefers-color-scheme: dark) {
+  .ctca-pdf-collapsed-label,
+  .ctca-manager-collapsed-label {
+    color: #8c959f;
+  }
+
+  .ctca-manager-restore-details {
+    color: #e6edf3;
+    background: #0d1117;
+    border-color: #484f58;
+  }
+}
+
+/* Version 1.12.0: PDF-to-entry import and external PDF drop targets. */
+.ctca-pdf-import-dialog {
+  display: grid;
+  gap: 14px;
+  width: 100%;
+  min-width: 0;
+}
+
+.ctca-pdf-import-dropzone {
+  min-height: 190px;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  border: 2px dashed #8c959f;
+  border-radius: 10px;
+  background: #f6f8fa;
+  color: #57606a;
+  text-align: center;
+  font-size: 15px;
+  transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease;
+}
+
+.ctca-pdf-import-dropzone:focus-visible,
+.ctca-pdf-import-dropzone.ctca-pdf-import-drop-active {
+  border-color: #0969da;
+  background: #ddf4ff;
+  box-shadow: 0 0 0 3px rgba(9, 105, 218, .16);
+  outline: none;
+}
+
+.ctca-pdf-import-browse {
+  display: inline !important;
+  min-width: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+  color: #0969da !important;
+  font: inherit !important;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.ctca-pdf-import-selection {
+  display: grid;
+  gap: 6px;
+  max-height: 170px;
+  overflow: auto;
+}
+
+.ctca-pdf-import-empty {
+  color: #6e7781;
+  font-size: 12px;
+}
+
+.ctca-pdf-import-file {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 9px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.ctca-pdf-import-file > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ctca-pdf-import-file > small { color: #6e7781; }
+
+.ctca-pdf-import-file > button {
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #57606a;
+  font-size: 18px;
+}
+
+.ctca-pdf-import-link-note {
+  margin: -4px 0 0;
+  color: #6e7781;
+  font-size: 12px;
+}
+
+.ctca-pdf-import-report {
+  max-height: 220px;
+  overflow: auto;
+  padding: 9px 11px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  background: #f6f8fa;
+  color: #57606a;
+  white-space: pre-wrap;
+  font-size: 12px;
+}
+
+.ctca-manager-pdf-drop-active {
+  outline: 2px dashed #0969da !important;
+  outline-offset: -5px;
+  background-color: #ddf4ff !important;
+}
+
+@media (prefers-color-scheme: dark) {
+  .ctca-pdf-import-dropzone {
+    border-color: #6e7681;
+    background: #161b22;
+    color: #8c959f;
+  }
+
+  .ctca-pdf-import-dropzone:focus-visible,
+  .ctca-pdf-import-dropzone.ctca-pdf-import-drop-active {
+    border-color: #58a6ff;
+    background: #0d2841;
+  }
+
+  .ctca-pdf-import-browse { color: #58a6ff !important; }
+  .ctca-pdf-import-file {
+    border-color: #30363d;
+    background: #161b22;
+  }
+  .ctca-pdf-import-report {
+    border-color: #30363d;
+    background: #161b22;
+    color: #8c959f;
+  }
+  .ctca-manager-pdf-drop-active { background-color: #0d2841 !important; }
+}
+
+/* Version 1.13.1: reorderable PDF attachments and attachment downloads. */
+.ctca-manager-pdf-row {
+  position: relative;
+  grid-template-columns: 24px minmax(0, 1fr);
+}
+
+.ctca-manager-pdf-reorder {
+  grid-column: 1;
+  grid-row: 1 / 4;
+  align-self: stretch;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  min-width: 24px;
+  padding: 0;
+  color: #6e7781;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  cursor: grab;
+  font-size: 16px;
+  line-height: 1;
+  touch-action: none;
+}
+
+.ctca-manager-pdf-reorder:hover,
+.ctca-manager-pdf-reorder:focus-visible {
+  color: #0969da;
+  background: #ddf4ff;
+  outline: none;
+}
+
+.ctca-manager-pdf-reorder:active { cursor: grabbing; }
+.ctca-manager-pdf-name,
+.ctca-manager-pdf-meta {
+  grid-column: 2;
+}
+.ctca-manager-pdf-actions {
+  grid-column: 2;
+}
+.ctca-manager-pdf-row.ctca-manager-pdf-reordering {
+  opacity: .55;
+}
+.ctca-manager-pdf-row.ctca-manager-pdf-drop-before::before,
+.ctca-manager-pdf-row.ctca-manager-pdf-drop-after::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  height: 3px;
+  background: #0969da;
+  border-radius: 999px;
+  pointer-events: none;
+}
+.ctca-manager-pdf-row.ctca-manager-pdf-drop-before::before { top: -5px; }
+.ctca-manager-pdf-row.ctca-manager-pdf-drop-after::after { bottom: -5px; }
+.ctca-manager-pdf-download .ctca-manager-row-pdf-icon {
+  width: 15px;
+  height: 15px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .ctca-manager-pdf-reorder:hover,
+  .ctca-manager-pdf-reorder:focus-visible {
+    color: #58a6ff;
+    background: #0d2841;
+  }
+  .ctca-manager-pdf-row.ctca-manager-pdf-drop-before::before,
+  .ctca-manager-pdf-row.ctca-manager-pdf-drop-after::after {
+    background: #58a6ff;
+  }
+}
+
+/* Entry-scoped PDF attachment progress. */
+.ctca-manager-pdf-loading {
+  display: flex;
+  justify-content: center;
+  padding: 14px 0 4px;
+}
+
+.ctca-manager-pdf-loading[hidden] {
+  display: none !important;
+}
+
+.ctca-manager-pdf-loading-spinner {
+  display: inline-block;
+  width: 24px;
+  height: 24px;
+  border: 3px solid #b6d7ff;
+  border-top-color: #0969da;
+  border-radius: 50%;
+  animation: ctca-manager-central-sync-spin 720ms linear infinite;
+}
+
+.ctca-manager-row-pdf-loading-indicator {
+  position: absolute;
+  z-index: 3;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(255, 255, 255, 0.62);
+  pointer-events: none;
+}
+
+.ctca-manager-row-pdf-loading-indicator .ctca-manager-pdf-loading-spinner {
+  width: 20px;
+  height: 20px;
+  border-width: 2px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .ctca-manager-pdf-loading-spinner {
+    border-color: #304b6b;
+    border-top-color: #58a6ff;
+  }
+  .ctca-manager-row-pdf-loading-indicator {
+    background: rgba(13, 17, 23, 0.62);
+  }
+}
+
+/* Keep the configurable table grid authoritative over legacy manager rules. */
+#ctca-bib-manager .ctca-manager-table-head {
+  display: grid !important;
+  grid-template-columns: var(--ctca-manager-table-columns) !important;
+  gap: 0 !important;
+  box-sizing: border-box;
+  width: max(100%, calc(var(--ctca-manager-table-width) + 28px));
+  padding: 0 14px !important;
+  overflow: hidden;
+}
+#ctca-bib-manager .ctca-manager-row {
+  display: grid !important;
+  grid-template-columns: var(--ctca-manager-table-columns) !important;
+  grid-template-rows: auto auto auto !important;
+  grid-template-areas: none !important;
+  gap: 4px 0 !important;
+  box-sizing: border-box;
+  width: max(100%, calc(var(--ctca-manager-table-width) + 28px));
+  padding: 10px 14px 11px !important;
+}
+#ctca-bib-manager .ctca-manager-row.ctca-manager-row-authors-hidden {
+  grid-template-rows: auto auto !important;
+}
+#ctca-bib-manager .ctca-manager-row.ctca-manager-row-authors-hidden .ctca-manager-row-star,
+#ctca-bib-manager .ctca-manager-row.ctca-manager-row-authors-hidden .ctca-manager-row-select {
+  grid-row: 1 / 3;
+}
+#ctca-bib-manager .ctca-manager-row.ctca-manager-row-authors-hidden .ctca-manager-row-publication {
+  grid-row: 2 !important;
 }
 
 

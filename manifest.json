@@ -1,14 +1,31 @@
 {
   "manifest_version": 3,
   "name": "Smart Citations",
-  "version": "1.11.1",
+  "version": "2.0",
   "description": "Smart Citations provides citation autocomplete, BibTeX management, Nextcloud synchronization, and linked Nextcloud project-file import and refresh for Collabtex/Overleaf.",
   "permissions": [
     "storage",
     "tabs",
+    "scripting",
+    "notifications",
+    "downloads",
+    "offscreen",
+    "declarativeNetRequestWithHostAccess",
+    "clipboardWrite",
+    "identity",
     "unlimitedStorage"
   ],
   "content_scripts": [
+    {
+      "matches": [
+        "https://*/*",
+        "http://*/*"
+      ],
+      "js": [
+        "manuscript-links.js"
+      ],
+      "run_at": "document_idle"
+    },
     {
       "matches": [
         "https://*/*"
@@ -29,12 +46,17 @@
         "https://*/*"
       ],
       "css": [
-        "content.css"
+        "content.css",
+        "privacy-consent.css"
       ],
       "js": [
+        "latex-renderer.js",
         "bibtex-parser.js",
         "search-tools.js",
         "attachments.js",
+        "pdf-import.js",
+        "privacy-consent.js",
+        "openalex.js",
         "content.js"
       ],
       "run_at": "document_idle",
@@ -48,6 +70,10 @@
   "action": {
     "default_title": "Open Smart Citations bibliography manager"
   },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
   "icons": {
     "16": "icons/icon16.png",
     "32": "icons/icon32.png",
@@ -56,7 +82,7 @@
   },
   "browser_specific_settings": {
     "gecko": {
-      "id": "collabtex-citation-assistant@t-kluge.de",
+      "id": "collabtex-citation-assistant@smartioz.com",
       "strict_min_version": "128.0",
       "data_collection_permissions": {
         "required": [
@@ -68,18 +94,18 @@
   "host_permissions": [
     "https://api.crossref.org/*",
     "https://api.datacite.org/*",
-    "https://doi.org/*"
+    "https://api.openalex.org/*",
+    "https://orcid.org/*",
+    "https://pub.orcid.org/*",
+    "https://doi.org/*",
+    "file:///*"
   ],
   "background": {
-    "scripts": [
-      "background.js"
-    ],
     "service_worker": "background.js"
   },
   "optional_host_permissions": [
     "https://*/*",
     "http://*/*",
-    "file:///*",
     "<all_urls>"
   ],
   "web_accessible_resources": [

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: CC-BY-NC-SA-4.0 */
+
 (() => {
   "use strict";
 
@@ -59,7 +61,7 @@
       .trim();
   }
 
-  function splitAuthors(value) {
+  function splitAuthorsRaw(value) {
     const normalizedValue = stripOuterDelimiters(value);
     const authors = [];
     let current = "";
@@ -86,7 +88,7 @@
         normalizedValue.slice(index, index + 5).toLowerCase() === " and "
       ) {
         if (current.trim()) {
-          authors.push(latexToText(current));
+          authors.push(current.trim());
         }
         current = "";
         index += 5;
@@ -98,10 +100,128 @@
     }
 
     if (current.trim()) {
-      authors.push(latexToText(current));
+      authors.push(current.trim());
     }
 
     return authors.filter(Boolean);
+  }
+
+  function splitAuthors(value) {
+    const toText = window.CollabTeXLatex?.toText || latexToText;
+    return splitAuthorsRaw(value).map(formatAuthorNameRaw).map(toText).filter(Boolean);
+  }
+
+  function formatAuthorNameRaw(value) {
+    const name = String(value || "").trim();
+    if (!name) return "";
+
+    const parts = splitTopLevel(name).map((part) => part.trim());
+    if (parts.length < 2) return name;
+
+    const family = parts[0];
+    const suffix = parts.length > 2 ? parts.slice(1, -1).filter(Boolean).join(", ") : "";
+    const given = parts[parts.length - 1];
+    if (!given) return [family, suffix].filter(Boolean).join(", ");
+    return `${given} ${family}${suffix ? `, ${suffix}` : ""}`.trim();
+  }
+
+  function formatAuthorName(value) {
+    const toText = window.CollabTeXLatex?.toText || latexToText;
+    return toText(formatAuthorNameRaw(value));
+  }
+
+  function authorFamilyName(value) {
+    const name = String(value || "").trim();
+    if (!name) return "";
+    const parts = splitTopLevel(name).map((part) => part.trim());
+    if (parts.length > 1) return latexToText(parts[0]);
+    const plain = latexToText(name);
+    return plain.split(/\s+/).pop() || plain;
+  }
+
+  function splitAuthorsDisplayRaw(value) {
+    return splitAuthorsRaw(value).map(formatAuthorNameRaw).filter(Boolean);
+  }
+
+  function createAuthorIndex(values) {
+    const byValue = new Map();
+    for (const value of values || []) {
+      for (const author of splitAuthorsRaw(value)) {
+        const normalized = author.replace(/\s+/g, " ").trim();
+        const key = normalized.toLocaleLowerCase();
+        if (!normalized || byValue.has(key)) continue;
+        const label = formatAuthorName(normalized);
+        byValue.set(key, {
+          value: normalized,
+          label,
+          matchText: `${normalized}\n${label}`.toLocaleLowerCase()
+        });
+      }
+    }
+    return [...byValue.values()].sort((left, right) =>
+      left.label.localeCompare(right.label, undefined, { sensitivity: "base" })
+    );
+  }
+
+  function authorTokenAt(value, caret) {
+    const text = String(value || "");
+    const position = Math.max(0, Math.min(text.length, Number(caret) || 0));
+    let depth = 0;
+    let start = 0;
+    let end = text.length;
+
+    for (let index = 0; index < text.length;) {
+      const char = text[index];
+      if (char === "{") {
+        depth += 1;
+        index += 1;
+        continue;
+      }
+      if (char === "}") {
+        depth = Math.max(0, depth - 1);
+        index += 1;
+        continue;
+      }
+      if (depth === 0 && text.slice(index, index + 5).toLowerCase() === " and ") {
+        if (index < position) {
+          start = index + 5;
+        } else {
+          end = index;
+          break;
+        }
+        index += 5;
+        continue;
+      }
+      index += 1;
+    }
+
+    const raw = text.slice(start, end);
+    const leading = raw.match(/^\s*/)?.[0].length || 0;
+    const trailing = raw.match(/\s*$/)?.[0].length || 0;
+    return {
+      start: start + leading,
+      end: Math.max(start + leading, end - trailing),
+      value: raw.trim()
+    };
+  }
+
+  function findAuthorCompletions(index, value, caret, limit = 8) {
+    const token = authorTokenAt(value, caret);
+    const query = token.value.replace(/\s+/g, " ").trim().toLocaleLowerCase();
+    if (!query || caret < token.end) return [];
+    return (index || [])
+      .filter((candidate) =>
+        candidate.value.toLocaleLowerCase() !== query &&
+        (candidate.value.toLocaleLowerCase().startsWith(query) ||
+          candidate.label.toLocaleLowerCase().startsWith(query) ||
+          candidate.matchText.split(/\s+/).some((part) => part.startsWith(query)))
+      )
+      .slice(0, Math.max(1, Number(limit) || 8))
+      .map((suggestion) => ({ ...suggestion, start: token.start, end: token.end }));
+  }
+
+  function findAuthorCompletion(index, value, caret) {
+    return findAuthorCompletions(index, value, caret, 1)[0] || null;
   }
 
   function readBalanced(text, startIndex, openChar, closeChar) {
@@ -402,6 +522,14 @@
     parseBibTeX,
     latexToText,
     splitAuthors,
+    splitAuthorsRaw,
+    splitAuthorsDisplayRaw,
+    formatAuthorName,
+    formatAuthorNameRaw,
+    authorFamilyName,
+    createAuthorIndex,
+    findAuthorCompletions,
+    findAuthorCompletion,
     normalizeDoi,
     normalizeAbstract,
     extractUrl

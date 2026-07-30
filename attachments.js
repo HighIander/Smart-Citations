@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: CC-BY-NC-SA-4.0 */
+
 (() => {
   "use strict";
   const api = globalThis.browser ?? globalThis.chrome;
@@ -15,6 +17,9 @@
   const STORE_NAME = "files";
   const HANDLE_STORE_NAME = "handles";
   const sessionLocalFiles = new Map();
+  let attachmentIndexCache = null;
+  let attachmentIndexLoadPromise = null;
+  let attachmentIndexCacheRevision = 0;
 
   const now = () => new Date().toISOString();
   const uuid = () => globalThis.crypto?.randomUUID?.() || `att-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -44,10 +49,16 @@
   async function backgroundRequest(message) {
     try {
       const response = await api.runtime.sendMessage(message);
-      if (!response?.ok) throw new Error(response?.error || "The extension PDF storage service did not respond.");
+      if (!response?.ok) {
+        const error = new Error(response?.error || "The extension PDF storage service did not respond.");
+        if (response?.code) error.code = String(response.code);
+        throw error;
+      }
       return response;
     } catch (error) {
-      throw new Error(error?.message || String(error));
+      const wrapped = new Error(error?.message || String(error));
+      if (error?.code) wrapped.code = String(error.code);
+      throw wrapped;
     }
   }
 
@@ -92,6 +103,33 @@
     headers[existing || name] = String(value);
   }
 
+  function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    const chunkSize = 0x8000;
+    let binary = "";
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+    }
+    return btoa(binary);
+  }
+
+  function base64ToUint8Array(value) {
+    const binary = atob(String(value || ""));
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    return bytes;
+  }
+
+  async function responseJson(response, context) {
+    const text = await response.text();
+    if (!text.trim()) throw new Error(`${context} returned an empty response.`);
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      throw new Error(`${context} returned invalid JSON.`);
+    }
+  }
+
   async function extensionFetch(url, options = {}) {
     const headers = headersToObject(options.headers);
     let bodyBytes = null;
@@ -114,7 +152,7 @@
       url,
       method: options.method || "GET",
       headers,
-      bodyBytes,
+      bodyBase64: bodyBytes ? arrayBufferToBase64(bodyBytes) : null,
       bodyText
     });
     const responseInit = {
@@ -124,11 +162,16 @@
     };
     const method = String(options.method || "GET").toUpperCase();
     const hasNullBodyStatus = [204, 205, 304].includes(response.status);
-    const hasBodyBytes = response.bodyBytes && response.bodyBytes.byteLength > 0;
+    const responseBytes = typeof response.bodyBase64 === "string"
+      ? base64ToUint8Array(response.bodyBase64)
+      : response.bodyBytes
+        ? new Uint8Array(response.bodyBytes)
+        : null;
+    const hasBodyBytes = responseBytes && responseBytes.byteLength > 0;
     if (method === "HEAD" || hasNullBodyStatus || !hasBodyBytes) {
       return new Response(undefined, responseInit);
     }
-    return new Response(new Uint8Array(response.bodyBytes), responseInit);
+    return new Response(responseBytes, responseInit);
   }
 
   async function storeBrowserBlob(id, blob) {
@@ -146,14 +189,59 @@
     if (!response.found || !response.bytes) return null;
     return new Blob([response.bytes], { type: response.mimeType || "application/pdf" });
   }
-  async function loadIndex() {
-    const value = await storageGet(INDEX_KEY);
-    return value && Array.isArray(value.attachments) ? value : { version: 1, attachments: [], updatedAt: "" };
+
+  function normalizeAttachmentIndex(value) {
+    return value && Array.isArray(value.attachments)
+      ? value
+      : { version: 1, attachments: [], updatedAt: "" };
   }
+
+  function cloneAttachmentIndex(index) {
+    return {
+      ...index,
+      attachments: index.attachments.map((attachment) => ({
+        ...attachment,
+        entry: attachment.entry ? { ...attachment.entry } : attachment.entry
+      }))
+    };
+  }
+
+  async function loadIndex() {
+    if (!attachmentIndexCache) {
+      if (!attachmentIndexLoadPromise) {
+        const loadRevision = attachmentIndexCacheRevision;
+        const pending = storageGet(INDEX_KEY).then((value) => {
+          if (attachmentIndexCacheRevision === loadRevision || !attachmentIndexCache) {
+            attachmentIndexCache = normalizeAttachmentIndex(value);
+          }
+          return attachmentIndexCache;
+        });
+        attachmentIndexLoadPromise = pending;
+        const clearPending = () => {
+          if (attachmentIndexLoadPromise === pending) attachmentIndexLoadPromise = null;
+        };
+        pending.then(clearPending, clearPending);
+      }
+      await attachmentIndexLoadPromise;
+    }
+    return cloneAttachmentIndex(attachmentIndexCache);
+  }
+
   async function saveIndex(index) {
     index.updatedAt = now();
-    await storageSet(INDEX_KEY, index);
+    const next = cloneAttachmentIndex(normalizeAttachmentIndex(index));
+    await storageSet(INDEX_KEY, next);
+    attachmentIndexCache = next;
+    attachmentIndexCacheRevision += 1;
   }
+
+  api.storage.onChanged?.addListener((changes, areaName) => {
+    if (areaName !== "local" || !Object.prototype.hasOwnProperty.call(changes, INDEX_KEY)) return;
+    attachmentIndexCache = normalizeAttachmentIndex(changes[INDEX_KEY]?.newValue);
+    attachmentIndexLoadPromise = null;
+    attachmentIndexCacheRevision += 1;
+  });
+
   async function getConfig() {
     const stored = await storageGet(CONFIG_KEY);
     const defaults = {
@@ -302,7 +390,7 @@
     onStatus("Starting Nextcloud client login flow…");
     const start = await extensionFetch(`${server}/index.php/login/v2`, { method: "POST" });
     if (!start.ok) throw new Error(`Nextcloud login flow could not be started (${start.status}).`);
-    const flow = await start.json();
+    const flow = await responseJson(start, "Nextcloud login flow");
     if (!flow?.login || !flow?.poll?.endpoint || !flow?.poll?.token) throw new Error("Nextcloud returned an invalid login-flow response.");
     // browser.tabs is unavailable in Firefox content scripts. Opening the
     // login page through the background context works identically from both
@@ -317,7 +405,7 @@
       const response = await extensionFetch(flow.poll.endpoint, { method: "POST", body });
       if (response.status === 404) continue;
       if (!response.ok) throw new Error(`Nextcloud login polling failed (${response.status}).`);
-      credentials = await response.json();
+      credentials = await responseJson(response, "Nextcloud login polling");
       break;
     }
     if (!credentials) throw new Error("Nextcloud login timed out.");
@@ -327,7 +415,7 @@
       const userResponse = await extensionFetch(`${credentials.server}/ocs/v2.php/cloud/user?format=json`, {
         headers: { Authorization: auth, "OCS-APIRequest": "true", Accept: "application/json" }
       });
-      if (userResponse.ok) userId = (await userResponse.json())?.ocs?.data?.id || userId;
+      if (userResponse.ok) userId = (await responseJson(userResponse, "Nextcloud user lookup"))?.ocs?.data?.id || userId;
     } catch (_) {}
     const config = await getConfig();
     config.provider = "nextcloud";
@@ -404,7 +492,61 @@
   async function list(entry) {
     const ref = entryRef(entry);
     const index = await loadIndex();
-    return index.attachments.filter((item) => item.entry?.identity === ref.identity || (ref.doi && item.entry?.doi === ref.doi) || item.entry?.key === ref.key);
+    return orderedAttachmentsForEntry(index, ref);
+  }
+
+  function attachmentMatchesEntry(attachment, ref) {
+    return attachment?.entry?.identity === ref.identity
+      || (ref.doi && attachment?.entry?.doi === ref.doi)
+      || attachment?.entry?.key === ref.key;
+  }
+
+  function orderedAttachmentsForEntry(index, ref) {
+    return index.attachments
+      .map((attachment, indexPosition) => ({ attachment, indexPosition }))
+      .filter(({ attachment }) => attachmentMatchesEntry(attachment, ref))
+      .sort((left, right) => {
+        const leftPosition = Number.isFinite(Number(left.attachment.position))
+          ? Number(left.attachment.position)
+          : 1_000_000 + left.indexPosition;
+        const rightPosition = Number.isFinite(Number(right.attachment.position))
+          ? Number(right.attachment.position)
+          : 1_000_000 + right.indexPosition;
+        return leftPosition - rightPosition || left.indexPosition - right.indexPosition;
+      })
+      .map(({ attachment }) => attachment);
+  }
+
+  async function reorder(entry, orderedIds) {
+    const ref = entryRef(entry);
+    const index = await loadIndex();
+    const current = orderedAttachmentsForEntry(index, ref);
+    const currentIds = current.map((item) => item.id);
+    const requestedIds = [...new Set((Array.isArray(orderedIds) ? orderedIds : []).map(String))];
+    if (
+      requestedIds.length !== currentIds.length
+      || requestedIds.some((id) => !currentIds.includes(id))
+    ) {
+      throw new Error("The PDF attachment order is out of date. Reload the entry and try again.");
+    }
+    if (requestedIds.every((id, index) => id === currentIds[index])) return current;
+
+    const byId = new Map(current.map((item) => [item.id, item]));
+    const reordered = requestedIds.map((id) => byId.get(id));
+    const changedAt = now();
+    reordered.forEach((attachment, position) => {
+      attachment.position = position;
+      attachment.updatedAt = changedAt;
+    });
+    let entryIndex = 0;
+    index.attachments = index.attachments.map((attachment) =>
+      attachmentMatchesEntry(attachment, ref) ? reordered[entryIndex++] : attachment
+    );
+    await saveIndex(index);
+    if (reordered.some((attachment) => attachment.provider === "nextcloud")) {
+      await writeRemoteIndex((await getConfig()).nextcloud, index);
+    }
+    return reordered;
   }
 
   function isPdfFile(file) {
@@ -508,35 +650,122 @@
   }
 
   async function isLocalFilePermissionGranted() {
+    let fileSchemeAccess = null;
+    const firefoxVersion = Number(/\bFirefox\/(\d+)/i.exec(globalThis.navigator?.userAgent || "")?.[1]) || 0;
     try {
       if (typeof api.extension?.isAllowedFileSchemeAccess === "function") {
-        if (await api.extension.isAllowedFileSchemeAccess()) return true;
+        fileSchemeAccess = await api.extension.isAllowedFileSchemeAccess();
       }
     } catch (_error) {}
+    if (fileSchemeAccess === false && (!firefoxVersion || firefoxVersion >= 153)) return false;
+    let declaredAccess = fileSchemeAccess === true;
     try {
       if (api.permissions?.contains) {
-        if (await api.permissions.contains({ origins: ["file:///*"] })) return true;
+        if (await api.permissions.contains({ origins: ["file:///*"] })) declaredAccess = true;
         // Firefox up to version 152 covers local files through the broad
         // “Access your data for all websites” permission rather than a
         // separate local-files switch.
-        if (await api.permissions.contains({ origins: ["<all_urls>"] })) return true;
+        if (firefoxVersion && firefoxVersion < 153
+          && await api.permissions.contains({ origins: ["<all_urls>"] })) declaredAccess = true;
       }
     } catch (_error) {}
-    return false;
+    return declaredAccess;
   }
 
   async function ensureLocalFilePermission() {
-    if (await isLocalFilePermissionGranted()) return true;
-    if (api.permissions?.request) {
-      for (const origins of [["file:///*"], ["<all_urls>"]]) {
-        try {
-          const granted = await api.permissions.request({ origins });
-          if (granted && await isLocalFilePermissionGranted()) return true;
-        } catch (_error) {}
+    return isLocalFilePermissionGranted();
+  }
+
+  async function openLocalFilePermissionSettings() {
+    return backgroundRequest({ type: "ctca-open-local-file-permission-settings" });
+  }
+
+  function normalizeWebUrl(value) {
+    const url = new URL(String(value || "").trim());
+    if (!/^https?:$/.test(url.protocol)) throw new Error("The webpage URL must use HTTP or HTTPS.");
+    return url.href;
+  }
+
+  async function discoverWebPdfs(value, options = {}) {
+    const url = normalizeWebUrl(value);
+    if (!(await requestOriginPermission(url))) {
+      throw new Error("Permission to inspect this webpage was not granted.");
+    }
+    const response = await backgroundRequest({
+      type: "ctca-discover-web-pdfs",
+      url,
+      tabId: Number.isInteger(options.tabId) ? options.tabId : null,
+      preserveTab: options.preserveTab === true
+    });
+    return {
+      finalUrl: response.finalUrl || url,
+      candidates: Array.isArray(response.candidates)
+        ? response.candidates.slice(0, 4).map((candidate) => ({
+            ...candidate,
+            tabId: Number.isInteger(candidate.tabId)
+              ? candidate.tabId
+              : (Number.isInteger(response.tabId) ? response.tabId : null)
+          }))
+        : [],
+      permissionRequired: response.permissionRequired === true,
+      humanCheckRequired: response.humanCheckRequired === true,
+      pageStillLoading: response.pageStillLoading === true,
+      tabId: Number.isInteger(response.tabId) ? response.tabId : null
+    };
+  }
+
+  async function showWebHumanCheck(tabId, url = "") {
+    return backgroundRequest({ type: "ctca-show-web-human-check", tabId, url });
+  }
+
+  async function closeWebTab(tabId) {
+    if (!Number.isInteger(tabId)) return false;
+    try {
+      await backgroundRequest({ type: "ctca-close-web-tab", tabId });
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  async function downloadWebPdf(value, sourceValue = "", tabId = null) {
+    const url = normalizeWebUrl(value);
+    if (!(await requestOriginPermission(url))) {
+      throw new Error("Permission to download this PDF was not granted.");
+    }
+    const sourceUrl = sourceValue ? normalizeWebUrl(sourceValue) : url;
+    const response = await backgroundRequest({
+      type: "ctca-download-web-pdf",
+      url,
+      sourceUrl,
+      tabId: Number.isInteger(tabId) ? tabId : null
+    });
+    const expectedLength = Number(response.byteLength) || 0;
+    const bytes = new Uint8Array(expectedLength);
+    let offset = 0;
+    try {
+      while (offset < expectedLength) {
+        const chunkResponse = await backgroundRequest({
+          type: "ctca-read-web-pdf-chunk",
+          downloadId: response.downloadId,
+          offset,
+          length: Math.min(512 * 1024, expectedLength - offset)
+        });
+        const chunk = base64ToUint8Array(chunkResponse.bodyBase64 || "");
+        if (!chunk.byteLength) throw new Error("The downloaded PDF data was not transferred completely.");
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+    } finally {
+      if (response.downloadId) {
+        backgroundRequest({ type: "ctca-release-web-pdf-download", downloadId: response.downloadId }).catch(() => {});
       }
     }
-    const response = await backgroundRequest({ type: "ctca-request-local-file-permission" });
-    return response.granted === true;
+    if (!bytes.byteLength || offset !== expectedLength) {
+      throw new Error("The downloaded PDF data was not transferred completely.");
+    }
+    const fileName = String(response.fileName || "document.pdf").replace(/[\\/:*?"<>|]+/g, "_");
+    return new File([bytes], fileName, { type: response.mimeType || "application/pdf" });
   }
 
   async function addLocalLink(entry, url, name) {
@@ -834,6 +1063,9 @@
         pendingCount: Math.max(0, Number(raw.pendingCount) || 0),
         pendingRevision: Math.max(0, Number(raw.pendingRevision) || 0),
         acknowledgedRevision: Math.max(0, Number(raw.acknowledgedRevision) || 0),
+        pendingEntryIdentities: [...new Set((Array.isArray(raw.pendingEntryIdentities) ? raw.pendingEntryIdentities : [])
+          .map((identity) => String(identity || "").trim().toLowerCase())
+          .filter((identity) => identity.startsWith("key:")))],
         registeredAt: String(raw.registeredAt || ""),
         updatedAt: String(raw.updatedAt || "")
       };
@@ -841,14 +1073,19 @@
     return { version: 1, revision: Math.max(0, Number(source.revision) || 0), documents };
   }
 
-  function markAllDocumentsPending(documentSync, changeCount = 1) {
+  function markAllDocumentsPending(documentSync, changeCount = 1, changedEntryIdentities = []) {
     const sync = normalizeDocumentSyncState(documentSync);
     const nowValue = now();
     const increment = Math.max(1, Number(changeCount) || 1);
     sync.revision += 1;
     for (const flag of Object.values(sync.documents)) {
+      const pendingEntryIdentities = new Set(flag.pendingEntryIdentities || []);
+      for (const identity of changedEntryIdentities) pendingEntryIdentities.add(identity);
       flag.pending = true;
-      flag.pendingCount = Math.max(0, Number(flag.pendingCount) || 0) + increment;
+      flag.pendingEntryIdentities = [...pendingEntryIdentities];
+      flag.pendingCount = flag.pendingEntryIdentities.length
+        ? flag.pendingEntryIdentities.length
+        : Math.max(0, Number(flag.pendingCount) || 0) + increment;
       flag.pendingRevision = sync.revision;
       flag.updatedAt = nowValue;
     }
@@ -857,8 +1094,24 @@
 
   function databaseContentString(databaseInput) {
     const database = normalizeDatabase(databaseInput);
-    const { documentSync: _documentSync, updatedAt: _updatedAt, ...content } = database;
-    return stableString(content);
+    return stableString({
+      entries: database.entries.map(comparableEntry).sort(),
+      categories: database.categories,
+      memberships: database.memberships,
+      deletedEntries: database.deletedEntries
+        .map((item) => String(item?.identity || "").toLowerCase())
+        .filter(Boolean)
+        .sort()
+    });
+  }
+
+  function changedDatabaseEntryIdentities(previousInput, nextInput) {
+    const previous = normalizeDatabase(previousInput);
+    const next = normalizeDatabase(nextInput);
+    const previousByIdentity = new Map(previous.entries.map((entry) => [databaseEntryIdentity(entry), comparableEntry(entry)]));
+    const nextByIdentity = new Map(next.entries.map((entry) => [databaseEntryIdentity(entry), comparableEntry(entry)]));
+    const identities = new Set([...previousByIdentity.keys(), ...nextByIdentity.keys()]);
+    return [...identities].filter((identity) => previousByIdentity.get(identity) !== nextByIdentity.get(identity));
   }
 
   function normalizeDatabase(database) {
@@ -870,7 +1123,9 @@
       aliases: [...new Set(entry?.aliases || [])],
       tags: [...new Set(entry?.tags || [])],
       updatedAt: String(entry?.updatedAt || ""),
-      doiSyncedAt: String(entry?.doiSyncedAt || "")
+      doiSyncedAt: String(entry?.doiSyncedAt || ""),
+      addedOn: String(entry?.addedOn || entry?.createdAt || entry?.updatedAt || ""),
+      starred: entry?.starred === true
     })) : [];
     const presentIdentities = new Set(entries.map(databaseDeletionIdentity));
     return {
@@ -933,7 +1188,9 @@
       type: normalizeComparableText(entry.type || "misc").toLowerCase(),
       fields,
       aliases: normalizedSet(entry.aliases, { lower: true }),
-      tags: normalizedSet(entry.tags, { lower: true })
+      tags: normalizedSet(entry.tags, { lower: true }),
+      addedOn: normalizeComparableText(entry.addedOn),
+      starred: entry.starred === true
     });
   }
 
@@ -1072,6 +1329,8 @@
       if ((memberships[entry.key] || []).length) fields.ctca_categories = memberships[entry.key].join(",");
       if (index === 0 && categoryTree) fields.ctca_category_tree = categoryTree;
       if (entry.doiSyncedAt) fields.ctca_doi_synced = entry.doiSyncedAt;
+      if (entry.addedOn) fields.ctca_added_on = entry.addedOn;
+      if (entry.starred) fields.ctca_starred = "true";
       const body = Object.entries(fields)
         .filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== "")
         .map(([name, value]) => `  ${name} = {${bibEscape(value)}}`)
@@ -1132,7 +1391,7 @@
     const treeCandidates = [];
     const internalFields = new Set([
       "ctca_meta_version", "ctca_doi_synced", "ctca_tags",
-      "ctca_categories", "ctca_category_tree"
+      "ctca_categories", "ctca_category_tree", "ctca_added_on", "ctca_starred"
     ]);
 
     for (const record of records) {
@@ -1162,7 +1421,9 @@
         aliases,
         tags,
         updatedAt: "",
-        doiSyncedAt: stripBibValue(rawFields.ctca_doi_synced || "")
+        doiSyncedAt: stripBibValue(rawFields.ctca_doi_synced || ""),
+        addedOn: stripBibValue(rawFields.ctca_added_on || ""),
+        starred: /^(?:true|1|yes|starred)$/i.test(stripBibValue(rawFields.ctca_starred || ""))
       });
     }
 
@@ -1206,7 +1467,12 @@
     normalized.documentSync = normalizeDocumentSyncState(previous.documentSync);
     const remoteContentChanged = remoteChanged && databaseContentString(normalized) !== databaseContentString(previous);
     if (remoteContentChanged) {
-      normalized.documentSync = markAllDocumentsPending(normalized.documentSync, 1);
+      const changedEntryIdentities = changedDatabaseEntryIdentities(previous, normalized);
+      normalized.documentSync = markAllDocumentsPending(
+        normalized.documentSync,
+        Math.max(1, changedEntryIdentities.length),
+        changedEntryIdentities
+      );
     }
     if (stableString(normalized) !== stableString(previous)) {
       await storageSet(GLOBAL_DATABASE_KEY, normalized);
@@ -1252,6 +1518,63 @@
       await writeRemoteBibliography(nc, merged);
     }
     return { status: "synchronized", database: merged, conflicts: [] };
+  }
+
+  async function deleteBibliographyEntriesNextcloud(entriesInput) {
+    const config = await getConfig();
+    const nc = config.nextcloud;
+    if (!nc?.syncBibliography) return { status: "disabled", deleted: 0 };
+    if (!nc?.server || !nc?.appPassword) throw new Error("Connect a Nextcloud account first.");
+
+    const requestedEntries = Array.isArray(entriesInput) ? entriesInput : [];
+    const requestedIdentities = new Set(
+      requestedEntries
+        .map(databaseEntryIdentity)
+        .filter((identity) => identity !== "key:")
+    );
+    if (!requestedIdentities.size) return { status: "unchanged", deleted: 0 };
+
+    await ensureNextcloudFolders(nc);
+    const remote = await readRemoteBibliography(nc);
+    if (!remote) return { status: "missing", deleted: 0 };
+
+    const removedEntries = remote.entries.filter((entry) =>
+      requestedIdentities.has(databaseEntryIdentity(entry))
+    );
+    if (!removedEntries.length) return { status: "unchanged", deleted: 0 };
+
+    const removedKeys = new Set(
+      removedEntries.map((entry) => String(entry.key || "").trim().toLowerCase())
+    );
+    const memberships = Object.fromEntries(
+      Object.entries(remote.memberships || {})
+        .filter(([key]) => !removedKeys.has(String(key || "").trim().toLowerCase()))
+        .map(([key, categoryIds]) => [key, [...categoryIds]])
+    );
+    const local = normalizeDatabase(await storageGet(GLOBAL_DATABASE_KEY));
+    const requestedTombstones = requestedEntries.map((entry) => ({
+      identity: databaseDeletionIdentity(entry),
+      doi: normalizeDoi(entry?.fields?.doi || ""),
+      key: String(entry?.key || ""),
+      title: stripBibValue(entry?.fields?.title || ""),
+      deletedAt: now(),
+      source: "global"
+    }));
+    const nextRemote = normalizeDatabase({
+      ...remote,
+      entries: remote.entries.filter((entry) =>
+        !requestedIdentities.has(databaseEntryIdentity(entry))
+      ),
+      memberships,
+      deletedEntries: [
+        ...(remote.deletedEntries || []),
+        ...(local.deletedEntries || []),
+        ...requestedTombstones
+      ],
+      updatedAt: now()
+    });
+    await writeRemoteBibliography(nc, nextRemote);
+    return { status: "deleted", deleted: removedEntries.length, database: nextRemote };
   }
 
   async function resolveBibliographyConflicts(syncResult, choices = {}) {
@@ -1435,9 +1758,10 @@
 
   globalThis.CollabTeXAttachmentStore = {
     INDEX_KEY, CONFIG_KEY, GLOBAL_DATABASE_KEY, entryRef, getConfig, saveConfig, checkNextcloudConnection, connectNextcloud, syncNextcloud,
-    syncBibliographyNextcloud, resolveBibliographyConflicts, databaseToBib, bibToDatabase, isPdfFile,
-    list, addBrowser, addLocalLink, addLocalSession, addLocalHandle, addNextcloud, getBlob, update, replaceFile, remove,
-    normalizeLocalPath, ensureLocalFilePermission, isLocalFilePermissionGranted,
+    syncBibliographyNextcloud, deleteBibliographyEntriesNextcloud, resolveBibliographyConflicts, databaseToBib, bibToDatabase, isPdfFile,
+    list, reorder, addBrowser, addLocalLink, addLocalSession, addLocalHandle, addNextcloud, getBlob, update, replaceFile, remove,
+    normalizeLocalPath, ensureLocalFilePermission, isLocalFilePermissionGranted, openLocalFilePermissionSettings,
+    discoverWebPdfs, showWebHumanCheck, closeWebTab, downloadWebPdf,
     listNextcloudDirectory, getNextcloudFileInfo, downloadNextcloudFile, normalizeNextcloudPath
   };
 })();

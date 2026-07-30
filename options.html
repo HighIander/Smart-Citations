@@ -1,0 +1,110 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: CC-BY-NC-SA-4.0 -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Smart Citations options</title>
+  <link rel="icon" type="image/png" sizes="128x128" href="icons/icon128.png">
+  <link rel="stylesheet" href="options.css">
+  <link rel="stylesheet" href="privacy-consent.css">
+</head>
+<body>
+  <main>
+    <header>
+      <img src="icons/icon128.png" alt="">
+      <div>
+        <h1>Smart Citations options</h1>
+        <p>Configure author matching, journal PDF links, and desktop access.</p>
+      </div>
+    </header>
+
+    <form id="ctca-options-form">
+      <section>
+        <div id="ctca-author-name-settings">
+          <label for="ctca-user-name">Your author name</label>
+          <p class="hint">Used to fill the automatic “My authorships” and “My co-authorships” bibliography categories. Enter your full published name; abbreviated first names are matched automatically.</p>
+          <input id="ctca-user-name" type="text" autocomplete="name" placeholder="e.g. Ada Lovelace">
+        </div>
+        <label class="ctca-options-secondary-label">ORCID account <span>(recommended)</span></label>
+        <p class="hint">Use ORCID’s official sign-in and authorization screen. Smart Citations receives the authenticated ORCID iD and loads the public name and affiliations; the user never types an ORCID iD.</p>
+        <div id="ctca-orcid-link-state" class="ctca-orcid-link-state">No ORCID account linked.</div>
+        <div id="ctca-orcid-check-row" class="ctca-options-check-row" hidden>
+          <button id="ctca-check-orcid" type="button">Check ORCID for new manuscripts now</button>
+          <span class="hint">Automatic checks run at most once per day.</span>
+        </div>
+        <div class="ctca-options-inline">
+          <button id="ctca-link-orcid" type="button">Sign in and link ORCID</button>
+          <button id="ctca-unlink-orcid" class="ctca-options-secondary-button" type="button" hidden>Unlink ORCID</button>
+        </div>
+        <label class="ctca-options-secondary-label" for="ctca-author-institutions">Author institutions <span>(one per line)</span></label>
+        <p class="hint">These constrain ambiguous name-based OpenAlex matches and filter the author-impact metrics to works where the linked author has one of these affiliations. They are filled from public ORCID affiliations when available and can be edited.</p>
+        <textarea id="ctca-author-institutions" rows="4" spellcheck="false" placeholder="University or research institute"></textarea>
+      </section>
+
+      <section>
+        <label for="ctca-openalex-api-key">OpenAlex API key</label>
+        <p class="hint">
+          Used to retrieve citation counts and author-impact statistics. OpenAlex API keys are free;
+          <a href="https://openalex.org/settings/api" target="_blank" rel="noopener noreferrer">create or copy yours from OpenAlex</a>.
+          The key is stored only in this browser's extension storage.
+        </p>
+        <input id="ctca-openalex-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="OpenAlex API key">
+        <label class="ctca-options-secondary-label" for="ctca-openalex-author-id">OpenAlex author ID <span>(optional fallback)</span></label>
+        <p class="hint">Use this only when you prefer to pin the impact panel to a specific OpenAlex profile instead of the linked ORCID account.</p>
+        <input id="ctca-openalex-author-id" type="text" autocomplete="off" spellcheck="false" placeholder="A5023888391">
+      </section>
+
+      <section>
+        <label for="ctca-page-patterns">Manuscript pages</label>
+        <p class="hint">Enter one hostname or page pattern per line. Wildcards are supported; for example, <code>*.nature.com</code> includes Nature subdomains and the main domain. Lines beginning with <code>#</code> are ignored.</p>
+        <textarea id="ctca-page-patterns" rows="10" spellcheck="false" placeholder="*.nature.com"></textarea>
+      </section>
+
+      <section>
+        <label for="ctca-preferred-action">PDF link behavior</label>
+        <p class="hint">“Remember my choice” in the journal-page dialog changes this setting.</p>
+        <select id="ctca-preferred-action">
+          <option value="ask">Ask every time</option>
+          <option value="journal">Always open on the journal site</option>
+          <option value="smart-citations">Always open in Smart Citations</option>
+        </select>
+      </section>
+
+      <div class="actions">
+        <button type="submit">Save options</button>
+        <span id="ctca-options-status" role="status" aria-live="polite"></span>
+      </div>
+    </form>
+
+    <section class="ctca-options-card ctca-options-desktop-launcher" aria-labelledby="ctca-desktop-launcher-heading">
+      <h2 id="ctca-desktop-launcher-heading">Desktop launcher</h2>
+      <p class="hint">Open Smart Citations directly from a bookmark, desktop shortcut, or app-style browser window.</p>
+      <div id="ctca-desktop-launcher-content"></div>
+    </section>
+
+    <section class="license-notice" aria-labelledby="ctca-license-heading">
+      <h2 id="ctca-license-heading">License</h2>
+      <p>
+        Except for bundled third-party components, this extension's source code is licensed under the
+        <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank" rel="license noopener noreferrer">Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License (CC BY-NC-SA 4.0)</a>.
+      </p>
+      <p>
+        The name <q>Smart Citations</q> and its associated branding are not part of this license. They belong exclusively to the owner identified in the
+        <a href="https://www.smartioz.com/smartcitations/impressum.php" target="_blank" rel="noopener noreferrer">Impressum</a>.
+      </p>
+    </section>
+
+    <footer class="legal-links" aria-label="Help and legal information">
+      <a href="README.md" target="_blank" rel="noopener">User guide</a>
+      <span aria-hidden="true">·</span>
+      <a href="https://www.smartioz.com/smartcitations/impressum.php" target="_blank" rel="noopener noreferrer">Impressum</a>
+      <span aria-hidden="true">·</span>
+      <a href="https://www.smartioz.com/smartcitations/dataprotection.php" target="_blank" rel="noopener noreferrer">Data protection/Datenschutzerklärung</a>
+    </footer>
+  </main>
+  <script src="privacy-consent.js"></script>
+  <script src="desktop-launcher.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

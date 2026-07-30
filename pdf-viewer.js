@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: CC-BY-NC-SA-4.0 */
+
 const earlyStatus = document.querySelector('#pv-status');
 
 function reportViewerFailure(error) {
@@ -39,6 +41,8 @@ const pageInput = $('#pv-page');
 const pageCount = $('#pv-pages');
 const zoomLabel = $('#pv-zoom');
 const saveButton = $('#pv-save');
+const downloadButton = $('#pv-download');
+const fullscreenButton = $('#pv-fullscreen');
 const dirtyBadge = $('#pv-dirty');
 const colorInput = $('#pv-color');
 const thicknessInput = $('#pv-thickness');
@@ -985,12 +989,21 @@ $('#pv-zoom-in').addEventListener('click', () => pdfViewer.increaseScale());
 $('#pv-fit').addEventListener('click', () => { pdfViewer.currentScaleValue = 'page-width'; });
 $('#pv-undo').addEventListener('click', () => editorManager?.undo());
 $('#pv-redo').addEventListener('click', () => editorManager?.redo());
+downloadButton.addEventListener('click', () => {
+  postToParent({ type: 'ctca-pdf-download-request', attachmentId: attachmentId() });
+});
 saveButton.addEventListener('click', () => savePdf().catch((error) => setStatus(error?.message || String(error), { error: true })));
+fullscreenButton.addEventListener('click', () => {
+  postToParent({ type: 'ctca-pdf-fullscreen-request', attachmentId: attachmentId() });
+});
 
 window.addEventListener('keydown', (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
     event.preventDefault();
     savePdf().catch((error) => setStatus(error?.message || String(error), { error: true }));
+  } else if (event.key === 'Escape' && document.body.classList.contains('pv-host-maximized')) {
+    event.preventDefault();
+    postToParent({ type: 'ctca-pdf-fullscreen-request', attachmentId: attachmentId() });
   }
 });
 
@@ -1005,7 +1018,11 @@ window.addEventListener('message', (event) => {
   if (message?.attachmentId && message.attachmentId !== attachmentId()) return;
 
   if (message?.type === 'ctca-pdf-host-layout') {
-    document.body.classList.toggle('pv-host-maximized', Boolean(message.maximized));
+    const maximized = Boolean(message.maximized);
+    document.body.classList.toggle('pv-host-maximized', maximized);
+    fullscreenButton.setAttribute('aria-pressed', maximized ? 'true' : 'false');
+    fullscreenButton.setAttribute('aria-label', maximized ? 'Reduce PDF view' : 'Maximize PDF view');
+    fullscreenButton.title = maximized ? 'Reduce PDF view' : 'Maximize PDF view';
     return;
   }
   if (message?.type === 'ctca-pdf-goto-page') {

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: CC-BY-NC-SA-4.0 */
+
 :root {
   color-scheme: light dark;
   --pv-toolbar-height: 50px;
@@ -48,6 +50,31 @@ body {
 .pv-toolbar button.pv-mode-active { color: #fff; background: #0969da; border-color: #0969da; }
 .pv-toolbar button.pv-save { color: #fff; background: #1f883d; border-color: #1a7f37; }
 .pv-toolbar button.pv-save:hover:not(:disabled) { background: #1a7f37; }
+.pv-toolbar button.pv-icon-button {
+  display: inline-grid;
+  width: 32px;
+  min-width: 32px;
+  padding: 4px;
+  place-items: center;
+}
+.pv-toolbar button.pv-history-button {
+  font-size: 21px;
+  font-weight: 500;
+  line-height: 1;
+}
+.pv-icon-button svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+.pv-fullscreen .pv-icon-reduce { display: none; }
+.pv-fullscreen[aria-pressed="true"] .pv-icon-expand { display: none; }
+.pv-fullscreen[aria-pressed="true"] .pv-icon-reduce { display: inline; }
 .pv-toolbar input[type="number"] {
   width: 56px;
   padding: 4px;
@@ -294,24 +321,4 @@ body {
   .pv-comment-list-item.pv-comment-selected { background: #0c2d48; }
 }
 
-/* Version 1.10.2: share one compact top row with the host controls in maximized mode. */
-body.pv-host-maximized .pv-toolbar {
-  padding-left: 190px;
-  padding-right: 135px;
-}
-body.pv-host-maximized .pv-workspace,
-body.pv-host-maximized #pv-status {
-  bottom: 0;
-}
-@media (max-width: 1380px) {
-  body.pv-host-maximized .pv-toolbar {
-    padding-left: 160px;
-    padding-right: 125px;
-  }
-}
-@media (max-width: 980px) {
-  body.pv-host-maximized .pv-toolbar {
-    padding-left: 9px;
-    padding-right: 9px;
-  }
-}
+/* Host layout state only changes the fullscreen icon; the editor owns the full toolbar. */

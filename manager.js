@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: CC-BY-NC-SA-4.0 */
+
 (() => {
   "use strict";
 
@@ -6,7 +8,14 @@
   const DB_KEY = `${PREFIX}global-bibliography:v1`;
   const PENDING_KEY = `${PREFIX}global-bibliography-pending:v1`;
   const UI_KEY = `${PREFIX}global-manager-ui:v2`;
+  const AUTHOR_OPTIONS_KEY = `${PREFIX}manuscript-links:v1`;
   const CTCA_TAGS_FIELD = "ctca_tags";
+  const LIST_COLUMNS = [
+    { id: "title", label: "Title / authors", min: 140, defaultWidth: 360, defaultVisible: true },
+    { id: "year", label: "Year", min: 58, defaultWidth: 72, defaultVisible: true },
+    { id: "key", label: "Citation key", min: 100, defaultWidth: 170, defaultVisible: true },
+    { id: "addedOn", label: "Added on", min: 130, defaultWidth: 176, defaultVisible: false }
+  ];
 
   const ENTRY_TYPES = [
     "article", "book", "booklet", "conference", "inbook", "incollection",
@@ -34,11 +43,18 @@
   let entries = [];
   let categoryState = { categories: [], memberships: {} };
   let selectedCategoryId = "all";
+  let authorshipUserName = "";
   let selectedKey = "";
   let selectedKeys = new Set();
   let selectionAnchorKey = "";
   let query = "";
   let sortState = { field: "year", direction: "desc" };
+  let starredFirst = false;
+  let columnWidths = Object.fromEntries(LIST_COLUMNS.map((column) => [column.id, column.defaultWidth]));
+  let columnVisibility = {
+    ...Object.fromEntries(LIST_COLUMNS.map((column) => [column.id, column.defaultVisible])),
+    authors: true
+  };
   let searchFields = {
     key: true,
     authors: true,
@@ -51,9 +67,12 @@
   let searchFilters = { type: "", yearFrom: "", yearTo: "", doi: "any", tagged: "any" };
   let categoryWidth = 190;
   let detailsWidth = 430;
+  let authorImpactHeight = 300;
+  let authorImpactCollapsed = false;
   let dirty = false;
   let changeRevision = 0;
   let savedRevision = 0;
+  let savedEntryContentByKey = new Map();
   let syncNextcloudBibliography = false;
   let nextcloudConnected = false;
   let deletionTombstones = [];
@@ -64,16 +83,21 @@
   let bulkAbortRequested = false;
   let activeDoiRequestId = "";
   let listRenderTimer = null;
+  let categoryListRenderRevision = 0;
   let activeWorkspaceTab = "bibliography";
   const openPdfTabs = new Map();
+  const pdfAttachmentLoadingKeys = new Set();
   let currentPdfObjectUrl = "";
   let pdfNoteSaveTimer = null;
   let pdfNotesWidth = 360;
   let pdfDetailsWidth = 390;
+  let pdfFullscreenPaneState = null;
   const pendingPdfSaveRequests = new Map();
   let bibliographyDetailsCollapsed = false;
   let nextcloudSyncTimer = null;
   let nextcloudSyncInProgress = false;
+  let standaloneManagerPort = null;
+  let standaloneCommandQueue = Promise.resolve();
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -82,6 +106,10 @@
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#39;");
+  }
+
+  function latexHtml(value) {
+    return globalThis.CollabTeXLatex?.toHtml(value) || escapeHtml(value);
   }
 
   function stripBibValue(value) {
@@ -93,6 +121,32 @@
       text = text.slice(1, -1).trim();
     }
     return text;
+  }
+
+  function formatDoiSyncDateTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value || "");
+    const formattedDate = [
+      String(date.getDate()).padStart(2, "0"),
+      String(date.getMonth() + 1).padStart(2, "0"),
+      date.getFullYear()
+    ].join("/");
+    const hour = String(date.getHours() % 12 || 12).padStart(2, "0");
+    const minute = String(date.getMinutes()).padStart(2, "0");
+    const period = date.getHours() < 12 ? "am" : "pm";
+    return `${formattedDate}, ${hour}:${minute} ${period}`;
+  }
+
+  function stableValue(value) {
+    if (Array.isArray(value)) return value.map(stableValue);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableValue(value[key])]));
+    }
+    return value;
+  }
+
+  function stableString(value) {
+    return JSON.stringify(stableValue(value));
   }
 
   function normalizeEntry(entry) {
@@ -108,8 +162,42 @@
       aliases: [...new Set(Array.isArray(entry?.aliases) ? entry.aliases.filter(Boolean) : [])],
       tags,
       updatedAt: entry?.updatedAt || "",
-      doiSyncedAt: entry?.doiSyncedAt || ""
+      doiSyncedAt: entry?.doiSyncedAt || "",
+      addedOn: entry?.addedOn || entry?.createdAt || entry?.updatedAt || "",
+      starred: entry?.starred === true
     };
+  }
+
+  function entryContentFingerprint(entry) {
+    const normalized = normalizeEntry(entry);
+    const keyIdentity = normalized.key.trim().toLowerCase();
+    const aliases = [...new Set((normalized.aliases || [])
+      .map((alias) => String(alias || "").trim())
+      .filter((alias) => alias && alias.toLowerCase() !== keyIdentity))]
+      .sort((left, right) => left.localeCompare(right));
+    return stableString({
+      key: normalized.key,
+      type: normalized.type,
+      fields: normalized.fields,
+      aliases,
+      tags: [...new Set(normalized.tags || [])].sort((left, right) => left.localeCompare(right)),
+      doiSyncedAt: normalized.doiSyncedAt,
+      addedOn: normalized.addedOn,
+      starred: normalized.starred
+    });
+  }
+
+  function entryContentMap(items = entries) {
+    return new Map((items || []).map((entry) => [
+      `key:${String(entry?.key || "").trim().toLowerCase()}`,
+      entryContentFingerprint(entry)
+    ]));
+  }
+
+  function changedEntryIdentitiesSinceSave() {
+    const current = entryContentMap();
+    const identities = new Set([...savedEntryContentByKey.keys(), ...current.keys()]);
+    return [...identities].filter((identity) => savedEntryContentByKey.get(identity) !== current.get(identity));
   }
 
   function deletionIdentity(entry) {
@@ -165,6 +253,9 @@
         pendingCount: Math.max(0, Number(raw.pendingCount) || 0),
         pendingRevision: Math.max(0, Number(raw.pendingRevision) || 0),
         acknowledgedRevision: Math.max(0, Number(raw.acknowledgedRevision) || 0),
+        pendingEntryIdentities: [...new Set((Array.isArray(raw.pendingEntryIdentities) ? raw.pendingEntryIdentities : [])
+          .map((identity) => String(identity || "").trim().toLowerCase())
+          .filter((identity) => identity.startsWith("key:")))],
         registeredAt: String(raw.registeredAt || ""),
         updatedAt: String(raw.updatedAt || "")
       };
@@ -176,14 +267,19 @@
     };
   }
 
-  function markKnownDocumentsPending(changeCount = 1) {
+  function markKnownDocumentsPending(changeCount = 1, changedEntryIdentities = []) {
     const sync = normalizeDocumentSyncState(documentSyncState);
     const now = new Date().toISOString();
     const increment = Math.max(1, Number(changeCount) || 1);
     sync.revision += 1;
     for (const flag of Object.values(sync.documents)) {
+      const pendingEntryIdentities = new Set(flag.pendingEntryIdentities || []);
+      for (const identity of changedEntryIdentities) pendingEntryIdentities.add(identity);
       flag.pending = true;
-      flag.pendingCount = Math.max(0, Number(flag.pendingCount) || 0) + increment;
+      flag.pendingEntryIdentities = [...pendingEntryIdentities];
+      flag.pendingCount = flag.pendingEntryIdentities.length
+        ? flag.pendingEntryIdentities.length
+        : Math.max(0, Number(flag.pendingCount) || 0) + increment;
       flag.pendingRevision = sync.revision;
       flag.updatedAt = now;
     }
@@ -267,13 +363,42 @@
     const controls = root.querySelectorAll(
       ".ctca-manager-add-entry, .ctca-manager-add-menu button, .ctca-manager-add-category, .ctca-manager-update, " +
       ".ctca-manager-update-all-doi, .ctca-manager-update-selected, .ctca-manager-remove-selected, " +
-      ".ctca-manager-select-visible-checkbox, .ctca-manager-global-sync-checkbox, [data-manager-sort]"
+      ".ctca-manager-select-visible-checkbox, .ctca-manager-global-sync-checkbox, .ctca-manager-cloud-settings, .ctca-manager-options, .ctca-manager-star-sort, .ctca-manager-column-eye, [data-manager-sort]"
     );
     controls.forEach((control) => { control.disabled = value; });
     updateNextcloudSyncToggle();
     const exportButton = $(".ctca-manager-update", root);
     if (exportButton) exportButton.disabled = value || entries.length === 0;
     updateSelectionControls(filteredEntries().map((entry) => entry.key));
+  }
+
+  function setListLoading(visible) {
+    const overlay = $(".ctca-manager-list-loading-overlay", root);
+    const list = $(".ctca-manager-list", root);
+    if (!overlay || !list) return;
+    overlay.hidden = !visible;
+    list.setAttribute("aria-busy", visible ? "true" : "false");
+  }
+
+  function selectCategory(categoryId) {
+    if (!categoryId || selectedCategoryId === categoryId) return;
+    selectedCategoryId = categoryId;
+    setListLoading(true);
+    const revision = ++categoryListRenderRevision;
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (revision !== categoryListRenderRevision) return;
+        try {
+          renderCategories();
+          renderList();
+        } finally {
+          setListLoading(false);
+        }
+        window.requestAnimationFrame(() => {
+          saveUiState().catch(() => {});
+        });
+      });
+    });
   }
 
   function setProgress(processed, total, label, visible = true) {
@@ -298,6 +423,9 @@
     ]);
     const database = dbData?.[DB_KEY] || { version: 1, entries: [] };
     entries = Array.isArray(database.entries) ? database.entries.map(normalizeEntry) : [];
+    const legacyAddedOn = database.updatedAt || new Date().toISOString();
+    for (const entry of entries) if (!entry.addedOn) entry.addedOn = legacyAddedOn;
+    savedEntryContentByKey = entryContentMap(entries);
     deletionTombstones = normalizeDeletionTombstones(database.deletedEntries);
     documentSyncState = normalizeDocumentSyncState(database.documentSync);
     categoryState = normalizeCategoryState(database);
@@ -314,8 +442,29 @@
     const ui = uiData?.[UI_KEY] || {};
     categoryWidth = Math.max(130, Math.min(420, Number(ui.categoryWidth) || 190));
     detailsWidth = Math.max(280, Math.min(900, Number(ui.detailsWidth) || 430));
+    authorImpactHeight = Math.max(120, Math.min(720, Number(ui.authorImpactHeight) || 300));
+    authorImpactCollapsed = ui.authorImpactCollapsed === true;
+    starredFirst = ui.starredFirst === true;
+    if (ui.sortState && ["author", "year", "key", "addedOn"].includes(ui.sortState.field)) {
+      sortState = {
+        field: ui.sortState.field,
+        direction: ui.sortState.direction === "desc" ? "desc" : "asc"
+      };
+    }
+    if (ui.columnWidths && typeof ui.columnWidths === "object") {
+      for (const column of LIST_COLUMNS) {
+        const width = Number(ui.columnWidths[column.id]);
+        if (Number.isFinite(width)) columnWidths[column.id] = Math.max(column.min, Math.min(700, width));
+      }
+    }
+    if (ui.columnVisibility && typeof ui.columnVisibility === "object") {
+      for (const column of LIST_COLUMNS) {
+        if (column.id in ui.columnVisibility) columnVisibility[column.id] = ui.columnVisibility[column.id] !== false;
+      }
+      if ("authors" in ui.columnVisibility) columnVisibility.authors = ui.columnVisibility.authors !== false;
+    }
     selectedCategoryId = ui.selectedCategoryId && (
-      ui.selectedCategoryId === "all" || ui.selectedCategoryId === "uncategorized" ||
+      ["all", "starred", "authorships", "coauthorships", "recent", "uncategorized"].includes(ui.selectedCategoryId) ||
       categoryState.categories.some((category) => category.id === ui.selectedCategoryId)
     ) ? ui.selectedCategoryId : "all";
     if (ui.searchFields && typeof ui.searchFields === "object") {
@@ -327,6 +476,7 @@
     }
     searchFilters = globalThis.CollabTeXSearchTools.normalizeFilterState(ui.searchFilters || searchFilters);
     applyColumnWidths();
+    applyManagerTableColumns();
     applySearchFieldSettings();
     applyAdvancedSearchUi();
   }
@@ -336,6 +486,12 @@
       [UI_KEY]: {
         categoryWidth,
         detailsWidth,
+        authorImpactHeight,
+        authorImpactCollapsed,
+        starredFirst,
+        sortState: { ...sortState },
+        columnWidths: { ...columnWidths },
+        columnVisibility: { ...columnVisibility },
         selectedCategoryId,
         searchFields,
         searchOptions,
@@ -344,12 +500,12 @@
     });
   }
 
-  function databaseSnapshot({ markChanged = false, changeCount = 1 } = {}) {
+  function databaseSnapshot({ markChanged = false, changeCount = 1, changedEntryIdentities = [] } = {}) {
     const presentIdentities = new Set(entries.map(deletionIdentity));
     deletionTombstones = normalizeDeletionTombstones(
       deletionTombstones.filter((item) => !presentIdentities.has(item.identity))
     );
-    if (markChanged) markKnownDocumentsPending(changeCount);
+    if (markChanged) markKnownDocumentsPending(changeCount, changedEntryIdentities);
     return {
       version: 3,
       entries: entries.map((entry) => ({
@@ -359,7 +515,9 @@
         aliases: [...new Set(entry.aliases || [])],
         tags: globalThis.CollabTeXSearchTools.splitTags(entry.tags || []),
         updatedAt: entry.updatedAt || "",
-        doiSyncedAt: entry.doiSyncedAt || ""
+        doiSyncedAt: entry.doiSyncedAt || "",
+        addedOn: entry.addedOn || "",
+        starred: entry.starred === true
       })),
       categories: categoryState.categories.map((category) => ({ ...category })),
       memberships: Object.fromEntries(
@@ -386,13 +544,16 @@
     window.clearTimeout(autoSaveTimer);
     autoSaveTimer = null;
     const revision = changeRevision;
+    const changedEntryIdentities = changedEntryIdentitiesSinceSave();
     const snapshot = databaseSnapshot({
       markChanged: dirty || revision > savedRevision,
-      changeCount: Math.max(1, revision - savedRevision)
+      changeCount: Math.max(1, changedEntryIdentities.length),
+      changedEntryIdentities
     });
     saveQueue = saveQueue.catch(() => {}).then(async () => {
       await extensionApi.storage.local.set({ [DB_KEY]: snapshot });
       await extensionApi.storage.local.remove(PENDING_KEY);
+      savedEntryContentByKey = entryContentMap(snapshot.entries);
       savedRevision = Math.max(savedRevision, revision);
       dirty = savedRevision < changeRevision;
       updateCount();
@@ -425,15 +586,127 @@
   }
 
   function allAuthors(entry) {
-    return String(entry?.fields?.author || entry?.fields?.editor || "Authors not specified")
-      .replace(/\s+and\s+/gi, "; ");
+    return authorNames(entry).join("; ");
+  }
+
+  function authorNames(entry) {
+    const value = String(entry?.fields?.author || entry?.fields?.editor || "");
+    const authors = globalThis.CollabTeXBibTeX.splitAuthors(value);
+    return authors.length ? authors : ["Authors not specified"];
+  }
+
+  function allAuthorsHtml(entry) {
+    const value = String(entry?.fields?.author || entry?.fields?.editor || "");
+    const authors = globalThis.CollabTeXBibTeX.splitAuthorsDisplayRaw(value);
+    return latexHtml(authors.length ? authors.join("\n") : "Authors not specified");
   }
 
   function firstAuthor(entry) {
     const value = String(entry?.fields?.author || entry?.fields?.editor || "");
-    const first = value.split(/\s+and\s+/i)[0]?.trim() || "";
-    if (first.includes(",")) return first.split(",")[0].trim();
-    return first.split(/\s+/).pop() || "";
+    const first = globalThis.CollabTeXBibTeX.splitAuthorsRaw(value)[0] || "";
+    return globalThis.CollabTeXBibTeX.authorFamilyName(first);
+  }
+
+  function abbreviatedFirstAuthor(entry) {
+    const value = String(entry?.fields?.author || entry?.fields?.editor || "");
+    const raw = globalThis.CollabTeXBibTeX.splitAuthorsRaw(value)[0] || "";
+    if (!raw) return "Unknown et al.";
+    const formatted = globalThis.CollabTeXBibTeX.formatAuthorName(raw);
+    const family = globalThis.CollabTeXBibTeX.authorFamilyName(raw);
+    const given = formatted.slice(0, Math.max(0, formatted.lastIndexOf(family))).trim();
+    const initial = given.match(/\p{L}/u)?.[0] || "";
+    return `${initial ? `${initial}. ` : ""}${family || formatted} et al.`;
+  }
+
+  function personIdentity(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+    const formatted = globalThis.CollabTeXBibTeX.formatAuthorName(raw);
+    const family = globalThis.CollabTeXBibTeX.authorFamilyName(raw);
+    const given = formatted.slice(0, Math.max(0, formatted.lastIndexOf(family))).trim();
+    const normalize = (text) => globalThis.CollabTeXBibTeX.latexToText(text)
+      .normalize("NFKD")
+      .replace(/\p{M}/gu, "")
+      .replace(/[^\p{L}\p{N}]+/gu, "")
+      .toLocaleLowerCase();
+    return {
+      family: normalize(family),
+      initial: normalize(given).match(/\p{L}/u)?.[0] || "",
+      full: normalize(formatted)
+    };
+  }
+
+  function personNamesMatch(left, right) {
+    const first = personIdentity(left);
+    const second = personIdentity(right);
+    if (!first || !second || !first.family || first.family !== second.family) return false;
+    if (first.full === second.full) return true;
+    return !first.initial || !second.initial || first.initial === second.initial;
+  }
+
+  function entryAuthorshipCategory(entry) {
+    if (!authorshipUserName) return "";
+    const authors = globalThis.CollabTeXBibTeX.splitAuthorsRaw(entry?.fields?.author || "");
+    const index = authors.findIndex((author) => personNamesMatch(author, authorshipUserName));
+    return index === 0 ? "authorships" : index > 0 ? "coauthorships" : "";
+  }
+
+  async function ensureAuthorshipUserName() {
+    const stored = (await extensionApi.storage.local.get(AUTHOR_OPTIONS_KEY))?.[AUTHOR_OPTIONS_KEY] || {};
+    authorshipUserName = String(stored.userName || "").trim();
+    if (authorshipUserName || stored.identitySetupSeen === true) return;
+    let nameInput;
+    const result = await showDialog({
+      title: "Link your author identity",
+      message: "Enter your published name, or authenticate through ORCID’s official sign-in flow. This is used for the automatic author categories and exact OpenAlex matching.",
+      controls: (container) => {
+        const fields = document.createElement("div");
+        fields.className = "ctca-global-dialog-form";
+        fields.innerHTML = `
+          <label class="ctca-app-dialog-field"><span>Your published name</span><input data-author-name type="text" autocomplete="name" placeholder="e.g. Ada Lovelace"></label>
+        `;
+        nameInput = $("[data-author-name]", fields);
+        container.appendChild(fields);
+      },
+      buttons: [
+        { label: "Not now", value: { skipped: true } },
+        { label: "Sign in with ORCID", value: { oauth: true } },
+        {
+          label: "Save name",
+          primary: true,
+          getValue: () => ({ name: nameInput?.value.trim() || "" })
+        }
+      ],
+      closeValue: { skipped: true }
+    });
+    const next = { ...stored, identitySetupSeen: true };
+    if (result?.oauth) {
+      const response = await extensionApi.runtime.sendMessage({
+        type: "ctca-orcid-oauth-link"
+      });
+      if (!response?.ok) {
+        next.identitySetupSeen = false;
+        setStatus(response?.error || "The ORCID account could not be linked.", true);
+      } else {
+        const profile = response.profile || {};
+        next.orcidId = profile.url || profile.orcid || "";
+        next.orcidOAuthAuthenticatedOrcid = profile.orcid || "";
+        next.orcidOAuthAuthenticatedAt = profile.authenticatedAt || new Date().toISOString();
+        next.orcidLastAutomaticCheckAt = "";
+        next.userName = profile.displayName || "";
+        next.authorInstitutions = profile.institutions || [];
+      }
+    } else if (result?.name) {
+      next.userName = result.name;
+    }
+    authorshipUserName = String(next.userName || "").trim();
+    await extensionApi.storage.local.set({
+      [AUTHOR_OPTIONS_KEY]: next
+    });
+  }
+
+  function formatAddedOn(value) {
+    return value ? formatDoiSyncDateTime(value) : "Unknown";
   }
 
   function publication(entry) {
@@ -523,15 +796,25 @@
   function entryMatchesCategory(entry) {
     const ids = entryCategoryIds(entry.key);
     if (selectedCategoryId === "all") return true;
-    if (selectedCategoryId === "uncategorized") return ids.length === 0;
+    if (selectedCategoryId === "starred") return entry.starred === true;
+    if (selectedCategoryId === "recent") return true;
+    if (selectedCategoryId === "authorships" || selectedCategoryId === "coauthorships") {
+      return entryAuthorshipCategory(entry) === selectedCategoryId;
+    }
+    if (selectedCategoryId === "uncategorized") return ids.length === 0 && !entryAuthorshipCategory(entry);
     const accepted = categoryDescendants(selectedCategoryId);
     return ids.some((id) => accepted.has(id));
   }
 
   function categoryCount(categoryId) {
     if (categoryId === "all") return entries.length;
+    if (categoryId === "starred") return entries.filter((entry) => entry.starred === true).length;
+    if (categoryId === "recent") return entries.length;
+    if (categoryId === "authorships" || categoryId === "coauthorships") {
+      return entries.filter((entry) => entryAuthorshipCategory(entry) === categoryId).length;
+    }
     if (categoryId === "uncategorized") {
-      return entries.filter((entry) => entryCategoryIds(entry.key).length === 0).length;
+      return entries.filter((entry) => entryCategoryIds(entry.key).length === 0 && !entryAuthorshipCategory(entry)).length;
     }
     const accepted = categoryDescendants(categoryId);
     return entries.filter((entry) => entryCategoryIds(entry.key).some((id) => accepted.has(id))).length;
@@ -554,20 +837,32 @@
         filters: searchFilters
       })
     })).filter((item) => item.matched && entryMatchesCategory(item.entry));
+    if (selectedCategoryId === "recent") {
+      return ranked.sort((left, right) =>
+        (new Date(right.entry.addedOn || 0).getTime() || 0) -
+        (new Date(left.entry.addedOn || 0).getTime() || 0)
+      ).map((item) => item.entry);
+    }
     const direction = sortState.direction === "asc" ? 1 : -1;
     const value = (entry) => {
       if (sortState.field === "year") return Number(String(entry.fields?.year || "").match(/\d{4}/)?.[0] || -Infinity);
       if (sortState.field === "author") return firstAuthor(entry).toLowerCase();
+      if (sortState.field === "addedOn") return new Date(entry.addedOn || 0).getTime() || 0;
       return entry.key.toLowerCase();
     };
     return ranked.sort((left, right) => {
-      if (query.trim() && left.rank !== right.rank) return left.rank - right.rank;
+      if (starredFirst && left.entry.starred !== right.entry.starred) return left.entry.starred ? -1 : 1;
       const leftValue = value(left.entry);
       const rightValue = value(right.entry);
+      let comparison;
       if (typeof leftValue === "number" && typeof rightValue === "number") {
-        return (leftValue - rightValue) * direction;
+        comparison = (leftValue - rightValue) * direction;
+      } else {
+        comparison = String(leftValue).localeCompare(String(rightValue), undefined, { numeric: true, sensitivity: "base" }) * direction;
       }
-      return String(leftValue).localeCompare(String(rightValue), undefined, { numeric: true, sensitivity: "base" }) * direction;
+      if (comparison) return comparison;
+      if (query.trim() && left.rank !== right.rank) return left.rank - right.rank;
+      return left.entry.key.localeCompare(right.entry.key, undefined, { numeric: true, sensitivity: "base" });
     }).map((item) => item.entry);
   }
 
@@ -595,10 +890,7 @@
       button.dataset.categoryId = id;
       button.innerHTML = `<span>${escapeHtml(label)}</span><span class="ctca-manager-category-count">${categoryCount(id)}</span>`;
       button.addEventListener("click", () => {
-        selectedCategoryId = id;
-        renderCategories();
-        renderList();
-        saveUiState().catch(() => {});
+        selectCategory(id);
       });
       if (id === "uncategorized") {
         button.addEventListener("dragover", (event) => {
@@ -616,7 +908,6 @@
             markDirty("Saving category assignments automatically…");
             renderCategories();
             renderList();
-            renderDetails();
           } catch (_error) {}
         });
       }
@@ -624,6 +915,17 @@
     };
 
     createFixed("all", "All");
+    createFixed("starred", "Starred");
+    createFixed("authorships", "My authorships");
+    createFixed("coauthorships", "My co-authorships");
+    createFixed("recent", "Recently added");
+    const addSeparator = () => {
+      const separator = document.createElement("div");
+      separator.className = "ctca-manager-category-separator";
+      separator.setAttribute("aria-hidden", "true");
+      container.appendChild(separator);
+    };
+    addSeparator();
 
     const renderBranch = (parentId, depth) => {
       for (const category of categoryChildren(parentId)) {
@@ -639,15 +941,18 @@
           <span class="ctca-manager-category-count">${categoryCount(category.id)}</span>
         `;
         $(".ctca-manager-category-name", row).addEventListener("click", () => {
-          selectedCategoryId = category.id;
-          renderCategories();
-          renderList();
-          saveUiState().catch(() => {});
+          selectCategory(category.id);
         });
         row.addEventListener("contextmenu", (event) => {
           event.preventDefault();
+          hideEntryContextMenu();
           const menu = $(".ctca-category-context-menu", root);
           menu.dataset.categoryId = category.id;
+          delete menu.dataset.pointerEntered;
+          menu.onpointerenter = () => { menu.dataset.pointerEntered = "true"; };
+          menu.onpointerleave = () => {
+            if (menu.dataset.pointerEntered === "true") hideCategoryContextMenu();
+          };
           menu.style.left = `${Math.min(event.clientX, window.innerWidth - 220)}px`;
           menu.style.top = `${Math.min(event.clientY, window.innerHeight - 90)}px`;
           menu.hidden = false;
@@ -695,6 +1000,7 @@
     };
 
     renderBranch("", 0);
+    addSeparator();
     createFixed("uncategorized", "Uncategorized");
   }
 
@@ -747,7 +1053,6 @@
     markDirty("Saving category assignments automatically…");
     renderCategories();
     renderList();
-    renderDetails();
   }
 
   function selectRange(visibleKeys, targetKey) {
@@ -780,22 +1085,48 @@
     selectVisible.disabled = busy || visibleKeys.length === 0;
   }
 
+  function updateListSelectionState(visibleKeys, previousSelectedKeys, previousActiveKey) {
+    const affectedKeys = new Set([
+      ...(previousSelectedKeys || []),
+      ...selectedKeys,
+      previousActiveKey,
+      selectedKey
+    ]);
+    const list = $(".ctca-manager-list", root);
+    affectedKeys.forEach((key) => {
+      if (!key) return;
+      const row = list.querySelector(`.ctca-manager-row[data-manager-record-id="${CSS.escape(key)}"]`);
+      if (!row) return;
+      const selected = selectedKeys.has(key);
+      row.classList.toggle("ctca-manager-row-active", selectedKeys.has(key) && selectedKey === key);
+      row.classList.toggle("ctca-manager-row-selected", selected);
+      row.setAttribute("aria-selected", selected ? "true" : "false");
+      const checkbox = $(".ctca-manager-row-checkbox", row);
+      if (checkbox) checkbox.checked = selected;
+    });
+    updateSelectionControls(visibleKeys);
+    updateCount(visibleKeys.length);
+  }
+
   function renderList() {
+    applyManagerTableColumns();
     const list = $(".ctca-manager-list", root);
     const visible = filteredEntries();
+    const openAlexDescriptors = [];
     const visibleKeys = visible.map((entry) => entry.key);
-    if (visible.length && !visible.some((entry) => entry.key === selectedKey)) {
-      selectedKey = visible[0].key;
-    } else if (!visible.length) {
-      selectedKey = "";
-    }
+    selectedKeys = new Set([...selectedKeys].filter((key) => entries.some((entry) => entry.key === key)));
+    if (!selectedKeys.size) selectedKey = "";
+    else if (!selectedKeys.has(selectedKey)) selectedKey = selectedKeys.values().next().value || "";
     list.replaceChildren();
 
     root.querySelectorAll("[data-manager-sort]").forEach((button) => {
-      const active = button.dataset.managerSort === sortState.field;
+      const active = button.dataset.managerSort === (selectedCategoryId === "recent" ? "addedOn" : sortState.field);
       button.classList.toggle("ctca-manager-sort-active", active);
       $("span", button).textContent = active ? (sortState.direction === "asc" ? "↑" : "↓") : "↕";
     });
+    const starSort = $(".ctca-manager-star-sort", root);
+    starSort.setAttribute("aria-pressed", starredFirst ? "true" : "false");
+    starSort.textContent = starredFirst ? "★" : "☆";
 
     $(".ctca-global-empty", root).hidden = entries.length !== 0;
 
@@ -814,30 +1145,60 @@
       row.setAttribute("tabindex", "0");
       row.setAttribute("aria-selected", selectedKeys.has(entry.key) ? "true" : "false");
       row.draggable = true;
-      row.classList.toggle("ctca-manager-row-active", selectedKey === entry.key);
+      row.classList.toggle("ctca-manager-row-active", selectedKeys.has(entry.key) && selectedKey === entry.key);
       row.classList.toggle("ctca-manager-row-selected", selectedKeys.has(entry.key));
+      row.classList.toggle("ctca-manager-row-authors-hidden", !columnVisibility.authors);
       const title = entry.fields?.title || "Untitled reference";
       const authors = allAuthors(entry);
       const year = entry.fields?.year || "";
       const journal = publication(entry);
       const volume = entry.fields?.volume || "";
       const pages = entry.fields?.pages || "";
-      const publicationText = [journal, volume, pages].filter(Boolean).join(", ");
-      row.innerHTML = `
-        <span class="ctca-manager-row-firstline">
-          <input type="checkbox" class="ctca-manager-row-checkbox" aria-label="Select ${escapeHtml(entry.key)}" ${selectedKeys.has(entry.key) ? "checked" : ""}>
-          <span class="ctca-manager-row-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
-          ${year ? `<span class="ctca-manager-row-year" title="${escapeHtml(year)}">${escapeHtml(year)}</span>` : "<span></span>"}
-          <span class="ctca-manager-row-meta">
-            ${entry.doiSyncedAt ? `<span class="ctca-manager-row-doi-sync" title="DOI synchronized ${escapeHtml(entry.doiSyncedAt)}">🌐</span>` : ""}
-            <span class="ctca-manager-row-key" title="${escapeHtml(entry.key)}">${escapeHtml(entry.key)}</span>
+      const addedOn = formatAddedOn(entry.addedOn);
+      const publicationValues = [journal, volume, pages].filter(Boolean);
+      const publicationBaseText = publicationValues.join(", ") || "Publication not specified";
+      const publicationText = `${publicationBaseText}${!columnVisibility.year && year ? ` (${year})` : ""}`;
+      const publicationBaseHtml = [
+        journal ? escapeHtml(journal) : "",
+        volume ? `<strong>${escapeHtml(volume)}</strong>` : "",
+        pages ? escapeHtml(pages) : ""
+      ].filter(Boolean).join(", ") || "Publication not specified";
+      const openAlexDescriptor = globalThis.SmartCitationsOpenAlex.descriptor(entry, entry.key);
+      // Keep citation-count lookup/cache warming active even though the list does not display it.
+      if (openAlexDescriptor.identity) openAlexDescriptors.push(openAlexDescriptor);
+      const publicationHtml = `<span class="ctca-manager-publication-text">${publicationBaseHtml}${!columnVisibility.year && year ? ` (${escapeHtml(year)})` : ""}</span>`;
+      const specifiedUrl = specifiedHttpUrl(entry);
+      const doiSynchronized = wasUpdatedFromDoi(entry);
+      const doiSyncTitle = doiSynchronized
+        ? `${entry.doiSyncedAt ? `DOI synchronized ${entry.doiSyncedAt}` : "DOI synchronized"}. `
+        : "";
+      const urlGlobe = specifiedUrl
+        ? `<button type="button" class="ctca-manager-row-doi-sync${doiSynchronized ? " ctca-manager-row-doi-synced" : ""}" title="${escapeHtml(`${doiSyncTitle}Open ${specifiedUrl}`)}" aria-label="${escapeHtml(`Open URL for ${entry.key}`)}">${urlGlobeIconHtml()}</button>`
+        : `<span class="ctca-manager-row-doi-sync ctca-manager-row-doi-placeholder" aria-hidden="true">${urlGlobeIconHtml()}</span>`;
+      const cells = [];
+      if (columnVisibility.title) cells.push(`<span class="ctca-manager-row-title ctca-manager-row-cell" title="${escapeHtml(title)}">${latexHtml(title)}</span>`);
+      if (columnVisibility.year) cells.push(`<span class="ctca-manager-row-year ctca-manager-row-cell" title="${escapeHtml(year)}">${escapeHtml(year)}</span>`);
+      if (columnVisibility.key) cells.push(`
+        <span class="ctca-manager-row-meta ctca-manager-row-cell">
+          <span class="ctca-manager-row-link-actions">
+            ${urlGlobe}
+            <span class="ctca-manager-row-pdf-slot"></span>
           </span>
-        </span>
-        <span class="ctca-manager-row-author" title="${escapeHtml(authors)}">${escapeHtml(authors)}</span>
-        <span class="ctca-manager-row-publication" title="${escapeHtml(publicationText)}">${escapeHtml(publicationText)}</span>
+          <span class="ctca-manager-row-key" title="${escapeHtml(entry.key)}">${escapeHtml(entry.key)}</span>
+        </span>`);
+      if (managerColumnVisible("addedOn")) cells.push(`<span class="ctca-manager-row-added ctca-manager-row-cell" title="${escapeHtml(addedOn)}">${escapeHtml(addedOn)}</span>`);
+      const condensedAuthor = abbreviatedFirstAuthor(entry);
+      row.innerHTML = `
+        <button type="button" class="ctca-manager-row-star" title="${entry.starred ? "Remove star" : "Star entry"}" aria-label="${entry.starred ? "Remove star from" : "Star"} ${escapeHtml(entry.key)}" aria-pressed="${entry.starred ? "true" : "false"}">${entry.starred ? "★" : "☆"}</button>
+        <span class="ctca-manager-row-select"><input type="checkbox" class="ctca-manager-row-checkbox" aria-label="Select ${escapeHtml(entry.key)}" ${selectedKeys.has(entry.key) ? "checked" : ""}></span>
+        ${cells.join("")}
+        ${columnVisibility.authors ? `<span class="ctca-manager-row-author" title="${escapeHtml(authors)}"><span class="ctca-manager-row-author-text">${latexHtml(authors)}</span><button type="button" class="ctca-manager-author-eye" title="Hide authors" aria-label="Hide authors">👁</button></span>` : ""}
+        <span class="ctca-manager-row-publication" title="${escapeHtml(publicationText)}">${columnVisibility.authors ? "" : `<button type="button" class="ctca-manager-condensed-author" title="Show full authors">${escapeHtml(condensedAuthor)}</button>, `}${publicationHtml}</span>
       `;
 
       const activate = (event) => {
+        const previousSelectedKeys = new Set(selectedKeys);
+        const previousActiveKey = selectedKey;
         if (event.shiftKey) {
           selectRange(visibleKeys, entry.key);
         } else if (event.ctrlKey || event.metaKey) {
@@ -849,27 +1210,57 @@
           selectionAnchorKey = entry.key;
         }
         selectedKey = entry.key;
-        renderList();
+        updateListSelectionState(visibleKeys, previousSelectedKeys, previousActiveKey);
         renderDetails();
       };
 
       row.addEventListener("click", (event) => {
-        if (event.target.closest(".ctca-manager-row-checkbox")) return;
+        if (event.target.closest(".ctca-manager-row-checkbox, .ctca-manager-row-star, .ctca-manager-row-doi-sync, .ctca-manager-row-pdf-action, .ctca-manager-author-eye, .ctca-manager-condensed-author")) return;
         activate(event);
       });
+      row.addEventListener("contextmenu", (event) => {
+        showEntryContextMenu(event, entry).catch((error) => {
+          hideEntryContextMenu();
+          setStatus(error?.message || String(error), true);
+        });
+      });
       row.addEventListener("keydown", (event) => {
+        if (event.target.closest(".ctca-manager-row-doi-sync, .ctca-manager-row-pdf-action")) return;
         if (event.key !== "Enter" && event.key !== " ") return;
         event.preventDefault();
         activate(event);
       });
       $(".ctca-manager-row-checkbox", row).addEventListener("click", (event) => {
         event.stopPropagation();
+        const previousSelectedKeys = new Set(selectedKeys);
+        const previousActiveKey = selectedKey;
         if (event.target.checked) selectedKeys.add(entry.key);
         else selectedKeys.delete(entry.key);
         selectedKey = entry.key;
         selectionAnchorKey = entry.key;
-        renderList();
+        updateListSelectionState(visibleKeys, previousSelectedKeys, previousActiveKey);
         renderDetails();
+      });
+      $(".ctca-manager-row-star", row).addEventListener("click", (event) => {
+        event.stopPropagation();
+        entry.starred = !entry.starred;
+        entry.updatedAt = new Date().toISOString();
+        markDirty(entry.starred ? "Starring entry…" : "Removing star…");
+        renderCategories();
+        renderList();
+      });
+      $("button.ctca-manager-row-doi-sync", row)?.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        window.open(specifiedUrl, "_blank", "noopener,noreferrer");
+      });
+      $(".ctca-manager-author-eye", row)?.addEventListener("click", (event) => {
+        event.stopPropagation();
+        setColumnVisible("authors", false);
+      });
+      $(".ctca-manager-condensed-author", row)?.addEventListener("click", (event) => {
+        event.stopPropagation();
+        setColumnVisible("authors", true);
       });
       row.addEventListener("dragstart", (event) => {
         if (!selectedKeys.has(entry.key)) {
@@ -883,21 +1274,56 @@
         row.classList.add("ctca-manager-row-dragging");
       });
       row.addEventListener("dragend", () => row.classList.remove("ctca-manager-row-dragging"));
+      bindPdfDropTarget(row, entry);
       list.appendChild(row);
+      loadRowPdfAction(row, entry);
     }
 
-    selectedKeys = new Set([...selectedKeys].filter((key) => entries.some((entry) => entry.key === key)));
     updateSelectionControls(visibleKeys);
     updateCount(visible.length);
     renderDetails();
+    syncPdfAttachmentLoadingIndicators();
+    globalThis.SmartCitationsOpenAlex.hydrateCitations(list, openAlexDescriptors).catch(() => {});
   }
 
   function managerInput(label, field, value, options = {}) {
     const wide = options.wide ? " ctca-manager-field-wide" : "";
-    if (options.multiline) {
-      return `<label class="ctca-manager-field${wide}"><span>${escapeHtml(label)}</span><textarea data-manager-field="${escapeHtml(field)}" rows="${options.rows || 3}">${escapeHtml(value || "")}</textarea></label>`;
+    const autocomplete = options.autocomplete
+      ? ` data-manager-autocomplete="${escapeHtml(options.autocomplete)}" autocomplete="off"`
+      : "";
+    const input = options.multiline
+      ? `<textarea data-manager-field="${escapeHtml(field)}" rows="${options.rows || 3}"${autocomplete}>${escapeHtml(value || "")}</textarea>`
+      : `<input data-manager-field="${escapeHtml(field)}" value="${escapeHtml(value || "")}"${autocomplete}>`;
+    const control = options.autocomplete
+      ? `<span class="ctca-field-completion-wrap">${input}<span class="ctca-field-completion" hidden role="listbox"></span></span>`
+      : input;
+    return `<label class="ctca-manager-field${wide}"><span>${escapeHtml(label)}</span>${control}</label>`;
+  }
+
+  function bindPdfDropTarget(target, entry) {
+    if (!target || !entry) return;
+    for (const eventName of ["dragenter", "dragover"]) {
+      target.addEventListener(eventName, (event) => {
+        if (!globalThis.CollabTeXPdfImport.hasPdfFiles(event.dataTransfer)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        event.dataTransfer.dropEffect = "copy";
+        target.classList.add("ctca-manager-pdf-drop-active");
+      });
     }
-    return `<label class="ctca-manager-field${wide}"><span>${escapeHtml(label)}</span><input data-manager-field="${escapeHtml(field)}" value="${escapeHtml(value || "")}"></label>`;
+    target.addEventListener("dragleave", (event) => {
+      if (!target.contains(event.relatedTarget)) target.classList.remove("ctca-manager-pdf-drop-active");
+    });
+    target.addEventListener("drop", (event) => {
+      const files = globalThis.CollabTeXPdfImport.filesFromDataTransfer(event.dataTransfer);
+      if (!files.length) return;
+      event.preventDefault();
+      event.stopPropagation();
+      target.classList.remove("ctca-manager-pdf-drop-active");
+      selectedKey = entry.key;
+      selectedKeys = new Set([entry.key]);
+      openAddPdfDialog(entry, { files }).catch((error) => setStatus(error?.message || String(error), true));
+    });
   }
 
   function availableFields(entry) {
@@ -912,6 +1338,278 @@
     return /^https?:\/\//i.test(url) ? url : "";
   }
 
+  function specifiedHttpUrl(entry) {
+    const value = stripBibValue(entry?.fields?.url || "");
+    if (!value) return "";
+    try {
+      const url = new URL(value);
+      return /^https?:$/.test(url.protocol) ? url.href : "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function formattedCitationParts(entry) {
+    const authors = globalThis.CollabTeXBibTeX.splitAuthorsRaw(entry?.fields?.author || "");
+    const authorText = authors.slice(0, 3).map((author) => {
+      const formatted = globalThis.CollabTeXBibTeX.formatAuthorName(author);
+      const family = globalThis.CollabTeXBibTeX.authorFamilyName(author);
+      const given = formatted.slice(0, Math.max(0, formatted.lastIndexOf(family))).trim();
+      const initial = globalThis.CollabTeXBibTeX.latexToText(given).match(/\p{L}/u)?.[0] || "";
+      return `${initial ? `${initial}. ` : ""}${family || formatted}`.trim();
+    }).filter(Boolean).join(", ") + (authors.length > 3 ? " et al." : "");
+    const fields = entry?.fields || {};
+    return {
+      authors: authorText || "Unknown author",
+      title: globalThis.CollabTeXBibTeX.latexToText(fields.title || "Untitled"),
+      journal: globalThis.CollabTeXBibTeX.latexToText(fields.journal || fields.journaltitle || fields.booktitle || ""),
+      number: globalThis.CollabTeXBibTeX.latexToText(fields.volume || fields.number || ""),
+      pages: globalThis.CollabTeXBibTeX.latexToText(fields.pages || ""),
+      year: globalThis.CollabTeXBibTeX.latexToText(fields.year || "")
+    };
+  }
+
+  async function copyTextWithFormatting(plainText, htmlText = "") {
+    if (htmlText && navigator.clipboard?.write && globalThis.ClipboardItem) {
+      try {
+        await navigator.clipboard.write([new ClipboardItem({
+          "text/plain": new Blob([plainText], { type: "text/plain" }),
+          "text/html": new Blob([htmlText], { type: "text/html" })
+        })]);
+        return;
+      } catch (_error) {}
+    }
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(plainText);
+      return;
+    }
+    const textarea = document.createElement("textarea");
+    textarea.value = plainText;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand("copy");
+    textarea.remove();
+  }
+
+  function formattedCitationContent(entry) {
+    const parts = formattedCitationParts(entry);
+    const journalPlain = parts.journal ? `, ${parts.journal}` : "";
+    const numberPlain = parts.number ? ` ${parts.number}` : "";
+    const pagesPlain = parts.pages ? `, ${parts.pages}` : "";
+    const yearPlain = parts.year ? ` (${parts.year})` : "";
+    const plain = `${parts.authors}, ${parts.title}${journalPlain}${numberPlain}${pagesPlain}${yearPlain}`;
+    const journalHtml = parts.journal ? `, <i>${escapeHtml(parts.journal)}</i>` : "";
+    const numberHtml = parts.number ? ` <b>${escapeHtml(parts.number)}</b>` : "";
+    const pagesHtml = parts.pages ? `, ${escapeHtml(parts.pages)}` : "";
+    const yearHtml = parts.year ? ` (${escapeHtml(parts.year)})` : "";
+    const html = `${escapeHtml(parts.authors)}, ${escapeHtml(parts.title)}${journalHtml}${numberHtml}${pagesHtml}${yearHtml}`;
+    return { plain, html };
+  }
+
+  async function copyFormattedCitation(entry) {
+    const citation = formattedCitationContent(entry);
+    await copyTextWithFormatting(citation.plain, citation.html);
+  }
+
+  function downloadTextFile(text, fileName, type = "text/plain;charset=utf-8") {
+    const url = URL.createObjectURL(new Blob([text], { type }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = fileName;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function hideCategoryContextMenu() {
+    const menu = $(".ctca-category-context-menu", root);
+    if (!menu) return;
+    menu.hidden = true;
+    delete menu.dataset.categoryId;
+    delete menu.dataset.pointerEntered;
+  }
+
+  function hideEntryContextMenu() {
+    const menu = $(".ctca-entry-context-menu", root);
+    if (!menu) return;
+    menu.hidden = true;
+    menu.replaceChildren();
+    delete menu.dataset.entryKey;
+    delete menu.dataset.pointerEntered;
+  }
+
+  async function showEntryContextMenu(event, entry) {
+    event.preventDefault();
+    event.stopPropagation();
+    hideCategoryContextMenu();
+    const preserveMultiple = selectedKeys.size > 1 && selectedKeys.has(entry.key);
+    if (!preserveMultiple) selectedKeys = new Set([entry.key]);
+    selectedKey = entry.key;
+    selectionAnchorKey = entry.key;
+    renderList();
+    renderDetails();
+
+    const menu = $(".ctca-entry-context-menu", root);
+    menu.dataset.entryKey = entry.key;
+    delete menu.dataset.pointerEntered;
+    menu.onpointerenter = () => { menu.dataset.pointerEntered = "true"; };
+    menu.onpointerleave = () => {
+      if (menu.dataset.pointerEntered === "true") hideEntryContextMenu();
+    };
+    menu.innerHTML = `<button type="button" disabled>Loading actions…</button>`;
+    menu.style.left = `${Math.max(8, Math.min(event.clientX, window.innerWidth - 265))}px`;
+    menu.style.top = `${Math.max(8, Math.min(event.clientY, window.innerHeight - 390))}px`;
+    menu.hidden = false;
+
+    const contextEntries = entries.filter((candidate) => selectedKeys.has(candidate.key));
+    const multiple = contextEntries.length > 1;
+    const attachments = multiple ? [] : await globalThis.CollabTeXAttachmentStore.list(entry);
+    if (menu.dataset.entryKey !== entry.key) return;
+    const url = specifiedHttpUrl(entry);
+    const actions = multiple ? [
+      { action: "update-dois", label: "Update from DOIs" },
+      { action: "copy-keys", label: "Copy citation keys" },
+      { action: "copy-formatted-many", label: "Copy as formatted citations" },
+      { action: "star-many", label: "Star" },
+      { action: "download-bib-many", label: "Download BibTeX entries" },
+      { action: "delete-many", label: "Delete", danger: true }
+    ] : [
+      ...(url ? [{ action: "visit-url", label: "Visit URL" }] : []),
+      ...(normalizeDoi(entry.fields?.doi || "") ? [{ action: "update-doi", label: "Update entry from DOI" }] : []),
+      ...(!attachments.length ? [{ action: "get-pdf-from-web", label: "Download attachment from web" }] : []),
+      ...(attachments.length ? [{ action: "open-pdf", label: "Open PDF", attachmentId: attachments[0].id }] : []),
+      { action: "star", label: entry.starred ? "Unstar" : "Star" },
+      { action: "copy-key", label: "Copy citation key" },
+      { action: "copy-formatted", label: "Copy as formatted citation" },
+      { action: "download-bib", label: "Download BibTeX entry" },
+      { action: "delete", label: "Delete", danger: true }
+    ];
+    menu.innerHTML = actions.map((item) =>
+      `<button type="button" role="menuitem" data-entry-context-action="${item.action}"${item.attachmentId ? ` data-attachment-id="${escapeHtml(item.attachmentId)}"` : ""}${item.danger ? ` class="ctca-entry-context-danger"` : ""}>${escapeHtml(item.label)}</button>`
+    ).join("");
+    menu.onclick = async (clickEvent) => {
+      const button = clickEvent.target.closest("[data-entry-context-action]");
+      if (!button) return;
+      const action = button.dataset.entryContextAction;
+      hideEntryContextMenu();
+      try {
+        if (action === "update-dois") {
+          await updateEntriesFromDoi(contextEntries, { showBatchConfirmation: true });
+        } else if (action === "copy-keys") {
+          await copyTextWithFormatting(contextEntries.map((item) => item.key).join("\n"));
+          setStatus(`Copied ${contextEntries.length} citation keys.`);
+        } else if (action === "copy-formatted-many") {
+          const citations = contextEntries.map(formattedCitationContent);
+          await copyTextWithFormatting(
+            citations.map((citation) => citation.plain).join("\n"),
+            citations.map((citation) => `<div>${citation.html}</div>`).join("")
+          );
+          setStatus(`Copied ${contextEntries.length} formatted citations.`);
+        } else if (action === "star-many") {
+          for (const item of contextEntries) {
+            item.starred = true;
+            item.updatedAt = new Date().toISOString();
+          }
+          markDirty(`Starring ${contextEntries.length} selected entriesâ€¦`);
+          renderAll();
+        } else if (action === "download-bib-many") {
+          downloadTextFile(
+            `${contextEntries.map((item) => exportBibEntry(item)).join("\n\n")}\n`,
+            "selected-bibliography-entries.bib",
+            "application/x-bibtex;charset=utf-8"
+          );
+        } else if (action === "delete-many") {
+          await removeSelected();
+        } else if (action === "visit-url") window.open(url, "_blank", "noopener,noreferrer");
+        else if (action === "star") {
+          entry.starred = !entry.starred;
+          entry.updatedAt = new Date().toISOString();
+          markDirty(entry.starred ? "Starring entry…" : "Removing star…");
+          renderAll();
+        } else if (action === "copy-key") {
+          await copyTextWithFormatting(entry.key);
+          setStatus(`Copied ${entry.key}.`);
+        } else if (action === "copy-formatted") {
+          await copyFormattedCitation(entry);
+          setStatus(`Copied formatted citation for ${entry.key}.`);
+        } else if (action === "download-bib") {
+          downloadTextFile(`${exportBibEntry(entry)}\n`, `${entry.key}.bib`, "application/x-bibtex;charset=utf-8");
+        } else {
+          const syntheticButton = document.createElement("button");
+          syntheticButton.dataset.managerAction = action === "delete" ? "remove-entry" : action;
+          if (button.dataset.attachmentId) syntheticButton.dataset.attachmentId = button.dataset.attachmentId;
+          await detailActionClicked({ target: syntheticButton, preventDefault() {} });
+        }
+      } catch (error) {
+        setStatus(error?.message || String(error), true);
+      }
+    };
+    menu.querySelector("button")?.focus();
+  }
+
+  function urlGlobeIconHtml() {
+    return `<svg class="ctca-manager-row-globe-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M1.75 8h12.5M8 1.75C6.15 3.45 5.1 5.55 5.1 8S6.15 12.55 8 14.25M8 1.75c1.85 1.7 2.9 3.8 2.9 6.25S9.85 12.55 8 14.25" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.25"/></svg>`;
+  }
+
+  function paperclipIconHtml() {
+    return `<svg class="ctca-manager-row-pdf-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5.2 8.25 9.45 4a2.15 2.15 0 0 1 3.05 3.05l-5.4 5.4a3.25 3.25 0 0 1-4.6-4.6l5.1-5.1" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.45"/></svg>`;
+  }
+
+  function downloadIconHtml() {
+    return `<svg class="ctca-manager-row-pdf-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 1.75v8.1m-3-3 3 3 3-3M2.25 13.5h11.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>`;
+  }
+
+  function updateRowPdfAction(row, entry, attachments) {
+    if (!row?.isConnected || row.dataset.managerRecordId !== entry.key) return;
+    delete row.dataset.pdfActionRequest;
+    const slot = $(".ctca-manager-row-pdf-slot", row);
+    if (!slot) return;
+    const attachment = attachments[0];
+    const sourceUrl = specifiedHttpUrl(entry);
+    if (!attachment && !sourceUrl) {
+      slot.replaceChildren();
+      return;
+    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ctca-manager-row-pdf-action";
+    if (attachment) {
+      button.title = `Open attached PDF: ${attachment.name}`;
+      button.setAttribute("aria-label", `Open first PDF attached to ${entry.key}`);
+      button.innerHTML = paperclipIconHtml();
+      button.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        await openPdfTab(entry, attachment);
+      });
+    } else {
+      button.title = `Get PDF from ${sourceUrl}`;
+      button.setAttribute("aria-label", `Get PDF from the web for ${entry.key}`);
+      button.innerHTML = downloadIconHtml();
+      button.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        await openAddPdfDialog(entry, { getFromWeb: true });
+      });
+    }
+    slot.replaceChildren(button);
+  }
+
+  async function loadRowPdfAction(row, entry) {
+    const request = `${Date.now()}-${Math.random()}`;
+    row.dataset.pdfActionRequest = request;
+    try {
+      const attachments = await globalThis.CollabTeXAttachmentStore.list(entry);
+      if (row.dataset.pdfActionRequest !== request) return;
+      updateRowPdfAction(row, entry, attachments);
+    } catch (_error) {
+      if (row.dataset.pdfActionRequest !== request) return;
+      delete row.dataset.pdfActionRequest;
+      $(".ctca-manager-row-pdf-slot", row)?.replaceChildren();
+    }
+  }
+
   function allKnownTags(exceptKey = "") {
     const seen = new Map();
     for (const item of entries) {
@@ -922,6 +1620,198 @@
       }
     }
     return [...seen.values()].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+  }
+
+  function allKnownJournals(exceptKey = "") {
+    const seen = new Map();
+    for (const item of entries) {
+      if (item.key === exceptKey) continue;
+      for (const field of ["journal", "journaltitle", "booktitle"]) {
+        const value = String(item?.fields?.[field] || "").replace(/\s+/g, " ").trim();
+        const key = value.toLocaleLowerCase();
+        if (!value || seen.has(key)) continue;
+        seen.set(key, {
+          value,
+          label: globalThis.CollabTeXBibTeX.latexToText(value)
+        });
+      }
+    }
+    return [...seen.values()].sort((left, right) =>
+      left.label.localeCompare(right.label, undefined, { sensitivity: "base" })
+    );
+  }
+
+  function allKnownKeywords(exceptKey = "") {
+    const seen = new Map();
+    for (const item of entries) {
+      if (item.key === exceptKey) continue;
+      for (const field of ["keywords", "keyword"]) {
+        for (const keyword of String(item?.fields?.[field] || "").split(/[,;\n]+/)) {
+          const value = keyword.replace(/\s+/g, " ").trim();
+          const key = value.toLocaleLowerCase();
+          if (!value || seen.has(key)) continue;
+          seen.set(key, {
+            value,
+            label: globalThis.CollabTeXBibTeX.latexToText(value)
+          });
+        }
+      }
+    }
+    return [...seen.values()].sort((left, right) =>
+      left.label.localeCompare(right.label, undefined, { sensitivity: "base" })
+    );
+  }
+
+  function keywordCompletionToken(input) {
+    const value = String(input?.value || "");
+    const caret = Math.max(0, Math.min(value.length, input?.selectionStart ?? value.length));
+    const before = value.slice(0, caret);
+    const separator = Math.max(before.lastIndexOf(","), before.lastIndexOf(";"), before.lastIndexOf("\n"));
+    const nextRelative = value.slice(caret).search(/[,;\n]/);
+    const rawStart = separator + 1;
+    const rawEnd = nextRelative < 0 ? value.length : caret + nextRelative;
+    const segment = value.slice(rawStart, rawEnd);
+    const leading = segment.match(/^\s*/)?.[0].length || 0;
+    const trailing = segment.match(/\s*$/)?.[0].length || 0;
+    return {
+      start: rawStart + leading,
+      end: Math.max(rawStart + leading, rawEnd - trailing),
+      value: segment.trim()
+    };
+  }
+
+  function setFieldCompletionOptions(container, suggestions) {
+    container.replaceChildren(...suggestions.map((candidate, index) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ctca-completion-option";
+      button.dataset.completionValue = candidate.value;
+      button.setAttribute("role", "option");
+      const name = document.createElement("span");
+      name.className = "ctca-completion-option-name";
+      name.textContent = candidate.label;
+      button.appendChild(name);
+      if (index === 0) {
+        const hint = document.createElement("span");
+        hint.className = "ctca-completion-option-hint";
+        hint.textContent = "\u2192";
+        hint.title = "Press Right Arrow to complete";
+        button.appendChild(hint);
+      }
+      return button;
+    }));
+    container.hidden = suggestions.length === 0;
+  }
+
+  function renderJournalSuggestions(entry, input) {
+    const container = input.closest(".ctca-field-completion-wrap")?.querySelector(".ctca-field-completion");
+    if (!container) return;
+    const queryText = input.value.replace(/\s+/g, " ").trim().toLocaleLowerCase();
+    const suggestions = allKnownJournals(entry.key)
+      .filter((candidate) => candidate.value.toLocaleLowerCase() !== queryText)
+      .filter((candidate) =>
+        !queryText ||
+        candidate.value.toLocaleLowerCase().includes(queryText) ||
+        candidate.label.toLocaleLowerCase().includes(queryText)
+      )
+      .sort((left, right) => {
+        const leftStarts = left.label.toLocaleLowerCase().startsWith(queryText) ? 0 : 1;
+        const rightStarts = right.label.toLocaleLowerCase().startsWith(queryText) ? 0 : 1;
+        return leftStarts - rightStarts;
+      })
+      .slice(0, 8);
+    setFieldCompletionOptions(container, suggestions);
+    input.setAttribute("aria-expanded", String(suggestions.length > 0));
+  }
+
+  function renderKeywordSuggestions(entry, input) {
+    const container = input.closest(".ctca-field-completion-wrap")?.querySelector(".ctca-field-completion");
+    if (!container) return;
+    const token = keywordCompletionToken(input);
+    const queryText = token.value.replace(/\s+/g, " ").trim().toLocaleLowerCase();
+    const current = new Set(
+      String(input.value || "")
+        .split(/[,;\n]+/)
+        .map((keyword) => keyword.replace(/\s+/g, " ").trim().toLocaleLowerCase())
+        .filter(Boolean)
+    );
+    current.delete(queryText);
+    const suggestions = allKnownKeywords(entry.key)
+      .filter((candidate) => !current.has(candidate.value.toLocaleLowerCase()))
+      .filter((candidate) => candidate.value.toLocaleLowerCase() !== queryText)
+      .filter((candidate) =>
+        !queryText ||
+        candidate.value.toLocaleLowerCase().includes(queryText) ||
+        candidate.label.toLocaleLowerCase().includes(queryText)
+      )
+      .sort((left, right) => {
+        const leftStarts = left.label.toLocaleLowerCase().startsWith(queryText) ? 0 : 1;
+        const rightStarts = right.label.toLocaleLowerCase().startsWith(queryText) ? 0 : 1;
+        return leftStarts - rightStarts;
+      })
+      .slice(0, 8);
+    setFieldCompletionOptions(container, suggestions);
+    input.setAttribute("aria-expanded", String(suggestions.length > 0));
+  }
+
+  function acceptJournalSuggestion(input, value) {
+    if (!input || !value) return false;
+    input.value = value;
+    const container = input.closest(".ctca-field-completion-wrap")?.querySelector(".ctca-field-completion");
+    if (container) container.hidden = true;
+    input.setAttribute("aria-expanded", "false");
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }
+
+  function acceptKeywordSuggestion(input, value) {
+    if (!input || !value) return false;
+    const token = keywordCompletionToken(input);
+    input.setRangeText(value, token.start, token.end, "end");
+    const container = input.closest(".ctca-field-completion-wrap")?.querySelector(".ctca-field-completion");
+    if (container) container.hidden = true;
+    input.setAttribute("aria-expanded", "false");
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }
+
+  function fieldAutocompleteKeydown(event) {
+    const input = event.target.closest("[data-manager-autocomplete]");
+    if (!input) return;
+    const container = input.closest(".ctca-field-completion-wrap")?.querySelector(".ctca-field-completion");
+    const token = input.dataset.managerAutocomplete === "keywords"
+      ? keywordCompletionToken(input)
+      : { end: input.value.length };
+    if (
+      event.key === "ArrowRight" &&
+      !container?.hidden &&
+      input.selectionStart === input.selectionEnd &&
+      input.selectionStart === token.end
+    ) {
+      const first = container.querySelector(".ctca-completion-option");
+      const accepted = input.dataset.managerAutocomplete === "keywords"
+        ? acceptKeywordSuggestion(input, first?.dataset.completionValue)
+        : acceptJournalSuggestion(input, first?.dataset.completionValue);
+      if (first && accepted) {
+        event.preventDefault();
+      }
+    } else if (event.key === "Escape" && container && !container.hidden) {
+      event.preventDefault();
+      container.hidden = true;
+      input.setAttribute("aria-expanded", "false");
+    }
+  }
+
+  function fieldAutocompleteMouseDown(event) {
+    const option = event.target.closest(".ctca-field-completion .ctca-completion-option");
+    if (!option) return;
+    const input = option.closest(".ctca-field-completion-wrap")?.querySelector("[data-manager-autocomplete]");
+    event.preventDefault();
+    event.stopPropagation();
+    const accepted = input?.dataset.managerAutocomplete === "keywords"
+      ? acceptKeywordSuggestion(input, option.dataset.completionValue)
+      : acceptJournalSuggestion(input, option.dataset.completionValue);
+    if (accepted) input.focus();
   }
 
   function tagEditorHtml(entry) {
@@ -993,9 +1883,25 @@
     }
   }
 
+  function updateBibliographyDetailsVisibility() {
+    const hasActiveSelection = selectedKeys.size > 0 && Boolean(entryByKey(selectedKey));
+    const hasAuthorImpact = globalThis.SmartCitationsOpenAlex.isAuthorCategory(selectedCategoryId);
+    const noSelectionDetailsHidden = !hasActiveSelection && (!hasAuthorImpact || authorImpactCollapsed);
+    const collapsed = bibliographyDetailsCollapsed || noSelectionDetailsHidden;
+    root.classList.toggle("ctca-details-collapsed", collapsed);
+    root.classList.toggle("ctca-details-no-selection", noSelectionDetailsHidden);
+    const collapseButton = $(".ctca-manager-collapse-details", root);
+    if (collapseButton) {
+      collapseButton.title = collapsed ? "Expand detail pane" : "Collapse detail pane";
+      collapseButton.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    }
+  }
+
   function renderDetails() {
+    updateBibliographyDetailsVisibility();
     const container = $(".ctca-manager-details", root);
-    const entry = entryByKey(selectedKey);
+    const entry = selectedKeys.size ? entryByKey(selectedKey) : null;
+    renderOpenAlexAuthorImpactSlot();
     if (!entry) {
       container.innerHTML = `<div class="ctca-manager-empty-details">Select a bibliography entry.</div>`;
       return;
@@ -1018,9 +1924,9 @@
     container.innerHTML = `
       <div class="ctca-manager-detail-head">
         <div class="ctca-manager-detail-heading-text">
-          <div class="ctca-manager-detail-title" title="${escapeHtml(title)}">${escapeHtml(title)}</div>
-          <div class="ctca-manager-detail-authors" title="${escapeHtml(authors)}">${escapeHtml(authors)}</div>
-          ${entry.doiSyncedAt ? `<div class="ctca-manager-detail-doi-sync">🌐✓ DOI synchronized ${escapeHtml(entry.doiSyncedAt)}</div>` : ""}
+          <div class="ctca-manager-detail-title" data-manager-inline-field="title" role="button" tabindex="0" title="Click to edit title">${latexHtml(title)}</div>
+          <div class="ctca-manager-detail-authors" data-manager-inline-field="author" role="button" tabindex="0" title="Click to edit authors">${allAuthorsHtml(entry)}</div>
+          ${entry.doiSyncedAt ? `<div class="ctca-manager-detail-doi-sync">🌐✓ DOI synchronized ${escapeHtml(formatDoiSyncDateTime(entry.doiSyncedAt))}</div>` : ""}
         </div>
         <div class="ctca-manager-detail-actions" data-detail-entry-key="${escapeHtml(entry.key)}"></div>
       </div>
@@ -1029,10 +1935,8 @@
           <select data-manager-property="type">${ENTRY_TYPES.map((type) => `<option value="${type}" ${entry.type === type ? "selected" : ""}>${type}</option>`).join("")}</select>
         </label>
         <label class="ctca-manager-field"><span>Citation key</span><input data-manager-property="key" value="${escapeHtml(entry.key)}"></label>
-        ${managerInput("Title", "title", fields.title, { multiline: true, rows: 2, wide: true })}
-        ${managerInput("Authors", "author", fields.author, { multiline: true, rows: 3, wide: true })}
         ${managerInput("Editors", "editor", fields.editor, { multiline: true, rows: 2, wide: true })}
-        ${managerInput(journalLabel, journalField, fields[journalField], { wide: true })}
+        ${managerInput(journalLabel, journalField, fields[journalField], { wide: true, autocomplete: "journal" })}
         ${managerInput("Year", "year", fields.year)}
         ${managerInput("Volume", "volume", fields.volume)}
         ${managerInput("Pages / article number", "pages", fields.pages)}
@@ -1042,9 +1946,14 @@
             <button type="button" data-manager-action="update-doi" title="Update this entry from DOI metadata">🌐</button>
           </div>
         </label>
-        ${managerInput("URL", "url", fields.url, { wide: true })}
+        <label class="ctca-manager-field ctca-manager-field-wide"><span>URL</span>
+          <div class="ctca-manager-url-row">
+            <input data-manager-field="url" type="url" value="${escapeHtml(fields.url || "")}">
+            <button type="button" data-manager-action="open-url" title="Open URL" aria-label="Open URL">↗</button>
+          </div>
+        </label>
         ${managerInput("Abstract", "abstract", fields.abstract, { multiline: true, rows: 8, wide: true })}
-        ${managerInput("Keywords", "keywords", fields.keywords, { multiline: true, rows: 3, wide: true })}
+        ${managerInput("Keywords", "keywords", fields.keywords, { multiline: true, rows: 3, wide: true, autocomplete: "keywords" })}
         ${managerInput("Publisher", "publisher", fields.publisher, { wide: true })}
         ${managerInput("Institution", "institution", fields.institution, { wide: true })}
         ${managerInput("BibTeX note", "note", fields.note, { multiline: true, rows: 3, wide: true })}
@@ -1061,8 +1970,9 @@
         </div>
       </div>
       <section class="ctca-manager-pdf-attachments" data-entry-key="${escapeHtml(entry.key)}">
-        <div class="ctca-manager-pdf-attachments-head"><h3>PDF attachments</h3><button type="button" class="ctca-manager-add-pdf" data-manager-action="add-pdf">+ Attach PDF</button></div>
+        <div class="ctca-manager-pdf-attachments-head"><h3>PDF attachments</h3><button type="button" class="ctca-manager-add-pdf" data-manager-action="add-pdf" ${pdfAttachmentLoadingKeys.has(entry.key) ? "disabled" : ""}>+ Attach PDF</button></div>
         <div class="ctca-manager-pdf-list"><div class="ctca-manager-no-pdf">Loading attachments…</div></div>
+        <div class="ctca-manager-pdf-loading" data-entry-key="${escapeHtml(entry.key)}" role="status" aria-label="Loading PDF attachments" hidden><span class="ctca-manager-pdf-loading-spinner" aria-hidden="true"></span></div>
       </section>
       <div class="ctca-manager-extra-fields">
         <h3>Additional BibTeX fields</h3>
@@ -1083,8 +1993,47 @@
       <div class="ctca-manager-unsaved-note">Changes are saved automatically.</div>
       <div class="ctca-manager-remove-entry-row"><button type="button" class="ctca-manager-remove-entry" data-manager-action="remove-entry">Remove entry</button></div>
     `;
+    bindPdfDropTarget(container, entry);
     renderAttachmentList(entry).catch((error) => setStatus(error.message || String(error), true));
+    syncPdfAttachmentLoadingIndicators();
     syncPdfEntryDetails();
+  }
+
+  function renderOpenAlexAuthorImpactSlot() {
+    const column = $(".ctca-manager-details-column", root);
+    const slot = $(".ctca-openalex-impact-slot", column);
+    const visible = globalThis.SmartCitationsOpenAlex.isAuthorCategory(selectedCategoryId);
+    column.classList.toggle("ctca-openalex-impact-visible", visible);
+    slot.hidden = !visible;
+    if (!visible) {
+      slot.replaceChildren();
+      return;
+    }
+    slot.innerHTML = globalThis.SmartCitationsOpenAlex.impactPlaceholderHtml();
+    globalThis.SmartCitationsOpenAlex.bindImpactResize(slot, {
+      height: authorImpactHeight,
+      onChange: (height) => {
+        authorImpactHeight = height;
+        saveUiState().catch(() => {});
+      }
+    });
+    globalThis.SmartCitationsOpenAlex.bindImpactCollapse(slot, {
+      collapsed: authorImpactCollapsed,
+      onChange: (collapsed) => {
+        authorImpactCollapsed = collapsed;
+        updateBibliographyDetailsVisibility();
+        saveUiState().catch(() => {});
+      }
+    });
+    const authoredEntries = entries.filter((entry) => Boolean(entryAuthorshipCategory(entry)));
+    const descriptors = authoredEntries.map((entry) =>
+      globalThis.SmartCitationsOpenAlex.descriptor(entry, entry.key)
+    );
+    globalThis.SmartCitationsOpenAlex.hydrateAuthorImpact(
+      slot.querySelector(".ctca-openalex-impact"),
+      descriptors,
+      authorshipUserName
+    ).catch(() => {});
   }
 
   function attachmentProviderLabel(attachment) {
@@ -1095,11 +2044,24 @@
 
   async function renderAttachmentList(entry) {
     const attachments = await globalThis.CollabTeXAttachmentStore.list(entry);
+    let openTabChanged = false;
+    for (const data of openPdfTabs.values()) {
+      if (data.entryKey !== entry.key) continue;
+      const currentAttachment = attachments.find((attachment) => attachment.id === data.attachment.id);
+      if (currentAttachment) data.attachment = currentAttachment;
+      data.attachmentCount = attachments.length;
+      openTabChanged = true;
+    }
+    if (openTabChanged) renderWorkspaceTabs();
+    const row = root.querySelector(`.ctca-manager-row[data-manager-record-id="${CSS.escape(entry.key)}"]`);
+    updateRowPdfAction(row, entry, attachments);
     if (selectedKey !== entry.key) return;
 
     const detailActionsHtml = attachments.length
       ? `<button type="button" data-manager-action="open-pdf" data-attachment-id="${escapeHtml(attachments[0].id)}">Open PDF ↗</button>`
-      : "";
+      : specifiedHttpUrl(entry)
+        ? `<button type="button" class="ctca-manager-detail-get-pdf" data-manager-action="get-pdf-from-web">${downloadIconHtml()}<span>Get PDF from web</span></button>`
+        : "";
     root.querySelectorAll(`.ctca-manager-detail-actions[data-detail-entry-key="${CSS.escape(entry.key)}"]`).forEach((detailActions) => {
       detailActions.innerHTML = detailActionsHtml;
     });
@@ -1107,10 +2069,12 @@
     const listHtml = attachments.length
       ? attachments.map((attachment) => `
         <div class="ctca-manager-pdf-row" data-attachment-id="${escapeHtml(attachment.id)}">
+          <button type="button" class="ctca-manager-pdf-reorder" draggable="${attachments.length > 1 ? "true" : "false"}" ${attachments.length > 1 ? "" : "disabled"} title="Drag to reorder PDF" aria-label="Reorder ${escapeHtml(attachment.name)}">⋮⋮</button>
           <div class="ctca-manager-pdf-name" title="${escapeHtml(attachment.name)}">${escapeHtml(attachment.name)}</div>
           <div class="ctca-manager-pdf-meta">${escapeHtml(attachmentProviderLabel(attachment))}${attachment.fileName ? ` · ${escapeHtml(attachment.fileName)}` : ""}${attachment.size ? ` · ${(attachment.size / 1024 / 1024).toFixed(1)} MB` : ""}</div>
           <div class="ctca-manager-pdf-actions">
             <button type="button" data-manager-action="open-pdf" data-attachment-id="${escapeHtml(attachment.id)}">Open</button>
+            <button type="button" class="ctca-manager-pdf-download" data-manager-action="download-pdf" data-attachment-id="${escapeHtml(attachment.id)}" title="Download PDF" aria-label="Download ${escapeHtml(attachment.name)}">${downloadIconHtml()}</button>
             <button type="button" data-manager-action="rename-pdf" data-attachment-id="${escapeHtml(attachment.id)}">Rename</button>
             ${attachment.provider !== "local" ? `<button type="button" data-manager-action="replace-pdf" data-attachment-id="${escapeHtml(attachment.id)}">Replace</button>` : ""}
             <button type="button" data-manager-action="remove-pdf" data-attachment-id="${escapeHtml(attachment.id)}">Remove</button>
@@ -1120,6 +2084,121 @@
 
     root.querySelectorAll(`.ctca-manager-pdf-attachments[data-entry-key="${CSS.escape(entry.key)}"] .ctca-manager-pdf-list`).forEach((list) => {
       list.innerHTML = listHtml;
+      bindAttachmentReordering(list, entry, attachments);
+    });
+  }
+
+  function reorderedAttachmentIds(attachments, sourceId, targetId, placeAfter) {
+    const ids = attachments.map((attachment) => attachment.id);
+    if (sourceId === targetId || !ids.includes(sourceId) || !ids.includes(targetId)) return ids;
+    ids.splice(ids.indexOf(sourceId), 1);
+    const targetIndex = ids.indexOf(targetId);
+    ids.splice(targetIndex + (placeAfter ? 1 : 0), 0, sourceId);
+    return ids;
+  }
+
+  function bindAttachmentReordering(list, entry, attachments) {
+    if (!list || attachments.length < 2) return;
+    let saving = false;
+    const clearDropState = () => {
+      list.querySelectorAll(".ctca-manager-pdf-drop-before, .ctca-manager-pdf-drop-after, .ctca-manager-pdf-reordering")
+        .forEach((row) => row.classList.remove("ctca-manager-pdf-drop-before", "ctca-manager-pdf-drop-after", "ctca-manager-pdf-reordering"));
+    };
+    const persistOrder = async (orderedIds) => {
+      if (saving || orderedIds.every((id, index) => id === attachments[index]?.id)) return;
+      saving = true;
+      try {
+        await globalThis.CollabTeXAttachmentStore.reorder(entry, orderedIds);
+        await renderAttachmentList(entry);
+        setStatus("PDF attachment order saved.");
+      } catch (error) {
+        setStatus(error?.message || String(error), true);
+        await renderAttachmentList(entry);
+      }
+    };
+
+    list.querySelectorAll(".ctca-manager-pdf-row[data-attachment-id]").forEach((row) => {
+      const handle = row.querySelector(".ctca-manager-pdf-reorder");
+      handle?.addEventListener("dragstart", (event) => {
+        event.stopPropagation();
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("application/x-ctca-pdf-attachment", row.dataset.attachmentId || "");
+        row.classList.add("ctca-manager-pdf-reordering");
+      });
+      handle?.addEventListener("dragend", clearDropState);
+      handle?.addEventListener("keydown", (event) => {
+        if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+        event.preventDefault();
+        const currentIndex = attachments.findIndex((attachment) => attachment.id === row.dataset.attachmentId);
+        const targetIndex = event.key === "ArrowUp" ? currentIndex - 1 : currentIndex + 1;
+        if (currentIndex < 0 || targetIndex < 0 || targetIndex >= attachments.length) return;
+        const ids = attachments.map((attachment) => attachment.id);
+        [ids[currentIndex], ids[targetIndex]] = [ids[targetIndex], ids[currentIndex]];
+        persistOrder(ids);
+      });
+      row.addEventListener("dragover", (event) => {
+        if (!Array.from(event.dataTransfer?.types || []).includes("application/x-ctca-pdf-attachment")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        event.dataTransfer.dropEffect = "move";
+        const rectangle = row.getBoundingClientRect();
+        const placeAfter = event.clientY > rectangle.top + rectangle.height / 2;
+        row.classList.toggle("ctca-manager-pdf-drop-before", !placeAfter);
+        row.classList.toggle("ctca-manager-pdf-drop-after", placeAfter);
+      });
+      row.addEventListener("dragleave", (event) => {
+        if (row.contains(event.relatedTarget)) return;
+        row.classList.remove("ctca-manager-pdf-drop-before", "ctca-manager-pdf-drop-after");
+      });
+      row.addEventListener("drop", (event) => {
+        const sourceId = event.dataTransfer?.getData("application/x-ctca-pdf-attachment") || "";
+        if (!sourceId) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const rectangle = row.getBoundingClientRect();
+        const placeAfter = event.clientY > rectangle.top + rectangle.height / 2;
+        const orderedIds = reorderedAttachmentIds(attachments, sourceId, row.dataset.attachmentId || "", placeAfter);
+        clearDropState();
+        persistOrder(orderedIds);
+      });
+    });
+  }
+
+  async function downloadPdfAttachment(attachment) {
+    const blob = await globalThis.CollabTeXAttachmentStore.getBlob(attachment);
+    if (!blob) throw new Error("PDF data is not available.");
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = attachment.fileName || `${attachment.name || "document"}.pdf`;
+    link.style.display = "none";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function syncPdfAttachmentLoadingIndicators() {
+    root.querySelectorAll(".ctca-manager-row[data-manager-record-id]").forEach((row) => {
+      const loading = pdfAttachmentLoadingKeys.has(row.dataset.managerRecordId || "");
+      row.classList.toggle("ctca-manager-row-pdf-loading", loading);
+      let indicator = row.querySelector(".ctca-manager-row-pdf-loading-indicator");
+      if (loading && !indicator) {
+        indicator = document.createElement("span");
+        indicator.className = "ctca-manager-row-pdf-loading-indicator";
+        indicator.setAttribute("role", "status");
+        indicator.setAttribute("aria-label", "Loading PDF attachments");
+        indicator.innerHTML = `<span class="ctca-manager-pdf-loading-spinner" aria-hidden="true"></span>`;
+        row.prepend(indicator);
+      } else if (!loading) {
+        indicator?.remove();
+      }
+    });
+    root.querySelectorAll(".ctca-manager-pdf-loading[data-entry-key]").forEach((indicator) => {
+      const loading = pdfAttachmentLoadingKeys.has(indicator.dataset.entryKey || "");
+      indicator.hidden = !loading;
+      const addButton = indicator.closest(".ctca-manager-pdf-attachments")?.querySelector(".ctca-manager-add-pdf");
+      if (addButton) addButton.disabled = loading;
     });
   }
 
@@ -1283,8 +2362,57 @@
     window.clearTimeout(nextcloudSyncTimer);
     nextcloudSyncTimer = window.setTimeout(() => {
       nextcloudSyncTimer = null;
+      if (busy) {
+        scheduleNextcloudSync(1500);
+        return;
+      }
       synchronizeNextcloud().catch(() => {});
     }, delay);
+  }
+
+  async function propagateRemovedEntriesToNextcloud(removedEntries) {
+    if (!syncNextcloudBibliography || !removedEntries?.length) return;
+    window.clearTimeout(nextcloudSyncTimer);
+    nextcloudSyncTimer = null;
+    setStatus(
+      `Deleting ${removedEntries.length} entr${removedEntries.length === 1 ? "y" : "ies"} from Nextcloud…`
+    );
+    const waitDeadline = Date.now() + 30000;
+    while (nextcloudSyncInProgress && Date.now() < waitDeadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    }
+    if (nextcloudSyncInProgress) {
+      setStatus("The local removal was saved, but the active Nextcloud synchronization did not finish in time.", true);
+      return;
+    }
+    nextcloudSyncInProgress = true;
+    try {
+      const result = await globalThis.CollabTeXAttachmentStore.deleteBibliographyEntriesNextcloud(removedEntries);
+      if (result?.status === "deleted") {
+        setStatus(
+          `Removed ${result.deleted} entr${result.deleted === 1 ? "y" : "ies"} locally and from Nextcloud.`
+        );
+      } else {
+        setStatus("The local removal is saved; Nextcloud will be brought up to date by synchronization.");
+      }
+    } catch (error) {
+      setStatus(
+        `The local removal was saved, but deletion from Nextcloud failed: ${error?.message || String(error)}`,
+        true
+      );
+      return;
+    } finally {
+      nextcloudSyncInProgress = false;
+    }
+    scheduleNextcloudSync(0);
+  }
+
+  async function openOptionsPage() {
+    try {
+      await extensionApi.runtime.openOptionsPage();
+    } catch (error) {
+      setStatus(error?.message || "Smart Citations options could not be opened.", true);
+    }
   }
 
   async function openPdfStorageSettings() {
@@ -1372,9 +2500,11 @@
     });
   }
 
-  async function openAddPdfDialog(entry) {
+  async function openAddPdfDialog(entry, options = {}) {
     const config = await globalThis.CollabTeXAttachmentStore.getConfig();
-    let selectedProvider = config.provider || "browser";
+    const sourceUrl = options.sourceUrl || specifiedHttpUrl(entry);
+    const initialFiles = globalThis.CollabTeXPdfImport.pdfFiles(options.files || []);
+    let selectedProvider = (options.getFromWeb || initialFiles.length) && config.provider === "local" ? "browser" : (config.provider || "browser");
     let fileInput = null;
     let fileRows = null;
     let localPanel = null;
@@ -1382,12 +2512,20 @@
     let localNameRows = null;
     let localPermissionButton = null;
     let localPermissionStatus = null;
-    let selectedFiles = [];
+    let selectedFiles = [...initialFiles];
     let localNames = [];
+    let webCandidates = [];
+    let webResultRows = null;
+    let webScanUrl = sourceUrl;
+    let webResumeTabId = null;
+    let webHumanCheckEncountered = false;
+    const webOpenTabIds = new Set();
 
     const result = await showDialog({
       title: `Attach PDF to ${entry.key}`,
-      message: "Choose where the PDF should be kept. You can attach several PDFs and name each attachment separately.",
+      message: options.getFromWebFile
+        ? "The journal PDF is selected. Choose where it should be kept, then attach it."
+        : "Choose where the PDF should be kept. You can attach several PDFs and name each attachment separately.",
       controls: (container) => {
         const wrapper = document.createElement("div");
         wrapper.className = "ctca-pdf-dialog-grid";
@@ -1404,10 +2542,18 @@
             </button>
           </div>
           <div class="ctca-pdf-browse-row">
+            ${sourceUrl ? `<button type="button" class="ctca-pdf-get-web">Get from web</button>` : ""}
             <button type="button" class="ctca-pdf-browse">Browse PDF file(s)…</button>
             <span class="ctca-pdf-browse-summary">No PDF selected</span>
             <input type="file" accept=".pdf,application/pdf,application/x-pdf" multiple hidden>
           </div>
+          ${sourceUrl ? `
+          <div class="ctca-web-pdf-panel" hidden>
+            <div class="ctca-web-pdf-status" aria-live="polite">Ready to inspect ${escapeHtml(sourceUrl)}</div>
+            <div class="ctca-web-file-permission">Protected-site downloads require <strong>Allow access to file URLs</strong> on Smart Citations’ extension Details page. <a href="#" class="ctca-web-file-permission-link">Open extension details</a></div>
+            <button type="button" class="ctca-web-pdf-continue" hidden>Continue looking for PDFs</button>
+            <div class="ctca-web-pdf-results"></div>
+          </div>` : ""}
           <div class="ctca-pdf-file-name-list"></div>
           <div class="ctca-local-path-panel" hidden>
             <label class="ctca-app-dialog-field ctca-local-path-field">
@@ -1416,7 +2562,7 @@
             </label>
             <p class="ctca-local-path-instruction"><strong>How to get the path:</strong> On Windows, browse to the PDF in File Explorer, right-click it, choose <em>Properties</em>, copy the file location, paste it here, and append the PDF filename. You can also use <em>Shift + right-click → Copy as path</em>. Paste one complete PDF path per line. Backslashes are accepted; do not add <code>file://</code>.</p>
             <p class="ctca-local-link-warning">Only the path is stored; the PDF is not copied. In Chrome or Edge, enable <strong>Allow access to file URLs</strong> on the extension’s Details page. In Firefox 153 and newer, enable <strong>Access local files on your computer</strong>. In older Firefox versions there is no separate local-files row; the relevant permission is <strong>Access your data for all websites</strong>.</p>
-            <div class="ctca-local-permission-row"><button type="button" class="ctca-local-permission-button">Check / grant local-file access</button><span class="ctca-local-permission-status" aria-live="polite"></span></div>
+            <div class="ctca-local-permission-row"><button type="button" class="ctca-local-permission-button">Open extension settings</button><span class="ctca-local-permission-status" aria-live="polite"></span></div>
             <div class="ctca-local-path-name-list"></div>
           </div>`;
         container.appendChild(wrapper);
@@ -1430,6 +2576,13 @@
         const browseRow = wrapper.querySelector('.ctca-pdf-browse-row');
         const summary = wrapper.querySelector('.ctca-pdf-browse-summary');
         const providerButtons = [...wrapper.querySelectorAll('.ctca-pdf-provider-choice')];
+        const getWebButton = wrapper.querySelector(".ctca-pdf-get-web");
+        const webPanel = wrapper.querySelector(".ctca-web-pdf-panel");
+        const webStatus = wrapper.querySelector(".ctca-web-pdf-status");
+        const webPermissionLink = wrapper.querySelector(".ctca-web-file-permission-link");
+        const continueWebButton = wrapper.querySelector(".ctca-web-pdf-continue");
+        const webResults = wrapper.querySelector(".ctca-web-pdf-results");
+        webResultRows = webResults;
 
         const localPaths = () => String(localPathInput.value || "")
           .split(/\r?\n/)
@@ -1451,18 +2604,18 @@
         };
         localPermissionButton.addEventListener("click", async () => {
           localPermissionButton.disabled = true;
-          localPermissionStatus.textContent = "Requesting permission…";
+          localPermissionStatus.textContent = "Enable local-file access on the extension page.";
           try {
-            const granted = await globalThis.CollabTeXAttachmentStore.ensureLocalFilePermission();
-            localPermissionStatus.textContent = granted
-              ? "Local-file access is granted."
-              : "Permission was not granted. In older Firefox versions, enable ‘Access your data for all websites’.";
-            localPermissionStatus.classList.toggle("ctca-local-permission-granted", granted);
+            await globalThis.CollabTeXAttachmentStore.openLocalFilePermissionSettings();
           } catch (error) {
             localPermissionStatus.textContent = error?.message || String(error);
           } finally {
             localPermissionButton.disabled = false;
           }
+        });
+        webPermissionLink?.addEventListener("click", (event) => {
+          event.preventDefault();
+          globalThis.CollabTeXAttachmentStore.openLocalFilePermissionSettings().catch(() => null);
         });
         refreshLocalPermissionStatus();
 
@@ -1472,10 +2625,93 @@
           selectedFiles.forEach((file, index) => {
             const label = document.createElement("label");
             label.className = "ctca-app-dialog-field";
-            label.innerHTML = `<span>Name for ${escapeHtml(file.name)}</span><input type="text" data-pdf-name-index="${index}" value="${escapeHtml(file.name.replace(/\.pdf$/i, ""))}">`;
+            label.innerHTML = `<span>Name for ${escapeHtml(file.name)}</span><input type="text" data-pdf-name-index="${index}" value="Manuscript">`;
             fileRows.appendChild(label);
           });
         };
+        const renderWebCandidates = () => {
+          webResults?.replaceChildren();
+          webCandidates.forEach((candidate, index) => {
+            const row = document.createElement("label");
+            row.className = "ctca-web-pdf-result";
+            row.title = candidate.url;
+            row.innerHTML = `
+              <input type="checkbox" data-web-pdf-index="${index}" ${index === 0 ? "checked" : ""}>
+              <span class="ctca-web-pdf-result-copy">
+                <strong>${escapeHtml(candidate.fileName || `PDF ${index + 1}`)}</strong>
+                <input type="text" data-web-pdf-name-index="${index}" value="${escapeHtml(candidate.name || `PDF ${index + 1}`)}" aria-label="Attachment name">
+              </span>`;
+            webResults.appendChild(row);
+          });
+        };
+        const scanWebPage = async (continueExistingTab = false) => {
+          webPanel.hidden = false;
+          webPanel.dataset.expanded = "true";
+          getWebButton.disabled = true;
+          continueWebButton.disabled = true;
+          continueWebButton.hidden = true;
+          webStatus.textContent = "Opening the webpage in the background and looking for PDFs…";
+          webStatus.classList.remove("ctca-web-pdf-status-error");
+          webStatus.classList.add("ctca-web-pdf-status-loading");
+          try {
+            const found = await globalThis.CollabTeXAttachmentStore.discoverWebPdfs(webScanUrl, {
+              tabId: continueExistingTab ? webResumeTabId : null,
+              preserveTab: continueExistingTab && webHumanCheckEncountered
+            });
+            if (Number.isInteger(found.tabId)) webOpenTabIds.add(found.tabId);
+            for (const candidate of found.candidates || []) {
+              if (Number.isInteger(candidate.tabId)) webOpenTabIds.add(candidate.tabId);
+            }
+            if (found.pageStillLoading && found.tabId) {
+              webScanUrl = found.finalUrl || webScanUrl;
+              webResumeTabId = found.tabId;
+              continueWebButton.dataset.resumeTabId = String(found.tabId);
+              webCandidates = [];
+              renderWebCandidates();
+              webStatus.textContent = "This page is still loading. Please go to the tab I just opened, complete any human test there might be and then come back to click Continue looking for PDFs.";
+              continueWebButton.hidden = false;
+              return;
+            }
+            if (found.humanCheckRequired && found.tabId) {
+              webScanUrl = found.finalUrl || webScanUrl;
+              webResumeTabId = found.tabId;
+              continueWebButton.dataset.resumeTabId = String(found.tabId);
+              webHumanCheckEncountered = true;
+              webCandidates = [];
+              renderWebCandidates();
+              webStatus.textContent = "This site requires a human check. Complete it in the journal tab. When that page changes URL, Smart Citations will switch back and continue looking for PDFs automatically. If it does not, return here and click Continue looking for PDFs.";
+              continueWebButton.hidden = false;
+              await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+              await globalThis.CollabTeXAttachmentStore.showWebHumanCheck(found.tabId, found.finalUrl || webScanUrl);
+              return;
+            }
+            webResumeTabId = null;
+            delete continueWebButton.dataset.resumeTabId;
+            if (found.permissionRequired && found.finalUrl) {
+              webScanUrl = found.finalUrl;
+              webCandidates = [];
+              renderWebCandidates();
+              webStatus.textContent = "The webpage forwarded to another site. Click Get from web again to grant access there and continue.";
+              return;
+            }
+            webCandidates = (found.candidates || []).slice(0, 4);
+            renderWebCandidates();
+            webStatus.textContent = webCandidates.length
+              ? `${webCandidates.length} PDF${webCandidates.length === 1 ? "" : "s"} found. Select the files to attach.`
+              : "No PDF files were found on this webpage.";
+          } catch (error) {
+            webCandidates = [];
+            renderWebCandidates();
+            webStatus.textContent = error.message || String(error);
+            webStatus.classList.add("ctca-web-pdf-status-error");
+          } finally {
+            getWebButton.disabled = false;
+            continueWebButton.disabled = false;
+            webStatus.classList.remove("ctca-web-pdf-status-loading");
+          }
+        };
+        getWebButton?.addEventListener("click", () => scanWebPage(false));
+        continueWebButton?.addEventListener("click", () => scanWebPage(true));
         const renderLocalPaths = () => {
           const oldInputs = [...localNameRows.querySelectorAll('[data-local-name-index]')];
           oldInputs.forEach((input, index) => { localNames[index] = input.value; });
@@ -1499,9 +2735,12 @@
             button.setAttribute('aria-pressed', selected ? 'true' : 'false');
           });
           const local = selectedProvider === "local";
-          browseRow.hidden = local;
-          fileRows.hidden = local;
-          localPanel.hidden = !local;
+          const selectedLocalFiles = local && selectedFiles.length > 0;
+          browseRow.hidden = local && !selectedLocalFiles;
+          fileRows.hidden = local && !selectedLocalFiles;
+          localPanel.hidden = !local || selectedLocalFiles;
+          if (getWebButton) getWebButton.hidden = local;
+          if (webPanel) webPanel.hidden = local || webPanel.dataset.expanded !== "true";
           if (resetFiles) {
             selectedFiles = [];
             fileInput.value = "";
@@ -1509,14 +2748,18 @@
           }
           if (local) window.setTimeout(() => localPathInput.focus(), 0);
         };
-        providerButtons.forEach((button) => button.addEventListener('click', () => updateProvider(button.dataset.provider)));
+        providerButtons.forEach((button) => button.addEventListener('click', () => updateProvider(button.dataset.provider, false)));
         wrapper.querySelector('.ctca-pdf-browse').addEventListener('click', () => fileInput.click());
         fileInput.addEventListener('change', () => {
           selectedFiles = [...fileInput.files];
           renderSelectedFiles();
         });
         localPathInput.addEventListener('input', renderLocalPaths);
+        renderSelectedFiles();
         updateProvider(selectedProvider, false);
+        if (options.getFromWeb && getWebButton) {
+          window.setTimeout(() => getWebButton.click(), 0);
+        }
       },
       buttons: [
         { label: "Cancel", value: null },
@@ -1524,40 +2767,94 @@
           provider: selectedProvider,
           files: selectedFiles,
           paths: String(localPathInput?.value || "").split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
-          names: selectedProvider === "local"
+          webFiles: selectedProvider === "local" ? [] : webCandidates.flatMap((candidate, index) => {
+            const checkbox = webResultRows?.querySelector(`[data-web-pdf-index="${index}"]`);
+            if (!checkbox?.checked) return [];
+            const name = webResultRows?.querySelector(`[data-web-pdf-name-index="${index}"]`)?.value.trim();
+            return [{ ...candidate, name: name || candidate.name || candidate.fileName.replace(/\.pdf$/i, "") }];
+          }),
+          names: selectedProvider === "local" && !selectedFiles.length
             ? [...localNameRows.querySelectorAll('[data-local-name-index]')].map((input) => input.value.trim())
             : [...fileRows.querySelectorAll('[data-pdf-name-index]')].map((input) => input.value.trim())
         }) }
       ],
       closeValue: null
     });
-    if (!result) return;
-    setBusy(true, "Attaching…");
+    if (!result) {
+      await Promise.allSettled(
+        [...webOpenTabIds].map((tabId) => globalThis.CollabTeXAttachmentStore.closeWebTab(tabId))
+      );
+      return [];
+    }
+    pdfAttachmentLoadingKeys.add(entry.key);
+    syncPdfAttachmentLoadingIndicators();
+    const attachedItems = [];
     try {
       if (result.provider === "local") {
-        if (!result.paths.length) throw new Error("Enter at least one complete local PDF path.");
-        let permitted = true;
-        try { permitted = await globalThis.CollabTeXAttachmentStore.ensureLocalFilePermission(); } catch (_error) { permitted = false; }
-        for (let index = 0; index < result.paths.length; index += 1) {
-          await globalThis.CollabTeXAttachmentStore.addLocalLink(entry, result.paths[index], result.names[index]);
+        if (result.files.length) {
+          for (let index = 0; index < result.files.length; index += 1) {
+            const attachment = await globalThis.CollabTeXPdfImport.attach(
+              entry,
+              { file: result.files[index], handle: null },
+              "local",
+              result.names[index]
+            );
+            if (attachment) attachedItems.push(attachment);
+          }
+          setStatus("Local PDF link saved for this browser session.");
+        } else {
+          if (!result.paths.length) throw new Error("Enter at least one complete local PDF path.");
+          let permitted = true;
+          try { permitted = await globalThis.CollabTeXAttachmentStore.ensureLocalFilePermission(); } catch (_error) { permitted = false; }
+          for (let index = 0; index < result.paths.length; index += 1) {
+            const attachment = await globalThis.CollabTeXAttachmentStore.addLocalLink(entry, result.paths[index], result.names[index]);
+            if (attachment) attachedItems.push(attachment);
+          }
+          setStatus(permitted
+            ? "Local PDF link saved. The PDF remains at its current disk location."
+            : "Local PDF link saved. Enable local-file access for this extension before opening the PDF.");
         }
-        setStatus(permitted
-          ? "Local PDF link saved. The PDF remains at its current disk location."
-          : "Local PDF link saved. Enable local-file access for this extension before opening the PDF.");
       } else {
-        if (!result.files.length) throw new Error("Choose at least one PDF file.");
+        const files = result.files.map((file, index) => ({ file, name: result.names[index] }));
+        const failures = [];
+        const webTabIds = new Set([
+          ...webOpenTabIds,
+          ...(result.webFiles || []).map((candidate) => candidate.tabId).filter(Number.isInteger)
+        ]);
+        try {
+          for (const candidate of result.webFiles || []) {
+            try {
+              files.push({
+                file: await globalThis.CollabTeXAttachmentStore.downloadWebPdf(
+                  candidate.url,
+                  candidate.sourceUrl,
+                  candidate.tabId
+                ),
+                name: candidate.name
+              });
+            } catch (error) {
+              failures.push(`${candidate.fileName || candidate.url}: ${error.message || String(error)}`);
+            }
+          }
+        } finally {
+          await Promise.allSettled(
+            [...webTabIds].map((tabId) => globalThis.CollabTeXAttachmentStore.closeWebTab(tabId))
+          );
+        }
+        if (!files.length) throw new Error(failures.join("; ") || "Choose or catch at least one PDF file.");
         if (result.provider === "nextcloud") {
           const cfg = await globalThis.CollabTeXAttachmentStore.getConfig();
           if (!cfg.nextcloud?.appPassword) throw new Error("Connect Nextcloud in PDF storage settings first.");
         }
-        const failures = [];
         let attached = 0;
-        for (let index = 0; index < result.files.length; index += 1) {
-          const file = result.files[index];
-          const name = result.names[index] || file.name.replace(/\.pdf$/i, "");
+        for (const item of files) {
+          const file = item.file;
+          const name = item.name || file.name.replace(/\.pdf$/i, "");
           try {
-            if (result.provider === "nextcloud") await globalThis.CollabTeXAttachmentStore.addNextcloud(entry, file, name);
-            else await globalThis.CollabTeXAttachmentStore.addBrowser(entry, file, name);
+            const attachment = result.provider === "nextcloud"
+              ? await globalThis.CollabTeXAttachmentStore.addNextcloud(entry, file, name)
+              : await globalThis.CollabTeXAttachmentStore.addBrowser(entry, file, name);
+            if (attachment) attachedItems.push(attachment);
             attached += 1;
           } catch (error) {
             failures.push(`${file.name}: ${error.message || String(error)}`);
@@ -1570,11 +2867,149 @@
           failures.length > 0);
       }
       await renderAttachmentList(entry);
+      if (options.openAfterAttach && attachedItems[0]) {
+        await openPdfTab(entry, attachedItems[0]);
+      }
     } catch (error) {
       setStatus(error.message || String(error), true);
     } finally {
-      setBusy(false);
+      await Promise.allSettled(
+        [...webOpenTabIds].map((tabId) => globalThis.CollabTeXAttachmentStore.closeWebTab(tabId))
+      );
+      pdfAttachmentLoadingKeys.delete(entry.key);
+      syncPdfAttachmentLoadingIndicators();
     }
+    return attachedItems;
+  }
+
+  async function showPdfImportReport(created, updated, skipped, failed, notes = []) {
+    const summary = `${created} new entr${created === 1 ? "y" : "ies"} created, ` +
+      `${updated} existing entr${updated === 1 ? "y" : "ies"} updated with a PDF, and ` +
+      `${skipped} PDF${skipped === 1 ? " was" : "s were"} skipped as ${skipped === 1 ? "a duplicate" : "duplicates"}.` +
+      (failed ? ` ${failed} PDF${failed === 1 ? " could" : "s could"} not be imported.` : "");
+    await showDialog({
+      title: "PDF import complete",
+      message: summary,
+      controls: notes.length ? (container) => {
+        const details = document.createElement("div");
+        details.className = "ctca-pdf-import-report";
+        details.textContent = notes.slice(0, 12).join("\n");
+        container.appendChild(details);
+      } : null,
+      buttons: [{ label: "Close", value: true, primary: true }],
+      closeValue: true
+    });
+    return summary;
+  }
+
+  async function addEntriesFromPdfs(initialFiles = []) {
+    if (busy) return;
+    const config = await globalThis.CollabTeXAttachmentStore.getConfig();
+    let picker = null;
+    const result = await showDialog({
+      title: "Add new entry from PDF",
+      message: "Choose where the imported PDFs should be kept. Smart Citations will read each PDF, find its DOI, and retrieve the bibliography details.",
+      controls: (container) => {
+        picker = globalThis.CollabTeXPdfImport.createSelectionControls(container, {
+          provider: config.provider || "browser",
+          files: initialFiles
+        });
+      },
+      buttons: [
+        { label: "Cancel", value: null },
+        { label: "Add", primary: true, getValue: () => picker.value() }
+      ],
+      closeValue: null
+    });
+    if (!result) return;
+    if (!result.items.length) {
+      setStatus("Select at least one PDF file.", true);
+      return;
+    }
+    if (result.provider === "nextcloud" && !config.nextcloud?.appPassword) {
+      setStatus("Connect Nextcloud in PDF storage settings first.", true);
+      return;
+    }
+
+    let created = 0;
+    let updated = 0;
+    let skipped = 0;
+    let failed = 0;
+    const notes = [];
+    setBusy(true, "Importing PDFs…");
+    setProgress(0, result.items.length, `0/${result.items.length} PDFs processed`, true);
+    try {
+      for (let index = 0; index < result.items.length; index += 1) {
+        const item = result.items[index];
+        const file = item.file;
+        setProgress(index, result.items.length, `Reading ${file.name}…`, true);
+        try {
+          const doi = await globalThis.CollabTeXPdfImport.extractDoi(file);
+          if (!doi) {
+            failed += 1;
+            notes.push(`${file.name}: no DOI was found.`);
+            continue;
+          }
+          const existing = entries.find((entry) => normalizeDoi(entry.fields?.doi || "") === doi);
+          if (existing) {
+            const attachments = await globalThis.CollabTeXAttachmentStore.list(existing);
+            if (attachments.length) {
+              skipped += 1;
+              notes.push(`${file.name}: skipped because ${existing.key} already has a PDF.`);
+              continue;
+            }
+            await globalThis.CollabTeXPdfImport.attach(existing, item, result.provider);
+            updated += 1;
+            selectedKey = existing.key;
+            selectedKeys = new Set([existing.key]);
+            continue;
+          }
+
+          const metadata = await fetchDoiMetadata(doi);
+          const entry = {
+            key: "",
+            type: metadata.entryType || "misc",
+            fields: {},
+            aliases: [],
+            tags: [],
+            updatedAt: "",
+            addedOn: new Date().toISOString(),
+            starred: false,
+            doiSyncedAt: ""
+          };
+          mergeMetadata(entry, { ...metadata, doi: metadata.doi || doi });
+          entry.key = uniqueKey(generatedKey(entry.fields));
+          entries.push(entry);
+          try {
+            await globalThis.CollabTeXPdfImport.attach(entry, item, result.provider);
+          } catch (error) {
+            entries.splice(entries.indexOf(entry), 1);
+            throw error;
+          }
+          if (selectedCategoryId !== "all" && selectedCategoryId !== "starred" && selectedCategoryId !== "uncategorized") {
+            setEntryCategoryIds(entry.key, [selectedCategoryId]);
+          }
+          selectedKey = entry.key;
+          selectedKeys = new Set([entry.key]);
+          created += 1;
+        } catch (error) {
+          failed += 1;
+          notes.push(`${file.name}: ${error?.message || String(error)}`);
+        } finally {
+          setProgress(index + 1, result.items.length, `${index + 1}/${result.items.length} PDFs processed`, true);
+        }
+      }
+      if (created) {
+        markDirty("Saving imported PDF entries…");
+        await saveDatabase("Imported entries from PDF.");
+      }
+      renderAll();
+    } finally {
+      setBusy(false);
+      setProgress(0, 1, "", false);
+    }
+    const summary = await showPdfImportReport(created, updated, skipped, failed, notes);
+    setStatus(summary, failed > 0 && created + updated === 0);
   }
 
   function renderWorkspaceTabs() {
@@ -1587,7 +3022,9 @@
     for (const [tabId, data] of openPdfTabs) {
       const button = document.createElement("button");
       button.type = "button"; button.className = "ctca-manager-tab"; button.dataset.tabId = tabId; button.setAttribute("role", "tab");
-      button.innerHTML = `<span>${escapeHtml(data.attachment.name)}</span><span class="ctca-manager-tab-close" title="Close PDF tab" aria-label="Close PDF tab">×</span>`;
+      const label = pdfWorkspaceTabLabel(data);
+      button.title = label;
+      button.innerHTML = `<span>${escapeHtml(label)}</span><span class="ctca-manager-tab-close" title="Close PDF tab" aria-label="Close PDF tab">×</span>`;
       tabs.insertBefore(button, spacer);
     }
     tabs.querySelectorAll(".ctca-manager-tab").forEach((tab) => {
@@ -1596,12 +3033,26 @@
     });
   }
 
+  function pdfWorkspaceTabLabel(data) {
+    const citationKey = String(data?.entryKey || "").trim() || "PDF";
+    if (!(Number(data?.attachmentCount) > 1)) return citationKey;
+    const pdfName = String(
+      data?.attachment?.name
+      || data?.attachment?.fileName?.replace(/\.pdf$/i, "")
+      || ""
+    ).trim();
+    return pdfName ? `${citationKey} — ${pdfName}` : citationKey;
+  }
+
   async function openPdfTab(entry, attachment) {
     const tabId = `pdf:${attachment.id}`;
     const previous = openPdfTabs.get(tabId);
+    const attachments = await globalThis.CollabTeXAttachmentStore.list(entry);
+    const currentAttachment = attachments.find((item) => item.id === attachment.id) || attachment;
     openPdfTabs.set(tabId, {
       entryKey: entry.key,
-      attachment,
+      attachment: currentAttachment,
+      attachmentCount: attachments.length,
       notesCollapsed: previous?.notesCollapsed || false,
       detailsCollapsed: previous?.detailsCollapsed || false
     });
@@ -1611,18 +3062,31 @@
   }
 
   async function activateWorkspaceTab(tabId) {
+    const previousPdf = openPdfTabs.get(activeWorkspaceTab);
     if (activeWorkspaceTab !== "bibliography" && activeWorkspaceTab !== tabId) {
       await requestPdfFrameSave(activeWorkspaceTab);
       window.clearTimeout(pdfNoteSaveTimer);
       await savePdfNotes().catch(() => {});
+      if (root.classList.contains("ctca-pdf-maximized")) setPdfMaximized(false);
     }
     activeWorkspaceTab = tabId;
     renderWorkspaceTabs();
     const bibliography = $(".ctca-manager-bibliography-view", root);
     const pdfView = $(".ctca-manager-pdf-view", root);
+    root.classList.toggle("ctca-manager-pdf-active", tabId !== "bibliography");
     bibliography.hidden = tabId !== "bibliography";
     pdfView.hidden = tabId === "bibliography";
-    if (tabId === "bibliography") { setPdfMaximized(false); return; }
+    if (tabId === "bibliography") {
+      if (previousPdf?.entryKey && entryByKey(previousPdf.entryKey)) {
+        selectedKey = previousPdf.entryKey;
+        selectedKeys = new Set([previousPdf.entryKey]);
+        selectionAnchorKey = previousPdf.entryKey;
+      }
+      setPdfMaximized(false);
+      renderList();
+      renderDetails();
+      return;
+    }
     const data = openPdfTabs.get(tabId);
     if (!data) return activateWorkspaceTab("bibliography");
     const entry = entryByKey(data.entryKey);
@@ -1631,11 +3095,18 @@
   }
 
   async function closePdfTab(tabId) {
+    const closingPdf = openPdfTabs.get(tabId);
     if (activeWorkspaceTab === tabId) {
       await requestPdfFrameSave(tabId);
       window.clearTimeout(pdfNoteSaveTimer);
       await savePdfNotes().catch(() => {});
+      if (root.classList.contains("ctca-pdf-maximized")) setPdfMaximized(false);
       activeWorkspaceTab = "bibliography";
+      if (closingPdf?.entryKey && entryByKey(closingPdf.entryKey)) {
+        selectedKey = closingPdf.entryKey;
+        selectedKeys = new Set([closingPdf.entryKey]);
+        selectionAnchorKey = closingPdf.entryKey;
+      }
     }
     openPdfTabs.delete(tabId);
     renderWorkspaceTabs();
@@ -1709,7 +3180,6 @@
       const updated = await globalThis.CollabTeXAttachmentStore.replaceFile(data.attachment.id, file);
       data.attachment = updated;
       data.pdfDirty = false;
-      $(".ctca-pdf-provider", root).textContent = attachmentProviderLabel(updated);
       const entry = entryByKey(data.entryKey);
       if (entry) await renderAttachmentList(entry);
       const convertedLocal = originalProvider === "local" && updated.provider === "browser";
@@ -1742,8 +3212,6 @@
 
   async function loadPdfView(attachment, entry) {
     if (currentPdfObjectUrl) { URL.revokeObjectURL(currentPdfObjectUrl); currentPdfObjectUrl = ""; }
-    $(".ctca-pdf-tab-title", root).textContent = attachment.name;
-    $(".ctca-pdf-provider", root).textContent = attachmentProviderLabel(attachment);
     $(".ctca-pdf-note", root).value = attachment.notes || "";
     const tabState = openPdfTabs.get(activeWorkspaceTab) || {};
     tabState.viewerReady = false;
@@ -1765,6 +3233,19 @@
 
   async function activePdfAttachment() {
     return openPdfTabs.get(activeWorkspaceTab)?.attachment || null;
+  }
+
+  async function downloadActivePdf() {
+    const attachment = await activePdfAttachment();
+    if (!attachment) return;
+    const blob = await globalThis.CollabTeXAttachmentStore.getBlob(attachment);
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = attachment.fileName || `${attachment.name}.pdf`;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   async function savePdfNotes() {
@@ -1828,8 +3309,146 @@
     }
     entry.updatedAt = new Date().toISOString();
     markDirty();
+    if (field === "author") renderCategories();
     scheduleListRender();
     if (event.type === "change") flushAutoSave().catch(() => {});
+  }
+
+  function startInlineEdit(display) {
+    const field = display?.dataset.managerInlineField;
+    const entry = entryByKey(selectedKey);
+    if (!field || !entry || busy || display.classList.contains("ctca-manager-inline-editing")) return false;
+
+    const originalValue = String(entry.fields?.[field] || "");
+    const textarea = document.createElement("textarea");
+    textarea.className = "ctca-manager-inline-editor";
+    textarea.value = originalValue;
+    textarea.rows = field === "author" ? 5 : 2;
+    textarea.setAttribute("aria-label", field === "author" ? "Edit authors" : "Edit title");
+    display.classList.add("ctca-manager-inline-editing");
+    display.replaceChildren(textarea);
+
+    const authorIndex = field === "author"
+      ? globalThis.CollabTeXBibTeX.createAuthorIndex(entries.flatMap((item) => [
+          item?.fields?.author || "",
+          item?.fields?.editor || ""
+        ]))
+      : [];
+    const completionElement = field === "author" ? document.createElement("div") : null;
+    let authorCompletions = [];
+    if (completionElement) {
+      completionElement.className = "ctca-author-completion";
+      completionElement.hidden = true;
+      completionElement.setAttribute("role", "listbox");
+      display.appendChild(completionElement);
+    }
+
+    const updateAuthorCompletion = () => {
+      if (!completionElement) return;
+      authorCompletions = textarea.selectionStart === textarea.selectionEnd
+        ? globalThis.CollabTeXBibTeX.findAuthorCompletions(
+            authorIndex,
+            textarea.value,
+            textarea.selectionStart,
+            8
+          )
+        : [];
+      completionElement.replaceChildren(...authorCompletions.map((completion, index) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "ctca-completion-option";
+        button.dataset.completionIndex = String(index);
+        button.setAttribute("role", "option");
+        const name = document.createElement("span");
+        name.className = "ctca-completion-option-name";
+        name.textContent = completion.label;
+        button.appendChild(name);
+        if (index === 0) {
+          const hint = document.createElement("span");
+          hint.className = "ctca-completion-option-hint";
+          hint.textContent = "\u2192";
+          hint.title = "Press Right Arrow to complete";
+          button.appendChild(hint);
+        }
+        return button;
+      }));
+      completionElement.hidden = authorCompletions.length === 0;
+      textarea.setAttribute("aria-expanded", String(authorCompletions.length > 0));
+    };
+
+    const acceptAuthorCompletion = (index = 0) => {
+      const authorCompletion = authorCompletions[index];
+      if (!authorCompletion) return false;
+      textarea.setRangeText(
+        authorCompletion.value,
+        authorCompletion.start,
+        authorCompletion.end,
+        "end"
+      );
+      updateAuthorCompletion();
+      return true;
+    };
+
+    let finished = false;
+    const finish = (applyChange) => {
+      if (finished) return;
+      finished = true;
+      if (applyChange && textarea.value !== originalValue) {
+        detailInputChanged({
+          target: { dataset: { managerField: field }, value: textarea.value },
+          type: "change"
+        });
+      }
+      renderDetails();
+    };
+
+    textarea.addEventListener("blur", () => finish(true), { once: true });
+    textarea.addEventListener("input", updateAuthorCompletion);
+    textarea.addEventListener("keyup", (event) => {
+      if (event.key !== "ArrowRight") updateAuthorCompletion();
+    });
+    textarea.addEventListener("keydown", (event) => {
+      if (event.key === "ArrowRight" && acceptAuthorCompletion()) {
+        event.preventDefault();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        finish(false);
+      } else if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        textarea.blur();
+      }
+    });
+    textarea.addEventListener("click", (event) => event.stopPropagation());
+    completionElement?.addEventListener("mousedown", (event) => {
+      const option = event.target.closest(".ctca-completion-option");
+      if (!option) return;
+      event.preventDefault();
+      acceptAuthorCompletion(Number(option.dataset.completionIndex) || 0);
+      textarea.focus();
+    });
+    completionElement?.addEventListener("click", (event) => event.stopPropagation());
+    requestAnimationFrame(() => {
+      textarea.focus();
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+      updateAuthorCompletion();
+    });
+    return true;
+  }
+
+  function detailClicked(event) {
+    const inlineDisplay = event.target.closest("[data-manager-inline-field]");
+    if (inlineDisplay && startInlineEdit(inlineDisplay)) {
+      event.preventDefault();
+      return;
+    }
+    detailActionClicked(event);
+  }
+
+  function inlineDisplayKeydown(event) {
+    if (!event.target.matches("[data-manager-inline-field]")) return;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    startInlineEdit(event.target);
   }
 
   async function detailActionClicked(event) {
@@ -1843,6 +3462,17 @@
     if (action === "open-paper") {
       const url = paperUrl(entry);
       if (url) window.open(url, "_blank", "noopener,noreferrer");
+      return;
+    }
+    if (action === "open-url") {
+      const value = button.closest(".ctca-manager-url-row")?.querySelector('[data-manager-field="url"]')?.value || entry.fields?.url || "";
+      try {
+        const url = new URL(String(value).trim());
+        if (!/^https?:$/.test(url.protocol)) throw new Error();
+        window.open(url.href, "_blank", "noopener,noreferrer");
+      } catch (_error) {
+        setStatus("Enter a valid HTTP or HTTPS URL first.", true);
+      }
       return;
     }
     if (action === "add-tag") {
@@ -1888,7 +3518,9 @@
     if (action === "remove-entry") {
       const confirmed = await showDialog({
         title: `Remove ${entry.key}?`,
-        message: "This entry will be removed from the global bibliography database.",
+        message: syncNextcloudBibliography
+          ? "This entry will be removed from the global bibliography database and from the synchronized Nextcloud bibliography."
+          : "This entry will be removed from the global bibliography database.",
         buttons: [
           { label: "Keep entry", value: false },
           { label: "Remove entry", value: true, danger: true }
@@ -1899,19 +3531,35 @@
       if (!confirmed) return;
       removeEntryKeys([entry.key]);
       await saveDatabase(`Removed ${entry.key}.`);
+      await propagateRemovedEntriesToNextcloud([entry]);
       renderAll();
       return;
     }
     if (action === "add-pdf") {
+      if (pdfAttachmentLoadingKeys.has(entry.key)) return;
       await openAddPdfDialog(entry);
       return;
     }
-    if (["open-pdf", "rename-pdf", "replace-pdf", "remove-pdf"].includes(action)) {
+    if (action === "get-pdf-from-web") {
+      if (pdfAttachmentLoadingKeys.has(entry.key)) return;
+      await openAddPdfDialog(entry, { getFromWeb: true });
+      return;
+    }
+    if (["open-pdf", "download-pdf", "rename-pdf", "replace-pdf", "remove-pdf"].includes(action)) {
       const attachments = await globalThis.CollabTeXAttachmentStore.list(entry);
       const attachment = attachments.find((item) => item.id === button.dataset.attachmentId);
       if (!attachment) return;
       if (action === "open-pdf") {
         await openPdfTab(entry, attachment);
+        return;
+      }
+      if (action === "download-pdf") {
+        try {
+          await downloadPdfAttachment(attachment);
+          setStatus(`Downloaded ${attachment.fileName || `${attachment.name}.pdf`}.`);
+        } catch (error) {
+          setStatus(error?.message || String(error), true);
+        }
         return;
       }
       if (action === "rename-pdf") {
@@ -1930,7 +3578,6 @@
           const updated = await globalThis.CollabTeXAttachmentStore.update(attachment.id, { name });
           for (const data of openPdfTabs.values()) if (data.attachment.id === updated.id) data.attachment = updated;
           renderWorkspaceTabs();
-          if (activeWorkspaceTab === `pdf:${updated.id}`) $(".ctca-pdf-tab-title", root).textContent = updated.name;
           await renderAttachmentList(entry);
         }
         return;
@@ -1975,6 +3622,13 @@
       .replace(/[),.;]+$/, "");
   }
 
+  function wasUpdatedFromDoi(entry) {
+    return Boolean(
+      entry?.doiSyncedAt ||
+      stripBibValue(entry?.fields?.ctca_doi_synced || "")
+    );
+  }
+
   async function fetchDoiMetadata(doi, requestId = "") {
     const response = await extensionApi.runtime.sendMessage({ type: "ctca-fetch-doi-metadata", doi, requestId });
     if (!response?.ok) throw new Error(response?.error || "DOI lookup failed.");
@@ -1994,6 +3648,7 @@
       journal: metadata.journal,
       year: metadata.year,
       volume: metadata.volume,
+      number: metadata.number,
       pages: metadata.pages,
       publisher: metadata.publisher,
       url: metadata.url,
@@ -2008,26 +3663,77 @@
     entry.updatedAt = entry.doiSyncedAt;
   }
 
-  async function updateEntriesFromDoi(targets) {
-    const doiTargets = targets.filter((entry) => normalizeDoi(entry.fields?.doi));
-    if (!doiTargets.length) {
+  async function showBatchDoiConfirmation(total, previouslySynchronized) {
+    let includePreviouslySynchronized = false;
+    return showDialog({
+      title: "Update entries from DOI",
+      message:
+        `${total} entr${total === 1 ? "y contains" : "ies contain"} a DOI. ` +
+        `${previouslySynchronized ? `${previouslySynchronized} ${previouslySynchronized === 1 ? "was" : "were"} updated from DOI before. ` : ""}` +
+        "Existing fields not supplied by the DOI service are preserved.",
+      controls: (container) => {
+        const label = document.createElement("label");
+        label.className = "ctca-app-dialog-check";
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = false;
+        checkbox.addEventListener("change", () => {
+          includePreviouslySynchronized = checkbox.checked;
+        });
+        label.append(checkbox, document.createTextNode("Also update entries that were updated from DOI before"));
+        container.appendChild(label);
+      },
+      buttons: [
+        { label: "Cancel", value: null },
+        {
+          label: "Start DOI update",
+          primary: true,
+          getValue: () => ({ includePreviouslySynchronized })
+        }
+      ],
+      closeValue: null
+    });
+  }
+
+  async function updateEntriesFromDoi(targets, { showBatchConfirmation = false } = {}) {
+    if (nextcloudSyncInProgress) {
+      setStatus("Wait for the current Nextcloud synchronization to finish before updating DOI metadata.", true);
+      return;
+    }
+    const allDoiTargets = targets.filter((entry) => normalizeDoi(entry.fields?.doi));
+    if (!allDoiTargets.length) {
       setStatus("None of the selected entries contains a DOI.", true);
       return;
     }
-    const confirmed = await showDialog({
-      title: doiTargets.length === 1 ? "Update entry from DOI" : "Update entries from DOI",
-      message: `${doiTargets.length} entr${doiTargets.length === 1 ? "y" : "ies"} will be updated. Existing fields not supplied by the DOI service are preserved.`,
-      buttons: [
-        { label: "Cancel", value: false },
-        { label: "Start DOI update", value: true, primary: true }
-      ],
-      closeValue: false
-    });
-    if (!confirmed) return;
+    const previouslySynchronized = allDoiTargets.filter(wasUpdatedFromDoi);
+    let doiTargets = allDoiTargets;
+    let skippedSynchronized = 0;
+    if (showBatchConfirmation) {
+      const decision = await showBatchDoiConfirmation(allDoiTargets.length, previouslySynchronized.length);
+      if (!decision) return;
+      doiTargets = decision.includePreviouslySynchronized
+        ? allDoiTargets
+        : allDoiTargets.filter((entry) => !wasUpdatedFromDoi(entry));
+      skippedSynchronized = allDoiTargets.length - doiTargets.length;
+      if (!doiTargets.length) {
+        setStatus(`All ${allDoiTargets.length} DOI entries were updated from DOI before; no update was started.`);
+        return;
+      }
+    }
 
     bulkAbortRequested = false;
     let updated = 0;
     let failed = 0;
+    const dirtyBeforeBatch = dirty;
+    const revisionBeforeBatch = changeRevision;
+    // Reserve one tracked revision before the first asynchronous lookup. This
+    // keeps storage change listeners from reloading `entries` halfway through a
+    // long "update all" run and leaving doiTargets pointing at detached objects.
+    window.clearTimeout(autoSaveTimer);
+    autoSaveTimer = null;
+    dirty = true;
+    changeRevision += 1;
+    updateCount();
     setBusy(true, "Updating DOI…");
     setProgress(0, doiTargets.length, `0/${doiTargets.length} processed`, true);
     $(".ctca-manager-abort-doi", root).disabled = false;
@@ -2054,13 +3760,33 @@
         setProgress(index + 1, doiTargets.length, `${index + 1}/${doiTargets.length} processed · ${updated} updated · ${failed} failed`, true);
         if (index + 1 < doiTargets.length && !bulkAbortRequested) await new Promise((resolve) => setTimeout(resolve, 120));
       }
-      if (updated) await saveDatabase(`DOI update completed: ${updated} updated${failed ? `, ${failed} failed` : ""}.`);
-      else setStatus(`DOI update completed: 0 updated${failed ? `, ${failed} failed` : ""}.`, failed > 0);
+      if (updated) {
+        await saveDatabase(
+          `DOI update completed: ${updated} updated${failed ? `, ${failed} failed` : ""}` +
+          `${skippedSynchronized ? `, ${skippedSynchronized} previously updated skipped` : ""}.`
+        );
+      } else {
+        changeRevision = revisionBeforeBatch;
+        dirty = dirtyBeforeBatch || savedRevision < changeRevision;
+        updateCount();
+        if (dirty) scheduleAutoSave();
+        setStatus(
+          `DOI update completed: 0 updated${failed ? `, ${failed} failed` : ""}` +
+          `${skippedSynchronized ? `, ${skippedSynchronized} previously updated skipped` : ""}.`,
+          failed > 0
+        );
+      }
       renderAll();
+    } catch (error) {
+      setStatus(
+        `DOI metadata was updated in memory but could not be saved yet: ${error?.message || String(error)}`,
+        true
+      );
     } finally {
       activeDoiRequestId = "";
       bulkAbortRequested = false;
       setBusy(false);
+      if (dirty && autoSaveTimer === null) scheduleAutoSave();
       window.setTimeout(() => setProgress(0, 1, "", false), 1600);
     }
   }
@@ -2089,9 +3815,12 @@
   async function removeSelected() {
     if (selectedKeys.size < 2) return;
     const count = selectedKeys.size;
+    const removedEntries = entries.filter((entry) => selectedKeys.has(entry.key));
     const confirmed = await showDialog({
       title: `Remove ${count} selected entries?`,
-      message: "The selected entries will be removed from the global bibliography database.",
+      message: syncNextcloudBibliography
+        ? "The selected entries will be removed from the global bibliography database and from the synchronized Nextcloud bibliography."
+        : "The selected entries will be removed from the global bibliography database.",
       buttons: [
         { label: "Keep entries", value: false },
         { label: `Remove ${count} entries`, value: true, danger: true }
@@ -2102,6 +3831,7 @@
     if (!confirmed) return;
     removeEntryKeys([...selectedKeys]);
     await saveDatabase(`Removed ${count} entries.`);
+    await propagateRemovedEntriesToNextcloud(removedEntries);
     renderAll();
   }
 
@@ -2180,7 +3910,7 @@
     renderAll();
   }
 
-  function showDialog({ title, message = "", controls = null, buttons = [{ label: "Close", value: null }], closeValue = null, danger = false }) {
+  function showDialog({ title, message = "", controls = null, buttons = [{ label: "Close", value: null }], closeValue = null, danger = false, dialogClass = "" }) {
     return new Promise((resolve) => {
       const titleElement = $("#ctca-app-dialog-title", appDialog);
       const messageElement = $(".ctca-app-dialog-message", appDialog);
@@ -2196,6 +3926,7 @@
         settled = true;
         appDialog.classList.remove("ctca-app-dialog-visible");
         appDialog.setAttribute("aria-hidden", "true");
+        if (dialogClass) card.classList.remove(dialogClass);
         document.removeEventListener("keydown", onKeyDown, true);
         resolve(value);
       };
@@ -2238,6 +3969,7 @@
         actionsElement.appendChild(button);
       }
       card.classList.toggle("ctca-app-dialog-danger-card", Boolean(danger));
+      if (dialogClass) card.classList.add(dialogClass);
       closeButton.onclick = () => finish(closeValue);
       backdrop.onclick = () => finish(closeValue);
       document.addEventListener("keydown", onKeyDown, true);
@@ -2257,17 +3989,17 @@
     form.className = "ctca-global-dialog-form";
     form.innerHTML = `
       <label class="ctca-app-dialog-field ctca-app-dialog-field-wide ctca-global-dialog-doi"><span>DOI</span><span class="ctca-add-entry-doi-row"><input data-add-field="doi" placeholder="10.xxxx/…"><button type="button" class="ctca-add-entry-fetch-doi">🌐 Pull metadata</button></span></label>
-      <label class="ctca-app-dialog-field"><span>Entry type</span><select data-add-property="type">${ENTRY_TYPES.map((type) => `<option value="${type}" ${type === "article" ? "selected" : ""}>${type}</option>`).join("")}</select></label>
-      <label class="ctca-app-dialog-field"><span>Citation key</span><input data-add-property="key" placeholder="Generated if empty"></label>
-      <label class="ctca-app-dialog-field ctca-app-dialog-field-wide"><span>Title</span><textarea rows="2" data-add-field="title"></textarea></label>
-      <label class="ctca-app-dialog-field ctca-app-dialog-field-wide"><span>Authors</span><textarea rows="3" data-add-field="author" placeholder="Family, Given and Family, Given"></textarea></label>
-      <label class="ctca-app-dialog-field ctca-app-dialog-field-wide"><span>Journal / book title</span><input data-add-field="journal"></label>
-      <label class="ctca-app-dialog-field"><span>Year</span><input data-add-field="year"></label>
-      <label class="ctca-app-dialog-field"><span>Volume</span><input data-add-field="volume"></label>
-      <label class="ctca-app-dialog-field"><span>Pages / article number</span><input data-add-field="pages"></label>
-      <label class="ctca-app-dialog-field ctca-app-dialog-field-wide"><span>URL</span><input data-add-field="url"></label>
-      <label class="ctca-app-dialog-field ctca-app-dialog-field-wide"><span>Abstract</span><textarea rows="5" data-add-field="abstract"></textarea></label>
-      <label class="ctca-app-dialog-field ctca-app-dialog-field-wide"><span>Keywords</span><textarea rows="2" data-add-field="keywords"></textarea></label>
+      <label class="ctca-app-dialog-field ctca-add-entry-third"><span>Entry type</span><select data-add-property="type">${ENTRY_TYPES.map((type) => `<option value="${type}" ${type === "article" ? "selected" : ""}>${type}</option>`).join("")}</select></label>
+      <label class="ctca-app-dialog-field ctca-add-entry-two-thirds"><span>Citation key</span><input data-add-property="key" placeholder="Generated if empty"></label>
+      <label class="ctca-app-dialog-field ctca-add-entry-half"><span>Title</span><textarea rows="2" data-add-field="title"></textarea></label>
+      <label class="ctca-app-dialog-field ctca-add-entry-half"><span>Authors</span><textarea rows="3" data-add-field="author" placeholder="Family, Given and Family, Given"></textarea></label>
+      <label class="ctca-app-dialog-field ctca-add-entry-half"><span>Journal / book title</span><input data-add-field="journal"></label>
+      <label class="ctca-app-dialog-field ctca-add-entry-half"><span>URL</span><input data-add-field="url"></label>
+      <label class="ctca-app-dialog-field ctca-add-entry-third"><span>Year</span><input data-add-field="year"></label>
+      <label class="ctca-app-dialog-field ctca-add-entry-third"><span>Volume</span><input data-add-field="volume"></label>
+      <label class="ctca-app-dialog-field ctca-add-entry-third"><span>Pages / article number</span><input data-add-field="pages"></label>
+      <label class="ctca-app-dialog-field ctca-add-entry-half"><span>Abstract</span><textarea rows="5" data-add-field="abstract"></textarea></label>
+      <label class="ctca-app-dialog-field ctca-add-entry-half"><span>Keywords</span><textarea rows="2" data-add-field="keywords"></textarea></label>
       <label class="ctca-app-dialog-field ctca-app-dialog-field-wide"><span>Tags</span><input data-add-tags list="ctca-global-add-tag-list" placeholder="Comma-separated tags"><datalist id="ctca-global-add-tag-list">${allKnownTags().map((tag) => `<option value="${escapeHtml(tag)}"></option>`).join("")}</datalist></label>
       <section class="ctca-global-dialog-extra"><h3>Additional BibTeX fields</h3><div class="ctca-global-dialog-extra-list"></div><div class="ctca-manager-add-field-row"><select class="ctca-global-add-field-select">${AVAILABLE_FIELDS.map((field) => `<option value="${field}">${field}</option>`).join("")}</select><button type="button" class="ctca-global-add-field">+ Add field</button></div></section>
     `;
@@ -2339,6 +4071,7 @@
     const result = await showDialog({
       title: "Add bibliography entry",
       message: "DOI metadata can fill the form before saving.",
+      dialogClass: "ctca-add-entry-dialog-card",
       controls: (container) => {
         form = addEntryForm();
         container.appendChild(form);
@@ -2373,16 +4106,592 @@
       aliases: [],
       tags: result.tags || [],
       updatedAt: new Date().toISOString(),
+      addedOn: new Date().toISOString(),
+      starred: false,
       doiSyncedAt: result.fields.doi ? new Date().toISOString() : ""
     };
     entries.push(entry);
-    if (selectedCategoryId !== "all" && selectedCategoryId !== "uncategorized") {
+    if (selectedCategoryId !== "all" && selectedCategoryId !== "starred" && selectedCategoryId !== "uncategorized") {
       setEntryCategoryIds(key, [selectedCategoryId]);
     }
     selectedKey = key;
     selectedKeys = new Set([key]);
     await saveDatabase(`Added ${key}.`);
     renderAll();
+  }
+
+  function orcidMetadataText(value) {
+    return String(value || "").trim();
+  }
+
+  function orcidMetadataAuthors(metadata) {
+    return (metadata?.authors || []).map((author) =>
+      orcidMetadataText(author?.name || [author?.given, author?.family].filter(Boolean).join(" "))
+    ).filter(Boolean);
+  }
+
+  function hasOrcidDoiMetadata(metadata) {
+    return Boolean(metadata && typeof metadata === "object" && orcidMetadataText(metadata.doi));
+  }
+
+  async function offerOrcidWorks(result = null, { force = false, announceEmpty = false } = {}) {
+    let items = [];
+    let chooser = null;
+    let dialogPromise = null;
+    let dialogClosed = false;
+    let dialogMessage = null;
+    let dialogControls = null;
+    let closeButton = null;
+    let addButton = null;
+    let loadingProgress = null;
+    const progressRequestId = !result && force
+      ? `orcid-doi-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      : "";
+    const onDiscoveryProgress = (message) => {
+      if (message?.type !== "ctca-orcid-discover-progress"
+        || message.progressRequestId !== progressRequestId) return;
+      const completed = Math.max(0, Number(message.completed) || 0);
+      const total = Math.max(0, Number(message.total) || 0);
+      if (loadingProgress && total) {
+        loadingProgress.hidden = false;
+        loadingProgress.max = total;
+        loadingProgress.value = Math.min(completed, total);
+      }
+    };
+
+    const openOrcidDialog = (loading = false) => {
+      dialogPromise = showDialog({
+        title: "Import new co-authored manuscripts from ORCID",
+        message: loading
+          ? "Checking ORCID for new manuscripts and retrieving publication details by DOI…"
+          : "",
+        dialogClass: "ctca-orcid-works-dialog-card",
+        controls: loading
+          ? (container) => {
+              const loadingState = document.createElement("div");
+              loadingState.className = "ctca-orcid-work-loading";
+              loadingState.setAttribute("role", "status");
+              loadingState.setAttribute("aria-live", "polite");
+              loadingState.innerHTML = `
+                <span class="ctca-orcid-work-loading-main">
+                  <span class="ctca-orcid-work-loading-spinner" aria-hidden="true"></span>
+                  <span>Checking ORCID…</span>
+                </span>
+                <progress class="ctca-orcid-work-loading-progress" max="1" value="0" aria-label="DOI lookup progress" hidden></progress>
+              `;
+              loadingProgress = loadingState.querySelector(".ctca-orcid-work-loading-progress");
+              container.appendChild(loadingState);
+            }
+          : null,
+        buttons: [
+          { label: loading ? "Close" : "Not now", value: [] },
+          {
+            label: "Add selected",
+            primary: true,
+            getValue: () => chooser
+              ? [...chooser.querySelectorAll("[data-orcid-work]:checked")]
+                .map((input) => Number(input.dataset.orcidWork))
+                .filter((index) => Number.isInteger(index) && items[index])
+              : []
+          }
+        ],
+        closeValue: []
+      });
+      dialogPromise.then(() => { dialogClosed = true; });
+      dialogMessage = $(".ctca-app-dialog-message p", appDialog);
+      dialogControls = $(".ctca-app-dialog-controls", appDialog);
+      const actions = $(".ctca-app-dialog-actions", appDialog);
+      closeButton = actions.querySelector("button:not(.ctca-app-dialog-primary)");
+      addButton = actions.querySelector(".ctca-app-dialog-primary");
+      addButton.disabled = loading;
+    };
+
+    const showDialogResult = (message, { empty = false } = {}) => {
+      if (!dialogPromise || dialogClosed) return;
+      dialogMessage.textContent = message;
+      if (empty) {
+        dialogControls.replaceChildren();
+        dialogControls.hidden = true;
+        addButton.hidden = true;
+        closeButton.textContent = "Close";
+      }
+    };
+
+    if (announceEmpty) openOrcidDialog(true);
+
+    let discovery = result;
+    try {
+      if (!discovery) {
+        if (progressRequestId) extensionApi.runtime.onMessage.addListener(onDiscoveryProgress);
+        let response;
+        try {
+          response = await extensionApi.runtime.sendMessage({
+            type: "ctca-orcid-discover",
+            force,
+            progressRequestId,
+            existingDois: entries.map((entry) => entry?.fields?.doi || "").filter(Boolean)
+          });
+        } finally {
+          if (progressRequestId) extensionApi.runtime.onMessage.removeListener(onDiscoveryProgress);
+        }
+        if (!response?.ok) throw new Error(response?.error || "The ORCID manuscript check failed.");
+        discovery = response;
+      }
+      if (dialogClosed) return;
+      if (discovery.skipped) {
+        const message = !discovery.authenticated
+          ? (discovery.linked
+              ? "Reconnect your ORCID account in Smart Citations options before checking for manuscripts."
+              : "Link an ORCID account in Smart Citations options before checking for manuscripts.")
+          : "ORCID was already checked within the last 24 hours.";
+        if (announceEmpty) showDialogResult(message, { empty: true });
+        setStatus(message, !discovery.linked);
+        if (dialogPromise) await dialogPromise;
+        return;
+      }
+      if (!force && discovery.newItemCount === 0) {
+        return;
+      }
+
+      items = Array.isArray(discovery.items)
+        ? discovery.items.filter((item) => hasOrcidDoiMetadata(item?.metadata))
+        : [];
+      const rejectedCount = Number(discovery.failedLookupCount) || 0;
+      if (!items.length) {
+        const message = "No new manuscript entries were found on ORCID.";
+        if (announceEmpty) {
+          showDialogResult(
+            rejectedCount
+              ? `${message} ${rejectedCount} ORCID work${rejectedCount === 1 ? " was" : "s were"} ignored because DOI lookup failed.`
+              : message,
+            { empty: true }
+          );
+        }
+        if (announceEmpty) setStatus(message);
+        if (dialogPromise) await dialogPromise;
+        return;
+      }
+
+      if (!dialogPromise) openOrcidDialog(false);
+      if (dialogClosed) return;
+      dialogMessage.textContent =
+        `${items.length} ORCID manuscript entr${items.length === 1 ? "y has" : "ies have"} DOI details. ` +
+        `Select the ${items.length === 1 ? "entry" : "entries"} to add.` +
+        (rejectedCount
+          ? ` ${rejectedCount} ORCID work${rejectedCount === 1 ? " was" : "s were"} excluded because DOI lookup failed.`
+          : "");
+      chooser = document.createElement("div");
+      chooser.className = "ctca-orcid-work-list";
+      chooser.innerHTML = items.map((item, index) => {
+        const metadata = item.metadata;
+        const authors = orcidMetadataAuthors(metadata).join("; ") || "—";
+        const publication = [
+          `Journal: ${orcidMetadataText(metadata.journal) || "—"}`,
+          metadata.volume ? `vol. ${metadata.volume}` : "",
+          `Journal no.: ${orcidMetadataText(metadata.number) || "—"}`,
+          `Pages: ${orcidMetadataText(metadata.pages) || "—"}`,
+          `Year: ${orcidMetadataText(metadata.year) || "—"}`,
+          `DOI ${item.doi}`
+        ].filter(Boolean).join(" · ");
+        return `
+          <label class="ctca-orcid-work-choice">
+            <input type="checkbox" data-orcid-work="${index}"${item.previouslyIgnored ? "" : " checked"}>
+            <span>
+              <strong>${escapeHtml(metadata.title || item.title || item.doi)}</strong>
+              <span class="ctca-orcid-work-authors">Authors: ${escapeHtml(authors)}</span>
+              <small>${escapeHtml(publication)}</small>
+            </span>
+          </label>
+        `;
+      }).join("");
+      dialogControls.replaceChildren(chooser);
+      dialogControls.hidden = false;
+      closeButton.textContent = "Not now";
+      addButton.hidden = false;
+      addButton.disabled = false;
+    } catch (error) {
+      if (dialogPromise && !dialogClosed) {
+        showDialogResult(
+          `The ORCID manuscript check failed: ${error?.message || String(error)}`,
+          { empty: true }
+        );
+        setStatus(error?.message || String(error), true);
+        await dialogPromise;
+        return;
+      }
+      throw error;
+    }
+
+    const selectedIndexes = await dialogPromise;
+    const selectedIndexSet = new Set(selectedIndexes || []);
+    await extensionApi.runtime.sendMessage({
+      type: "ctca-orcid-record-review",
+      ignoredDois: items
+        .filter((_item, index) => !selectedIndexSet.has(index))
+        .map((item) => item.doi),
+      reconsideredDois: items
+        .filter((_item, index) => selectedIndexSet.has(index))
+        .map((item) => item.doi)
+    }).catch(() => {});
+    if (!selectedIndexes?.length) {
+      setStatus("No ORCID manuscripts were added.");
+      return;
+    }
+
+    setBusy(true, "Adding ORCID manuscripts…");
+    let added = 0;
+    const failed = [];
+    try {
+      for (let index = 0; index < selectedIndexes.length; index += 1) {
+        const selectedItem = items[selectedIndexes[index]];
+        const doi = normalizeDoi(selectedItem?.doi || "");
+        if (!doi || entries.some((entry) =>
+          normalizeDoi(entry?.fields?.doi || "").toLowerCase() === doi.toLowerCase()
+        )) continue;
+        setStatus(`Adding retrieved DOI details ${index + 1}/${selectedIndexes.length}: ${doi}`);
+        try {
+          const metadata = selectedItem.metadata;
+          if (!hasOrcidDoiMetadata(metadata)) continue;
+          const now = new Date().toISOString();
+          const entry = {
+            key: "",
+            type: metadata.entryType || "article",
+            fields: { doi },
+            aliases: [],
+            tags: [],
+            updatedAt: now,
+            doiSyncedAt: now,
+            addedOn: now,
+            starred: false
+          };
+          mergeMetadata(entry, { ...metadata, doi: metadata.doi || doi });
+          entry.key = generatedKey(entry.fields);
+          entries.push(entry);
+          added += 1;
+        } catch (error) {
+          failed.push(`${doi}: ${error?.message || String(error)}`);
+        }
+      }
+      if (added) {
+        markDirty("Saving ORCID manuscripts…");
+        await saveDatabase(`Added ${added} ORCID manuscript${added === 1 ? "" : "s"} from DOI metadata.`);
+        renderAll();
+      }
+      if (failed.length) {
+        setStatus(`${added} added; ${failed.length} failed. ${failed.join(" ")}`, true);
+      } else if (!added) {
+        setStatus("The selected ORCID manuscripts were already present.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function manuscriptWorkflowParameters() {
+    const parameters = new URLSearchParams(location.search);
+    const doi = normalizeDoi(parameters.get("manuscriptDoi") || "");
+    const pdfUrl = parameters.get("manuscriptPdfUrl") || "";
+    const sourceUrl = parameters.get("manuscriptSourceUrl") || "";
+    const sourceTabIdValue = parameters.get("manuscriptSourceTabId") || "";
+    const sourceTabId = /^\d+$/.test(sourceTabIdValue) ? Number(sourceTabIdValue) : null;
+    if (!doi || !pdfUrl || !sourceUrl) return null;
+    try {
+      const parsedPdfUrl = new URL(pdfUrl);
+      const parsedSourceUrl = new URL(sourceUrl);
+      if (!/^https?:$/.test(parsedPdfUrl.protocol) || !/^https?:$/.test(parsedSourceUrl.protocol)) return null;
+      return {
+        doi,
+        pdfUrl: parsedPdfUrl.href,
+        sourceUrl: parsedSourceUrl.href,
+        sourceTabId: Number.isInteger(sourceTabId) && sourceTabId >= 0 ? sourceTabId : null
+      };
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  async function runManuscriptPdfWorkflow(workflow) {
+    const normalizedDoi = normalizeDoi(workflow.doi).toLowerCase();
+    let entry = entries.find((candidate) =>
+      normalizeDoi(candidate?.fields?.doi || "").toLowerCase() === normalizedDoi
+    ) || null;
+
+    if (!entry) {
+      setStatus(`Retrieving DOI metadata for ${workflow.doi}…`);
+      const metadata = await fetchDoiMetadata(workflow.doi);
+      const now = new Date().toISOString();
+      entry = {
+        key: "",
+        type: metadata.entryType || "article",
+        fields: { doi: workflow.doi },
+        aliases: [],
+        tags: [],
+        updatedAt: now,
+        doiSyncedAt: now,
+        addedOn: now,
+        starred: false
+      };
+      mergeMetadata(entry, { ...metadata, doi: metadata.doi || workflow.doi });
+      entry.key = generatedKey(entry.fields);
+      entries.push(entry);
+      markDirty(`Saving ${entry.key}…`);
+      await saveDatabase(`Added ${entry.key} from DOI metadata.`);
+    }
+
+    selectedKey = entry.key;
+    selectedKeys = new Set([entry.key]);
+    await activateWorkspaceTab("bibliography");
+    renderAll();
+
+    const existingAttachments = await globalThis.CollabTeXAttachmentStore.list(entry);
+    if (existingAttachments.length) {
+      setStatus(`Opening the PDF attached to ${entry.key}.`);
+      await openPdfTab(entry, existingAttachments[0]);
+      return;
+    }
+
+    setStatus(`Downloading the journal PDF for ${entry.key}…`);
+    let file;
+    try {
+      file = await globalThis.CollabTeXAttachmentStore.downloadWebPdf(
+        workflow.pdfUrl,
+        workflow.sourceUrl,
+        Number.isInteger(workflow.sourceTabId) ? workflow.sourceTabId : null
+      );
+    } finally {
+      if (Number.isInteger(workflow.sourceTabId)) {
+        await globalThis.CollabTeXAttachmentStore.closeWebTab(workflow.sourceTabId);
+      }
+    }
+    setStatus(`Journal PDF downloaded for ${entry.key}. Choose its storage and attach it.`);
+    await openAddPdfDialog(entry, {
+      files: [file],
+      getFromWebFile: true,
+      sourceUrl: workflow.sourceUrl,
+      openAfterAttach: true
+    });
+  }
+
+  function waitForStandaloneCommandReady() {
+    return new Promise((resolve) => {
+      const check = () => {
+        if (!busy && !appDialog.classList.contains("ctca-app-dialog-visible")) {
+          resolve();
+          return;
+        }
+        window.setTimeout(check, 120);
+      };
+      check();
+    });
+  }
+
+  async function selectStandaloneEntry(key) {
+    const entry = entryByKey(String(key || ""));
+    if (!entry) throw new Error(`The requested bibliography entry “${key}” was not found.`);
+    await activateWorkspaceTab("bibliography");
+    selectedKey = entry.key;
+    selectedKeys = new Set([entry.key]);
+    renderAll();
+    setStatus(`Selected ${entry.key}.`);
+  }
+
+  function queueStandaloneCommand(command) {
+    standaloneCommandQueue = standaloneCommandQueue
+      .catch(() => {})
+      .then(async () => {
+        await waitForStandaloneCommandReady();
+        setBusy(true, "Opening…");
+        try {
+          if (command?.type === "ctca-run-manuscript-pdf-workflow") {
+            await runManuscriptPdfWorkflow(command.workflow || {});
+          } else if (command?.type === "ctca-select-standalone-entry") {
+            await selectStandaloneEntry(command.key);
+          } else if (command?.type === "ctca-check-orcid-now") {
+            await offerOrcidWorks(null, { force: true, announceEmpty: true });
+          } else if (command?.type === "ctca-offer-orcid-works") {
+            await offerOrcidWorks(command.result);
+          }
+        } catch (error) {
+          setStatus(error?.message || String(error), true);
+        } finally {
+          setBusy(false);
+        }
+      });
+  }
+
+  const pendingWebPdfAutoContinueTabs = new Set();
+
+  function scheduleWebPdfAutoContinue(tabId) {
+    const normalizedTabId = Number(tabId);
+    if (!Number.isInteger(normalizedTabId) || pendingWebPdfAutoContinueTabs.has(normalizedTabId)) return false;
+    pendingWebPdfAutoContinueTabs.add(normalizedTabId);
+    let attempts = 0;
+    const tryContinue = () => {
+      const button = [...document.querySelectorAll(".ctca-web-pdf-continue:not([hidden])")]
+        .find((candidate) => Number(candidate.dataset.resumeTabId) === normalizedTabId);
+      if (button && !button.disabled) {
+        pendingWebPdfAutoContinueTabs.delete(normalizedTabId);
+        button.click();
+        return;
+      }
+      attempts += 1;
+      if (attempts >= 150) {
+        pendingWebPdfAutoContinueTabs.delete(normalizedTabId);
+        return;
+      }
+      window.setTimeout(tryContinue, 100);
+    };
+    tryContinue();
+    return true;
+  }
+
+  function connectStandaloneManager() {
+    if (standaloneManagerPort) return;
+    try {
+      const port = extensionApi.runtime.connect({ name: "ctca-standalone-manager" });
+      standaloneManagerPort = port;
+      port.onMessage.addListener((command) => {
+        if (command?.type === "ctca-auto-continue-web-pdf") {
+          scheduleWebPdfAutoContinue(command.tabId);
+          return;
+        }
+        queueStandaloneCommand(command);
+      });
+      port.onDisconnect.addListener(() => {
+        if (standaloneManagerPort === port) standaloneManagerPort = null;
+      });
+    } catch (_error) {
+      standaloneManagerPort = null;
+    }
+  }
+
+  function applyManagerTableColumns() {
+    const visible = LIST_COLUMNS.filter((column) => managerColumnVisible(column.id));
+    const widths = [34, 24, ...visible.map((column) => columnWidths[column.id])];
+    const flexibleColumnId = visible.some((column) => column.id === "title") ? "title" : visible[0]?.id;
+    const template = [
+      "34px",
+      "24px",
+      ...visible.map((column) => column.id === flexibleColumnId
+        ? `minmax(${Math.round(columnWidths[column.id])}px,1fr)`
+        : `${Math.round(columnWidths[column.id])}px`)
+    ];
+    root.style.setProperty("--ctca-manager-table-columns", template.join(" "));
+    root.style.setProperty("--ctca-manager-table-width", `${widths.reduce((sum, width) => sum + width, 0)}px`);
+    for (const column of LIST_COLUMNS) {
+      const header = root.querySelector(`.ctca-manager-column-header[data-manager-column="${column.id}"]`);
+      if (header) header.hidden = !managerColumnVisible(column.id);
+    }
+  }
+
+  function managerColumnVisible(columnId) {
+    return columnId === "addedOn" && selectedCategoryId === "recent"
+      ? true
+      : columnVisibility[columnId] !== false;
+  }
+
+  function renderColumnVisibilityMenu(clientX, clientY) {
+    const menu = $(".ctca-manager-column-menu", root);
+    const choices = [
+      ...LIST_COLUMNS.map((column) => ({ id: column.id, label: column.label })),
+      { id: "authors", label: "Authors" }
+    ];
+    menu.innerHTML = choices.map((choice) => `
+      <label role="menuitemcheckbox">
+        <input type="checkbox" data-manager-visible-column="${choice.id}" ${columnVisibility[choice.id] !== false ? "checked" : ""}>
+        <span>${escapeHtml(choice.label)}</span>
+      </label>
+    `).join("");
+    menu.style.left = `${Math.min(clientX, window.innerWidth - 235)}px`;
+    menu.style.top = `${Math.min(clientY, window.innerHeight - 235)}px`;
+    menu.hidden = false;
+  }
+
+  function setColumnVisible(columnId, visible) {
+    if (!(columnId in columnVisibility)) return false;
+    if (!visible && columnId !== "authors") {
+      const visibleColumns = LIST_COLUMNS.filter((column) => columnVisibility[column.id] !== false);
+      if (visibleColumns.length <= 1 && visibleColumns[0]?.id === columnId) return false;
+    }
+    columnVisibility[columnId] = Boolean(visible);
+    applyManagerTableColumns();
+    renderList();
+    saveUiState().catch(() => {});
+    return true;
+  }
+
+  function initializeTableColumns() {
+    const header = $(".ctca-manager-table-head", root);
+    const list = $(".ctca-manager-list", root);
+    const menu = $(".ctca-manager-column-menu", root);
+    root.appendChild(menu);
+    applyManagerTableColumns();
+
+    header.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      renderColumnVisibilityMenu(event.clientX, event.clientY);
+    });
+    header.querySelectorAll(".ctca-manager-column-eye").forEach((button) => {
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        setColumnVisible(button.closest("[data-manager-column]")?.dataset.managerColumn, false);
+      });
+    });
+    header.querySelectorAll(".ctca-manager-column-resizer").forEach((handle) => {
+      handle.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const column = handle.closest("[data-manager-column]")?.dataset.managerColumn;
+        const definition = LIST_COLUMNS.find((item) => item.id === column);
+        if (!definition) return;
+        const startX = event.clientX;
+        const startWidth = handle.closest("[data-manager-column]").getBoundingClientRect().width;
+        const visibleColumns = LIST_COLUMNS.filter((item) => columnVisibility[item.id] !== false);
+        const flexibleColumnId = visibleColumns.some((item) => item.id === "title") ? "title" : visibleColumns[0]?.id;
+        const nextColumn = column === flexibleColumnId
+          ? visibleColumns[visibleColumns.findIndex((item) => item.id === column) + 1]
+          : null;
+        const startNextWidth = nextColumn ? columnWidths[nextColumn.id] : 0;
+        root.classList.add("ctca-manager-resizing-columns");
+        const move = (moveEvent) => {
+          const delta = moveEvent.clientX - startX;
+          if (nextColumn) {
+            const minimumDelta = Math.max(definition.min - startWidth, startNextWidth - 700);
+            const maximumDelta = Math.min(700 - startWidth, startNextWidth - nextColumn.min);
+            const effectiveDelta = Math.max(minimumDelta, Math.min(maximumDelta, delta));
+            columnWidths[column] = startWidth + effectiveDelta;
+            columnWidths[nextColumn.id] = startNextWidth - effectiveDelta;
+          } else {
+            columnWidths[column] = Math.max(definition.min, Math.min(700, startWidth + delta));
+          }
+          applyManagerTableColumns();
+        };
+        const finish = () => {
+          document.removeEventListener("pointermove", move, true);
+          document.removeEventListener("pointerup", finish, true);
+          document.removeEventListener("pointercancel", finish, true);
+          root.classList.remove("ctca-manager-resizing-columns");
+          saveUiState().catch(() => {});
+        };
+        document.addEventListener("pointermove", move, true);
+        document.addEventListener("pointerup", finish, true);
+        document.addEventListener("pointercancel", finish, true);
+      });
+    });
+    $(".ctca-manager-star-sort", header).addEventListener("click", () => {
+      starredFirst = !starredFirst;
+      renderList();
+      saveUiState().catch(() => {});
+    });
+    menu.addEventListener("change", (event) => {
+      const input = event.target.closest("[data-manager-visible-column]");
+      if (input && !setColumnVisible(input.dataset.managerVisibleColumn, input.checked)) {
+        input.checked = columnVisibility[input.dataset.managerVisibleColumn] !== false;
+      }
+    });
+    list.addEventListener("scroll", () => { header.scrollLeft = list.scrollLeft; }, { passive: true });
   }
 
   function applyColumnWidths() {
@@ -2489,7 +4798,6 @@
   function renderAll() {
     renderCategories();
     renderList();
-    renderDetails();
   }
 
   function encodeBase64Url(value) {
@@ -2518,6 +4826,8 @@
     fields.ctca_meta_version = "1";
     if ((entry.aliases || []).length && !fields.ids) fields.ids = [...new Set(entry.aliases)].join(", ");
     if (entry.doiSyncedAt) fields.ctca_doi_synced = entry.doiSyncedAt;
+    if (entry.addedOn) fields.ctca_added_on = entry.addedOn;
+    if (entry.starred) fields.ctca_starred = "true";
     const tags = globalThis.CollabTeXSearchTools.splitTags(entry.tags || []);
     if (tags.length) fields.ctca_tags = tags.join(", ");
     const memberships = categoryState.memberships?.[entry.key] || [];
@@ -2537,7 +4847,7 @@
     const preferredOrder = [
       "title", "year", "journal", "journaltitle", "booktitle", "author", "editor",
       "volume", "number", "pages", "publisher", "institution", "url", "doi",
-      "abstract", "keywords", "ctca_meta_version", "ctca_doi_synced", "ctca_tags",
+      "abstract", "keywords", "ctca_meta_version", "ctca_doi_synced", "ctca_added_on", "ctca_starred", "ctca_tags",
       "ctca_categories", "ctca_category_tree"
     ];
     const names = [
@@ -2742,7 +5052,11 @@
     const now = new Date().toISOString();
     const selectedImported = [...selectedImportIndices]
       .sort((left, right) => left - right)
-      .map((index) => ({ ...normalizeEntry(plan.incoming[index]), updatedAt: plan.incoming[index]?.updatedAt || now }));
+      .map((index) => ({
+        ...normalizeEntry(plan.incoming[index]),
+        updatedAt: plan.incoming[index]?.updatedAt || now,
+        addedOn: plan.incoming[index]?.addedOn || now
+      }));
 
     if (!selectedImported.length && !removedExistingIndices.size) {
       setStatus(`No entries were imported from ${file.name}; the current database versions were kept.`);
@@ -2846,15 +5160,63 @@
     window.close();
   }
 
+  function setPdfPaneCollapsed(pane, collapsed, { trackFullscreenChange = true } = {}) {
+    const state = openPdfTabs.get(activeWorkspaceTab);
+    if (!state) return;
+    const stateKey = pane === "notes" ? "notesCollapsed" : "detailsCollapsed";
+    state[stateKey] = Boolean(collapsed);
+    if (
+      trackFullscreenChange
+      && root.classList.contains("ctca-pdf-maximized")
+      && pdfFullscreenPaneState?.state === state
+    ) {
+      pdfFullscreenPaneState[pane === "notes" ? "notesModified" : "detailsModified"] = true;
+    }
+    const layout = $(".ctca-pdf-layout", root);
+    layout?.classList.toggle(
+      pane === "notes" ? "ctca-pdf-notes-collapsed" : "ctca-pdf-details-collapsed",
+      Boolean(collapsed)
+    );
+    const collapseButton = $(pane === "notes" ? ".ctca-pdf-collapse-notes" : ".ctca-pdf-collapse-details", root);
+    if (collapseButton) {
+      collapseButton.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      collapseButton.title = collapsed
+        ? `Expand ${pane === "notes" ? "notes pane" : "entry details"}`
+        : `Collapse ${pane === "notes" ? "notes pane" : "entry details"}`;
+    }
+  }
+
   function setPdfMaximized(maximized) {
     const value = Boolean(maximized && activeWorkspaceTab !== "bibliography");
-    root.classList.toggle("ctca-pdf-maximized", value);
-    const button = $(".ctca-pdf-fullscreen", root);
-    if (button) {
-      button.setAttribute("aria-pressed", value ? "true" : "false");
-      button.setAttribute("aria-label", value ? "Reduce PDF view" : "Maximize PDF view");
-      button.title = value ? "Reduce PDF view" : "Maximize PDF view";
+    const wasMaximized = root.classList.contains("ctca-pdf-maximized");
+    const state = openPdfTabs.get(activeWorkspaceTab);
+
+    if (value && !wasMaximized && state) {
+      pdfFullscreenPaneState = {
+        state,
+        notesCollapsed: Boolean(state.notesCollapsed),
+        detailsCollapsed: Boolean(state.detailsCollapsed),
+        notesModified: false,
+        detailsModified: false
+      };
+      setPdfPaneCollapsed("notes", true, { trackFullscreenChange: false });
+      setPdfPaneCollapsed("details", true, { trackFullscreenChange: false });
+    } else if (!value && wasMaximized && pdfFullscreenPaneState) {
+      const snapshot = pdfFullscreenPaneState;
+      if (!snapshot.notesModified) {
+        snapshot.state.notesCollapsed = snapshot.notesCollapsed;
+      }
+      if (!snapshot.detailsModified) {
+        snapshot.state.detailsCollapsed = snapshot.detailsCollapsed;
+      }
+      if (snapshot.state === state) {
+        setPdfPaneCollapsed("notes", snapshot.state.notesCollapsed, { trackFullscreenChange: false });
+        setPdfPaneCollapsed("details", snapshot.state.detailsCollapsed, { trackFullscreenChange: false });
+      }
+      pdfFullscreenPaneState = null;
     }
+
+    root.classList.toggle("ctca-pdf-maximized", value);
     const frame = $(".ctca-pdf-frame", root);
     frame?.contentWindow?.postMessage({
       type: "ctca-pdf-host-layout",
@@ -2864,9 +5226,6 @@
   }
 
   function bindEvents() {
-    $(".ctca-manager-close", root).addEventListener("click", () => {
-      closeStandaloneManager().catch((error) => setStatus(error?.message || String(error), true));
-    });
     const addMenuWrap = $(".ctca-manager-add-menu-wrap", root);
     const addMenuButton = $(".ctca-manager-add-entry", root);
     const closeAddMenu = () => {
@@ -2895,6 +5254,11 @@
       closeAddMenu();
       addEntry().catch((error) => setStatus(error.message || String(error), true));
     });
+    $(".ctca-manager-add-from-pdf", root).addEventListener("click", (event) => {
+      event.stopPropagation();
+      closeAddMenu();
+      addEntriesFromPdfs().catch((error) => setStatus(error.message || String(error), true));
+    });
     $(".ctca-manager-import-bib", root).addEventListener("click", (event) => {
       event.stopPropagation();
       closeAddMenu();
@@ -2907,15 +5271,26 @@
     $(".ctca-manager-update", root).addEventListener("click", () => {
       exportGlobalBibliography().catch((error) => setStatus(error.message || String(error), true));
     });
-    $(".ctca-manager-update-all-doi", root).addEventListener("click", () => updateEntriesFromDoi(entries));
-    $(".ctca-manager-update-selected", root).addEventListener("click", () => updateEntriesFromDoi([...selectedKeys].map(entryByKey).filter(Boolean)));
+    $(".ctca-manager-update-all-doi", root).addEventListener("click", () => {
+      updateEntriesFromDoi(entries, { showBatchConfirmation: true });
+    });
+    $(".ctca-manager-update-selected", root).addEventListener("click", () => {
+      updateEntriesFromDoi(
+        [...selectedKeys].map(entryByKey).filter(Boolean),
+        { showBatchConfirmation: true }
+      );
+    });
     $(".ctca-manager-remove-selected", root).addEventListener("click", removeSelected);
     $(".ctca-manager-abort-doi", root).addEventListener("click", abortDoiUpdate);
     $(".ctca-manager-cloud-settings", root).addEventListener("click", () => openPdfStorageSettings().catch((error) => setStatus(error.message || String(error), true)));
+    $(".ctca-manager-options", root).addEventListener("click", () => openOptionsPage());
     $(".ctca-manager-collapse-details", root).addEventListener("click", () => {
       bibliographyDetailsCollapsed = !bibliographyDetailsCollapsed;
-      root.classList.toggle("ctca-details-collapsed", bibliographyDetailsCollapsed);
-      $(".ctca-manager-collapse-details", root).title = bibliographyDetailsCollapsed ? "Expand detail pane" : "Collapse detail pane";
+      updateBibliographyDetailsVisibility();
+    });
+    $(".ctca-manager-restore-details", root).addEventListener("click", () => {
+      bibliographyDetailsCollapsed = false;
+      updateBibliographyDetailsVisibility();
     });
     window.addEventListener("message", (event) => {
       const frame = $(".ctca-pdf-frame", root);
@@ -2936,6 +5311,14 @@
       }
       if (message.type === "ctca-pdf-request-data") {
         sendPdfDataToFrame(frame, attachment).catch(() => {});
+        return;
+      }
+      if (message.type === "ctca-pdf-download-request") {
+        downloadActivePdf().catch((error) => setStatus(error?.message || String(error), true));
+        return;
+      }
+      if (message.type === "ctca-pdf-fullscreen-request") {
+        setPdfMaximized(!root.classList.contains("ctca-pdf-maximized"));
         return;
       }
       if (message.type === "ctca-pdf-dirty-state") {
@@ -2962,15 +5345,6 @@
       if (event.target.closest(".ctca-manager-tab-close")) closePdfTab(tabId).catch(() => {});
       else activateWorkspaceTab(tabId).catch((error) => setStatus(error.message || String(error), true));
     });
-    const setPdfPaneCollapsed = (pane, collapsed) => {
-      const layout = $(".ctca-pdf-layout", root);
-      const className = pane === "notes" ? "ctca-pdf-notes-collapsed" : "ctca-pdf-details-collapsed";
-      layout.classList.toggle(className, collapsed);
-      const state = openPdfTabs.get(activeWorkspaceTab);
-      if (state) state[pane === "notes" ? "notesCollapsed" : "detailsCollapsed"] = collapsed;
-      const collapseButton = $(pane === "notes" ? ".ctca-pdf-collapse-notes" : ".ctca-pdf-collapse-details", root);
-      if (collapseButton) collapseButton.title = collapsed ? `Expand ${pane === "notes" ? "notes pane" : "entry details"}` : `Collapse ${pane === "notes" ? "notes pane" : "entry details"}`;
-    };
     $(".ctca-pdf-collapse-notes", root).addEventListener("click", () => setPdfPaneCollapsed("notes", true));
     $(".ctca-pdf-restore-notes", root).addEventListener("click", () => setPdfPaneCollapsed("notes", false));
     $(".ctca-pdf-collapse-details", root).addEventListener("click", () => setPdfPaneCollapsed("details", true));
@@ -2979,12 +5353,6 @@
       window.clearTimeout(pdfNoteSaveTimer); pdfNoteSaveTimer = window.setTimeout(() => savePdfNotes().catch((error) => setStatus(error.message || String(error), true)), 500);
     });
     $(".ctca-pdf-note", root).addEventListener("change", () => savePdfNotes().catch((error) => setStatus(error.message || String(error), true)));
-    $(".ctca-pdf-download", root).addEventListener("click", async () => {
-      const attachment = await activePdfAttachment(); if (!attachment) return;
-      const blob = await globalThis.CollabTeXAttachmentStore.getBlob(attachment); if (!blob) return;
-      const url = URL.createObjectURL(blob), link = document.createElement("a"); link.href = url; link.download = attachment.fileName || `${attachment.name}.pdf`; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-    });
-    $(".ctca-pdf-fullscreen", root).addEventListener("click", () => setPdfMaximized(!root.classList.contains("ctca-pdf-maximized")));
     initializePdfResizer($(".ctca-pdf-resizer-notes", root), "notes");
     initializePdfResizer($(".ctca-pdf-resizer-details", root), "details");
     root.addEventListener("keydown", (event) => { if (event.key === "Escape" && root.classList.contains("ctca-pdf-maximized")) { event.preventDefault(); setPdfMaximized(false); } });
@@ -2993,11 +5361,12 @@
       if (event.target.checked) visibleKeys.forEach((key) => selectedKeys.add(key));
       else visibleKeys.forEach((key) => selectedKeys.delete(key));
       renderList();
+      renderDetails();
     });
     $(".ctca-category-remove", root).addEventListener("click", () => {
       const menu = $(".ctca-category-context-menu", root);
       const categoryId = menu.dataset.categoryId || "";
-      menu.hidden = true;
+      hideCategoryContextMenu();
       removeCategory(categoryId);
     });
 
@@ -3084,13 +5453,16 @@
       }
     });
 
+    root.addEventListener("contextmenu", (event) => event.preventDefault());
     root.addEventListener("click", (event) => {
       if (!event.target.closest(".ctca-manager-search-composite")) {
         setSearchMenuOpen(false);
       }
       if (!event.target.closest(".ctca-manager-add-menu-wrap")) closeAddMenu();
-      if (!event.target.closest(".ctca-category-context-menu")) {
-        $(".ctca-category-context-menu", root).hidden = true;
+      if (!event.target.closest(".ctca-category-context-menu")) hideCategoryContextMenu();
+      if (!event.target.closest(".ctca-entry-context-menu")) hideEntryContextMenu();
+      if (!event.target.closest(".ctca-manager-column-menu")) {
+        $(".ctca-manager-column-menu", root).hidden = true;
       }
     });
 
@@ -3100,6 +5472,7 @@
         if (sortState.field === field) sortState.direction = sortState.direction === "asc" ? "desc" : "asc";
         else sortState = { field, direction: "asc" };
         renderList();
+        saveUiState().catch(() => {});
       });
     });
 
@@ -3110,31 +5483,75 @@
         if (entry) renderTagSuggestions(entry, event.target);
         return;
       }
+      if (event.target.matches("[data-manager-autocomplete]")) {
+        const entry = entryByKey(selectedKey);
+        if (entry && event.target.dataset.managerAutocomplete === "keywords") renderKeywordSuggestions(entry, event.target);
+        else if (entry) renderJournalSuggestions(entry, event.target);
+        return;
+      }
       detailInputChanged(event);
     });
     details.addEventListener("change", detailInputChanged);
+    details.addEventListener("keydown", inlineDisplayKeydown);
     details.addEventListener("keydown", tagInputKeydown);
+    details.addEventListener("keydown", fieldAutocompleteKeydown);
+    details.addEventListener("mousedown", fieldAutocompleteMouseDown);
     details.addEventListener("focusin", (event) => {
       if (event.target.matches(".ctca-tag-input")) {
         const entry = entryByKey(selectedKey);
         if (entry) renderTagSuggestions(entry, event.target);
+      } else if (event.target.matches("[data-manager-autocomplete]")) {
+        const entry = entryByKey(selectedKey);
+        if (entry && event.target.dataset.managerAutocomplete === "keywords") renderKeywordSuggestions(entry, event.target);
+        else if (entry) renderJournalSuggestions(entry, event.target);
       }
     });
     details.addEventListener("focusout", (event) => {
       if (event.target.matches(".ctca-tag-input")) {
         window.setTimeout(() => event.target.closest(".ctca-tag-input-wrap")?.querySelector(".ctca-tag-suggestions")?.setAttribute("hidden", ""), 120);
+      } else if (event.target.matches("[data-manager-autocomplete]")) {
+        window.setTimeout(() => {
+          const container = event.target.closest(".ctca-field-completion-wrap")?.querySelector(".ctca-field-completion");
+          if (container) container.hidden = true;
+          event.target.setAttribute("aria-expanded", "false");
+        }, 120);
       }
     });
-    details.addEventListener("click", detailActionClicked);
+    details.addEventListener("click", detailClicked);
 
     const pdfDetails = $(".ctca-pdf-entry-details", root);
     pdfDetails.addEventListener("input", (event) => {
       if (event.target.matches(".ctca-tag-input")) { const entry = entryByKey(selectedKey); if (entry) renderTagSuggestions(entry, event.target); return; }
+      if (event.target.matches("[data-manager-autocomplete]")) {
+        const entry = entryByKey(selectedKey);
+        if (entry && event.target.dataset.managerAutocomplete === "keywords") renderKeywordSuggestions(entry, event.target);
+        else if (entry) renderJournalSuggestions(entry, event.target);
+        return;
+      }
       detailInputChanged(event);
     });
     pdfDetails.addEventListener("change", detailInputChanged);
+    pdfDetails.addEventListener("keydown", inlineDisplayKeydown);
     pdfDetails.addEventListener("keydown", tagInputKeydown);
-    pdfDetails.addEventListener("click", detailActionClicked);
+    pdfDetails.addEventListener("keydown", fieldAutocompleteKeydown);
+    pdfDetails.addEventListener("mousedown", fieldAutocompleteMouseDown);
+    pdfDetails.addEventListener("focusin", (event) => {
+      if (event.target.matches("[data-manager-autocomplete]")) {
+        const entry = entryByKey(selectedKey);
+        if (entry && event.target.dataset.managerAutocomplete === "keywords") renderKeywordSuggestions(entry, event.target);
+        else if (entry) renderJournalSuggestions(entry, event.target);
+      }
+    });
+    pdfDetails.addEventListener("focusout", (event) => {
+      if (event.target.matches("[data-manager-autocomplete]")) {
+        window.setTimeout(() => {
+          const container = event.target.closest(".ctca-field-completion-wrap")?.querySelector(".ctca-field-completion");
+          if (container) container.hidden = true;
+          event.target.setAttribute("aria-expanded", "false");
+        }, 120);
+      }
+    });
+    pdfDetails.addEventListener("click", detailClicked);
 
     const globalSyncToggle = $(".ctca-manager-global-sync-checkbox", root);
     if (globalSyncToggle) {
@@ -3172,6 +5589,12 @@
 
     extensionApi.storage.onChanged?.addListener(async (changes, areaName) => {
       if (areaName !== "local") return;
+      if (AUTHOR_OPTIONS_KEY in changes) {
+        authorshipUserName = String(changes[AUTHOR_OPTIONS_KEY]?.newValue?.userName || "").trim();
+        renderCategories();
+        renderList();
+        renderDetails();
+      }
       if (globalThis.CollabTeXAttachmentStore.CONFIG_KEY in changes) {
         const config = changes[globalThis.CollabTeXAttachmentStore.CONFIG_KEY]?.newValue || {};
         await refreshNextcloudSyncState(config);
@@ -3201,20 +5624,39 @@
   }
 
   async function initialize() {
+    await globalThis.SmartCitationsPrivacy.ensureAccepted();
+    const manualOrcidCheck = new URLSearchParams(location.search).get("orcidCheck") === "1";
+    setListLoading(true);
     setBusy(true, "Loading…");
     try {
+      const manuscriptWorkflow = manuscriptWorkflowParameters();
+      if (manuscriptWorkflow) {
+        history.replaceState(null, "", `${location.pathname}${location.hash || ""}`);
+      }
       await loadDatabase();
-      selectedKey = entries[0]?.key || "";
-      if (selectedKey) selectedKeys = new Set([selectedKey]);
+      selectedKey = "";
+      selectedKeys.clear();
       bindEvents();
+      $(".ctca-category-remove", root).textContent = "Delete";
+      await ensureAuthorshipUserName();
+      initializeTableColumns();
       initializeResizers();
       window.addEventListener("focus", () => scheduleNextcloudSync(100));
       window.setInterval(() => scheduleNextcloudSync(50), 5 * 60 * 1000);
       renderAll();
       renderWorkspaceTabs();
+      connectStandaloneManager();
       const hashKey = decodeURIComponent(location.hash.replace(/^#entry=/, ""));
-      if (hashKey && entries.some((entry) => entry.key === hashKey)) { selectedKey = hashKey; renderAll(); }
-      setStatus(entries.length ? "Global bibliography loaded." : "No global bibliography entries yet.");
+      if (hashKey && entries.some((entry) => entry.key === hashKey)) {
+        selectedKey = hashKey;
+        selectedKeys = new Set([hashKey]);
+        renderAll();
+      }
+      if (manuscriptWorkflow) {
+        await runManuscriptPdfWorkflow(manuscriptWorkflow);
+      } else {
+        setStatus(entries.length ? "Global bibliography loaded." : "No global bibliography entries yet.");
+      }
       globalThis.CollabTeXAttachmentStore.getConfig().then((config) => {
         if (!config.nextcloud?.appPassword) return;
         return synchronizeNextcloud().then(() => {
@@ -3225,8 +5667,15 @@
     } catch (error) {
       setStatus(error.message || String(error), true);
     } finally {
+      setListLoading(false);
       setBusy(false);
     }
+    window.setTimeout(() => {
+      offerOrcidWorks(null, {
+        force: manualOrcidCheck,
+        announceEmpty: manualOrcidCheck
+      }).catch((error) => setStatus(error?.message || String(error), true));
+    }, 0);
   }
 
   initialize();
