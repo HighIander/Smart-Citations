@@ -31,8 +31,21 @@
   function entryRef(entry) {
     const doi = normalizeDoi(entry?.fields?.doi || entry?.doi || "");
     const key = String(entry?.key || "Reference").trim();
+    const keys = [...new Set([
+      key,
+      entry?.originalKey,
+      ...(Array.isArray(entry?.aliases) ? entry.aliases : []),
+      ...String(entry?.fields?.ids || "").split(/[;,\s]+/)
+    ]
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean))];
     return {
       identity: doi ? `doi:${doi}` : `key:${key.toLowerCase()}`,
+      identities: [
+        ...(doi ? [`doi:${doi}`] : []),
+        ...keys.map((value) => `key:${value}`)
+      ],
+      keys,
       key,
       doi,
       title: String(entry?.fields?.title || entry?.title || key || "Reference")
@@ -496,9 +509,11 @@
   }
 
   function attachmentMatchesEntry(attachment, ref) {
-    return attachment?.entry?.identity === ref.identity
+    const attachmentIdentity = String(attachment?.entry?.identity || "").toLowerCase();
+    const attachmentKey = String(attachment?.entry?.key || "").trim().toLowerCase();
+    return ref.identities.includes(attachmentIdentity)
       || (ref.doi && attachment?.entry?.doi === ref.doi)
-      || attachment?.entry?.key === ref.key;
+      || ref.keys.includes(attachmentKey);
   }
 
   function orderedAttachmentsForEntry(index, ref) {
@@ -978,27 +993,68 @@
     return attachment;
   }
 
-  async function remove(id) {
-    const index = await loadIndex(); const attachment = index.attachments.find((item) => item.id === id);
-    if (!attachment) return;
+  async function deleteNextcloudResource(nc, relativePath, label) {
+    if (!relativePath) throw new Error(`The ${label} path is missing from the attachment record.`);
+    const response = await davFetch(nc, relativePath, { method: "DELETE" });
+    if (!response.ok && response.status !== 404) {
+      throw new Error(`Could not delete the ${label} from Nextcloud (${response.status}).`);
+    }
+  }
+
+  async function deleteAttachmentStorage(attachment) {
     if (attachment.provider === "browser") {
-      await backgroundRequest({ type: "ctca-pdf-delete-browser", id }).catch(() => {});
-      await idbDelete(id).catch(() => {});
+      const deletions = await Promise.allSettled([
+        backgroundRequest({ type: "ctca-pdf-delete-browser", id: attachment.id }),
+        idbDelete(attachment.id)
+      ]);
+      const failure = deletions.find((result) => result.status === "rejected");
+      if (failure) {
+        throw new Error(`Could not delete the PDF from browser storage: ${failure.reason?.message || String(failure.reason)}`);
+      }
     }
     if (attachment.provider === "local" && attachment.sessionOnly) {
-      sessionLocalFiles.delete(id);
-      await backgroundRequest({ type: "ctca-pdf-delete-session", id }).catch(() => {});
+      sessionLocalFiles.delete(attachment.id);
+      await backgroundRequest({ type: "ctca-pdf-delete-session", id: attachment.id });
     }
-    if (attachment.provider === "local" && attachment.localHandle) await idbHandleDelete(id);
+    if (attachment.provider === "local" && attachment.localHandle) await idbHandleDelete(attachment.id);
     if (attachment.provider === "nextcloud") {
       const nc = (await getConfig()).nextcloud;
       await Promise.all([
-        davFetch(nc, attachment.remotePath, { method: "DELETE" }).catch(() => null),
-        davFetch(nc, `annotations/${attachment.id}.json`, { method: "DELETE" }).catch(() => null)
+        deleteNextcloudResource(nc, attachment.remotePath, "PDF"),
+        deleteNextcloudResource(nc, `annotations/${attachment.id}.json`, "PDF annotation sidecar")
       ]);
     }
-    index.attachments = index.attachments.filter((item) => item.id !== id); await saveIndex(index);
-    if (attachment.provider === "nextcloud") await writeRemoteIndex((await getConfig()).nextcloud, index);
+  }
+
+  async function remove(id) {
+    const index = await loadIndex();
+    const attachment = index.attachments.find((item) => item.id === id);
+    if (!attachment) return false;
+
+    await deleteAttachmentStorage(attachment);
+    index.attachments = index.attachments.filter((item) => item.id !== id);
+    if (attachment.provider === "nextcloud") {
+      await writeRemoteIndex((await getConfig()).nextcloud, index);
+    }
+    await saveIndex(index);
+    return true;
+  }
+
+  async function removeForEntries(entriesInput) {
+    const refs = (Array.isArray(entriesInput) ? entriesInput : [entriesInput])
+      .filter(Boolean)
+      .map(entryRef);
+    if (!refs.length) return { removed: 0 };
+
+    const index = await loadIndex();
+    const attachmentIds = index.attachments
+      .filter((attachment) => refs.some((ref) => attachmentMatchesEntry(attachment, ref)))
+      .map((attachment) => attachment.id);
+    let removed = 0;
+    for (const id of attachmentIds) {
+      if (await remove(id)) removed += 1;
+    }
+    return { removed };
   }
 
   async function syncNextcloud() {
@@ -1464,6 +1520,13 @@
   async function saveSyncedDatabase(database, previousLocal, { remoteChanged = false } = {}) {
     const normalized = normalizeDatabase(database);
     const previous = normalizeDatabase(previousLocal);
+    const liveEntryIdentities = new Set(normalized.entries.map(databaseEntryIdentity));
+    const deletionIdentities = new Set(normalized.deletedEntries.map((item) => item.identity));
+    const removedEntries = previous.entries.filter((entry) =>
+      !liveEntryIdentities.has(databaseEntryIdentity(entry))
+      && deletionIdentities.has(databaseDeletionIdentity(entry))
+    );
+    if (removedEntries.length) await removeForEntries(removedEntries);
     normalized.documentSync = normalizeDocumentSyncState(previous.documentSync);
     const remoteContentChanged = remoteChanged && databaseContentString(normalized) !== databaseContentString(previous);
     if (remoteContentChanged) {
@@ -1759,7 +1822,7 @@
   globalThis.CollabTeXAttachmentStore = {
     INDEX_KEY, CONFIG_KEY, GLOBAL_DATABASE_KEY, entryRef, getConfig, saveConfig, checkNextcloudConnection, connectNextcloud, syncNextcloud,
     syncBibliographyNextcloud, deleteBibliographyEntriesNextcloud, resolveBibliographyConflicts, databaseToBib, bibToDatabase, isPdfFile,
-    list, reorder, addBrowser, addLocalLink, addLocalSession, addLocalHandle, addNextcloud, getBlob, update, replaceFile, remove,
+    list, reorder, addBrowser, addLocalLink, addLocalSession, addLocalHandle, addNextcloud, getBlob, update, replaceFile, remove, removeForEntries,
     normalizeLocalPath, ensureLocalFilePermission, isLocalFilePermissionGranted, openLocalFilePermissionSettings,
     discoverWebPdfs, showWebHumanCheck, closeWebTab, downloadWebPdf,
     listNextcloudDirectory, getNextcloudFileInfo, downloadNextcloudFile, normalizeNextcloudPath

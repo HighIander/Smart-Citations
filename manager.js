@@ -3519,8 +3519,8 @@
       const confirmed = await showDialog({
         title: `Remove ${entry.key}?`,
         message: syncNextcloudBibliography
-          ? "This entry will be removed from the global bibliography database and from the synchronized Nextcloud bibliography."
-          : "This entry will be removed from the global bibliography database.",
+          ? "This entry and all of its attached PDFs will be removed from the global bibliography database, browser storage or Nextcloud, and the synchronized Nextcloud bibliography."
+          : "This entry and all of its attached PDFs will be removed from the global bibliography database and browser storage or Nextcloud.",
         buttons: [
           { label: "Keep entry", value: false },
           { label: "Remove entry", value: true, danger: true }
@@ -3529,6 +3529,8 @@
         danger: true
       });
       if (!confirmed) return;
+      setStatus(`Removing attachments for ${entry.key}…`);
+      await globalThis.CollabTeXAttachmentStore.removeForEntries([entry]);
       removeEntryKeys([entry.key]);
       await saveDatabase(`Removed ${entry.key}.`);
       await propagateRemovedEntriesToNextcloud([entry]);
@@ -3819,8 +3821,8 @@
     const confirmed = await showDialog({
       title: `Remove ${count} selected entries?`,
       message: syncNextcloudBibliography
-        ? "The selected entries will be removed from the global bibliography database and from the synchronized Nextcloud bibliography."
-        : "The selected entries will be removed from the global bibliography database.",
+        ? "The selected entries and all of their attached PDFs will be removed from the global bibliography database, browser storage or Nextcloud, and the synchronized Nextcloud bibliography."
+        : "The selected entries and all of their attached PDFs will be removed from the global bibliography database and browser storage or Nextcloud.",
       buttons: [
         { label: "Keep entries", value: false },
         { label: `Remove ${count} entries`, value: true, danger: true }
@@ -3829,6 +3831,8 @@
       danger: true
     });
     if (!confirmed) return;
+    setStatus(`Removing attachments for ${count} entries…`);
+    await globalThis.CollabTeXAttachmentStore.removeForEntries(removedEntries);
     removeEntryKeys([...selectedKeys]);
     await saveDatabase(`Removed ${count} entries.`);
     await propagateRemovedEntriesToNextcloud(removedEntries);
