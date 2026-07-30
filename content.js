@@ -2772,7 +2772,7 @@
     const result = await showAppDialog({
       title: `Remove ${selectedDrafts.length} selected entr${selectedDrafts.length === 1 ? "y" : "ies"}?`,
       message:
-        "The selected entries will be marked for removal. No BibTeX file is changed until you click Update Bib.",
+        "The selected entries will be marked for removal. When Update Bib writes the changes, their attached PDFs will also be deleted from browser storage or Nextcloud.",
       buttons: [
         { label: "Keep entries", value: false },
         { label: selectedDrafts.length === 1 ? "Remove selected entry" : `Remove ${selectedDrafts.length} selected entries`, value: true, danger: true }
@@ -5127,7 +5127,7 @@
     if (action === "remove-entry") {
       const confirmed = await showAppDialog({
         title: `Remove ${draft.key}?`,
-        message: `This entry will be marked for removal from ${draft.sourceFile || "the bibliography"}. The BibTeX file is changed only after you click Update Bib.`,
+        message: `This entry will be marked for removal from ${draft.sourceFile || "the bibliography"}. When Update Bib writes the change, its attached PDFs will also be deleted from browser storage or Nextcloud.`,
         buttons: [
           { label: "Keep entry", value: false },
           { label: "Remove entry", value: true, danger: true }
@@ -6612,6 +6612,10 @@
       // the beginning. Untouched bibliography text is never replaced wholesale.
       let workingText = text;
       for (const replacement of replacements) {
+        if (replacement.deletion) {
+          managerSetStatus(`Removing attachments for ${replacement.lookupKey}…`);
+          await globalThis.CollabTeXAttachmentStore.removeForEntries([replacement.draft]);
+        }
         const response = await bridgeRequest(
           "replaceRange",
           { start: replacement.start, end: replacement.end, text: replacement.text },
