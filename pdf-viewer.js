@@ -122,6 +122,25 @@ function postToParent(message, transfer = []) {
   }
 }
 
+viewerElement.addEventListener('click', (event) => {
+  const link = event.target.closest('a[href]');
+  if (!link || !viewerElement.contains(link)) return;
+  let url;
+  try {
+    url = new URL(link.href, location.href);
+  } catch (_error) {
+    return;
+  }
+  if (!/^https?:$/.test(url.protocol)) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  postToParent({
+    type: 'ctca-pdf-link-request',
+    attachmentId: attachmentId(),
+    url: url.href
+  });
+}, true);
+
 function setStatus(message, { error = false, success = false, persistent = false } = {}) {
   window.clearTimeout(statusTimer);
   status.hidden = !message;
@@ -869,6 +888,18 @@ eventBus.on('annotationeditorstateschanged', ({ details }) => {
   $('#pv-redo').disabled = !details.hasSomethingToRedo;
 });
 
+function runEditorHistoryAction(action) {
+  const button = action === 'undo' ? $('#pv-undo') : $('#pv-redo');
+  if (!editorManager || button.disabled) return false;
+  editorManager[action]();
+  // PDF.js updates the annotation editors during undo/redo, but does not
+  // consistently notify annotationStorage that the document changed.
+  // Treat the completed history action as a new revision so the normal
+  // autosave path persists it, including when another save is in progress.
+  setDirty(true, { increment: true });
+  return true;
+}
+
 eventBus.on('pagechanging', refreshPageUi);
 eventBus.on('scalechanging', refreshPageUi);
 eventBus.on('pagesloaded', refreshPageUi);
@@ -987,8 +1018,8 @@ pageInput.addEventListener('change', () => {
 $('#pv-zoom-out').addEventListener('click', () => pdfViewer.decreaseScale());
 $('#pv-zoom-in').addEventListener('click', () => pdfViewer.increaseScale());
 $('#pv-fit').addEventListener('click', () => { pdfViewer.currentScaleValue = 'page-width'; });
-$('#pv-undo').addEventListener('click', () => editorManager?.undo());
-$('#pv-redo').addEventListener('click', () => editorManager?.redo());
+$('#pv-undo').addEventListener('click', () => runEditorHistoryAction('undo'));
+$('#pv-redo').addEventListener('click', () => runEditorHistoryAction('redo'));
 downloadButton.addEventListener('click', () => {
   postToParent({ type: 'ctca-pdf-download-request', attachmentId: attachmentId() });
 });

@@ -40,13 +40,23 @@
       .filter(Boolean);
   }
 
+  function normalizeJournalSitePattern(value) {
+    return String(value || "").trim().replace(/\/+$/, "");
+  }
+
+  function journalSitePatternsFromForm() {
+    return [...new Set(
+      patterns.value
+        .split(/\r?\n/)
+        .map(normalizeJournalSitePattern)
+        .filter((value) => value && !value.startsWith("#"))
+    )];
+  }
+
   function settingsFromForm() {
     return {
       ...loadedSettings,
-      pagePatterns: patterns.value
-        .split(/\r?\n/)
-        .map((value) => value.trim())
-        .filter((value) => value && !value.startsWith("#")),
+      pagePatterns: journalSitePatternsFromForm(),
       preferredAction: preferredAction.value,
       userName: userName.value.trim(),
       authorInstitutions: institutionLines(),
@@ -80,7 +90,10 @@
       .join("\n");
     openAlexApiKey.value = String(stored.openAlexApiKey || "");
     openAlexAuthorId.value = String(stored.openAlexAuthorId || "");
-    patterns.value = (Array.isArray(stored.pagePatterns) ? stored.pagePatterns : defaults.pagePatterns).join("\n");
+    patterns.value = (Array.isArray(stored.pagePatterns) ? stored.pagePatterns : defaults.pagePatterns)
+      .map(normalizeJournalSitePattern)
+      .filter(Boolean)
+      .join("\n");
     preferredAction.value = ["ask", "journal", "smart-citations"].includes(stored.preferredAction)
       ? stored.preferredAction
       : defaults.preferredAction;

@@ -216,6 +216,7 @@
   let managerCloseCommitRequested = false;
   let managerListRenderTimer = null;
   let managerSearchRenderTimer = null;
+  let managerPdfLinkRequestInProgress = false;
   let managerCategoryListRenderRevision = 0;
   let managerWorkspaceTab = "bibliography";
   let managerRenderingPdfEntryDetails = false;
@@ -1537,6 +1538,10 @@
       const attachment = data?.attachment;
       if (!attachment || (message.attachmentId && message.attachmentId !== attachment.id)) return;
 
+      if (message.type === 'ctca-pdf-link-request') {
+        managerHandlePdfLinkRequest(message.url).catch((error) => managerSetStatus(error?.message || String(error), true));
+        return;
+      }
       if (message.type === 'ctca-pdf-viewer-ready') {
         data.viewerReady = true;
         frame.contentWindow.postMessage({
@@ -6374,7 +6379,7 @@
       await Promise.allSettled(
         [...webOpenTabIds].map((tabId) => globalThis.CollabTeXAttachmentStore.closeWebTab(tabId))
       );
-      return;
+      return [];
     }
 
     managerPdfAttachmentLoadingIds.add(draft.id);
@@ -6460,6 +6465,10 @@
       }
       await managerOfferAttachedPdfDoiUpdate(draft, attachedSources);
       await managerRenderPdfAttachmentList(draft);
+      if (options.openAfterAttach && attachedSources[0]?.attachment) {
+        await managerOpenPdfTab(draft, attachedSources[0].attachment);
+      }
+      return attachedSources.map((source) => source.attachment).filter(Boolean);
     } finally {
       await Promise.allSettled(
         [...webOpenTabIds].map((tabId) => globalThis.CollabTeXAttachmentStore.closeWebTab(tabId))
@@ -6658,6 +6667,35 @@
     return pdfName ? `${citationKey} — ${pdfName}` : citationKey;
   }
 
+
+  function managerSourcePdfAttachmentId(attachment) {
+    const id = String(attachment?.id || "");
+    const sharedId = String(attachment?.sharedCategoryId || "");
+    const prefix = sharedId ? `shared-${sharedId}-` : "";
+    return prefix && id.startsWith(prefix) ? id.slice(prefix.length) : id;
+  }
+
+  function managerPdfAttachmentsMatch(left, right) {
+    const leftId = String(left?.id || "");
+    const rightId = String(right?.id || "");
+    if (leftId && rightId && leftId === rightId) return true;
+    const leftSourceId = managerSourcePdfAttachmentId(left);
+    const rightSourceId = managerSourcePdfAttachmentId(right);
+    if (leftSourceId && rightSourceId && leftSourceId === rightSourceId) return true;
+    const sharedPath = (property) => {
+      const leftValue = String(left?.[property] || "").trim();
+      const rightValue = String(right?.[property] || "").trim();
+      return Boolean(leftValue && rightValue && leftValue === rightValue);
+    };
+    return sharedPath("remotePath") || sharedPath("localUrl") || sharedPath("localPath");
+  }
+
+  function managerOpenPdfTabIdForAttachment(attachment) {
+    for (const [tabId, data] of managerOpenPdfTabs) {
+      if (managerPdfAttachmentsMatch(data?.attachment, attachment)) return tabId;
+    }
+    return "";
+  }
 
   async function managerSendPdfDataToFrame(frame, attachment) {
     if (!frame?.contentWindow || !attachment) return;
@@ -6888,20 +6926,176 @@
   }
 
   async function managerOpenPdfTab(draft, attachment) {
-    const tabId = `pdf:${attachment.id}`;
-    const previous = managerOpenPdfTabs.get(tabId);
+    const directTabId = `pdf:${attachment.id}`;
+    if (managerOpenPdfTabs.has(directTabId)) {
+      await managerActivatePdfTab(directTabId);
+      return;
+    }
     const attachments = await globalThis.CollabTeXAttachmentStore.list({ key: draft.key, fields: draft.fields });
     const currentAttachment = attachments.find((item) => item.id === attachment.id) || attachment;
+    const existingTabId = managerOpenPdfTabIdForAttachment(currentAttachment);
+    if (existingTabId) {
+      await managerActivatePdfTab(existingTabId);
+      return;
+    }
+    const tabId = directTabId;
     managerOpenPdfTabs.set(tabId, {
-      ...previous,
       draftId: draft.id,
       entryKey: draft.key,
       attachment: currentAttachment,
       attachmentCount: attachments.length,
-      notesCollapsed: previous?.notesCollapsed || false,
-      detailsCollapsed: previous?.detailsCollapsed || false
+      notesCollapsed: false,
+      detailsCollapsed: false
     });
     await managerActivatePdfTab(tabId);
+  }
+
+  function managerDoiFromPdfLink(value) {
+    try {
+      const url = new URL(String(value || ""));
+      const host = url.hostname.toLowerCase().replace(/^www\./, "");
+      if (host !== "doi.org" && host !== "dx.doi.org") return "";
+      const doi = normalizeDoiInput(decodeURIComponent(url.pathname.replace(/^\/+/, "")));
+      return DOI_PATTERN.test(doi) ? doi : "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  async function managerOpenPdfLinkInBrowser(value) {
+    const response = await extensionApi.runtime.sendMessage({
+      type: "ctca-open-external-tab",
+      url: value,
+      active: true
+    });
+    if (!response?.ok) throw new Error(response?.error || "The link could not be opened.");
+  }
+
+  async function managerCreateDraftFromPdfDoi(doi) {
+    if (!managerFiles.length) await managerLoadBibliography({ saveDirty: false });
+    const targetFile = managerFiles[0];
+    if (!targetFile) throw new Error("No writable BibTeX file is configured.");
+
+    managerSetStatus(`Retrieving DOI metadata for ${doi}â€¦`);
+    const metadata = await fetchDoiMetadata(doi);
+    const key = generateCitationKey(metadata, [...managerDrafts.values()].map((draft) => draft.key));
+    const wrappedFields = metadataToBibFields({ ...metadata, doi: metadata.doi || doi }, null);
+    const timestamp = new Date().toISOString();
+    const fields = {
+      ...normalizeFieldMapForEditing(wrappedFields),
+      [CTCA_ADDED_ON_FIELD]: timestamp,
+      [CTCA_DOI_SYNC_FIELD]: timestamp
+    };
+    const syntheticRecord = {
+      key,
+      type: metadata.entryType || "misc",
+      sourceFile: targetFile,
+      fields: Object.fromEntries(
+        Object.entries(fields).map(([name, value]) => [name, managerWrapBibValue(value)])
+      )
+    };
+    const draft = draftFromRecord(syntheticRecord);
+    draft.originalKey = "";
+    draft.key = key;
+    draft.fields = fields;
+    managerRecords.push(syntheticRecord);
+    managerDrafts.set(draft.id, draft);
+    managerDirtyIds.add(draft.id);
+    managerSessionChanged = true;
+    managerNewEntryKeys.add(key.toLowerCase());
+    managerMarkDoiSynced(draft, timestamp);
+    if (
+      !["all", "starred", "uncategorized"].includes(managerSelectedCategoryId)
+      && !managerCategoryIsReadOnly(managerSelectedCategoryId)
+    ) {
+      managerSetEntryCategoryIds(draft.id, [managerSelectedCategoryId]);
+      managerMarkCategoryTreeDirty();
+    }
+    scheduleFastManagerCentralSync(draft);
+    renderManagerCategories();
+    renderManagerList();
+    updateManagerCount();
+    managerSetStatus(`Prepared ${key}. Attach a PDF, then click Update Bib or close the window to add it to ${targetFile}.`);
+    return draft;
+  }
+
+  async function managerHandlePdfLinkRequest(value) {
+    if (managerPdfLinkRequestInProgress) return;
+    managerPdfLinkRequestInProgress = true;
+    try {
+      const url = new URL(String(value || ""));
+      if (!/^https?:$/.test(url.protocol)) throw new Error("Only HTTP or HTTPS links can be opened.");
+      const doi = managerDoiFromPdfLink(url.href);
+      if (!doi) {
+        await managerOpenPdfLinkInBrowser(url.href);
+        return;
+      }
+
+      let draft = [...managerDrafts.values()].find((candidate) =>
+        candidate.centralPreview !== true
+        && normalizeDoiInput(candidate?.fields?.doi || "").toLowerCase() === doi.toLowerCase()
+      ) || null;
+      if (draft) {
+        const attachments = await globalThis.CollabTeXAttachmentStore.list({ key: draft.key, fields: draft.fields });
+        if (attachments.length) {
+          await managerOpenPdfTab(draft, attachments[0]);
+          return;
+        }
+        const readOnly = managerEntryIsReadOnly(draft.id);
+        const choice = await showAppDialog({
+          title: "DOI entry has no PDF",
+          message: readOnly
+            ? `${draft.key} matches ${doi}, but this shared entry is read-only and cannot receive an attachment.`
+            : `${draft.key} matches ${doi}, but it has no attached PDF. Would you like to look for the manuscript or open the DOI page in a browser tab?`,
+          buttons: readOnly
+            ? [
+                { label: "Cancel", value: null },
+                { label: "Open DOI page", value: "browser", primary: true }
+              ]
+            : [
+                { label: "Cancel", value: null },
+                { label: "Open DOI page", value: "browser" },
+                { label: "Try to download PDF", value: "download", primary: true }
+              ],
+          closeValue: null
+        });
+        if (choice === "browser") {
+          await managerOpenPdfLinkInBrowser(url.href);
+        } else if (choice === "download") {
+          await managerOpenAddPdfDialog(draft, {
+            getFromWeb: true,
+            sourceUrl: url.href,
+            openAfterAttach: true
+          });
+        }
+        return;
+      }
+
+      const choice = await showAppDialog({
+        title: "DOI not in the bibliography",
+        message: `${doi} is not in Smart Citations. Would you like to add it and look for the manuscript, or open the DOI page in a browser tab?`,
+        buttons: [
+          { label: "Cancel", value: null },
+          { label: "Open DOI page", value: "browser" },
+          { label: "Add entry and try download", value: "add", primary: true }
+        ],
+        closeValue: null
+      });
+      if (choice === "browser") {
+        await managerOpenPdfLinkInBrowser(url.href);
+        return;
+      }
+      if (choice !== "add") return;
+
+      draft = await managerCreateDraftFromPdfDoi(doi);
+      await managerOpenAddPdfDialog(draft, {
+        getFromWeb: true,
+        sourceUrl: url.href,
+        openAfterAttach: true
+      });
+    } finally {
+      managerPdfLinkRequestInProgress = false;
+    }
   }
 
   async function managerClosePdfTab(tabId) {

@@ -123,6 +123,7 @@
   let nextcloudSyncInProgress = false;
   let nextcloudSyncFailureCount = 0;
   let nextcloudSyncWaiters = [];
+  let pdfLinkRequestInProgress = false;
   let standaloneManagerPort = null;
   let standaloneCommandQueue = Promise.resolve();
   const NEXTCLOUD_SYNC_RETRY_DELAY_MS = 30 * 1000;
@@ -4872,18 +4873,55 @@
     return pdfName ? `${citationKey} — ${pdfName}` : citationKey;
   }
 
+  function sourcePdfAttachmentId(attachment) {
+    const id = String(attachment?.id || "");
+    const sharedId = String(attachment?.sharedCategoryId || "");
+    const prefix = sharedId ? `shared-${sharedId}-` : "";
+    return prefix && id.startsWith(prefix) ? id.slice(prefix.length) : id;
+  }
+
+  function pdfAttachmentsMatch(left, right) {
+    const leftId = String(left?.id || "");
+    const rightId = String(right?.id || "");
+    if (leftId && rightId && leftId === rightId) return true;
+    const leftSourceId = sourcePdfAttachmentId(left);
+    const rightSourceId = sourcePdfAttachmentId(right);
+    if (leftSourceId && rightSourceId && leftSourceId === rightSourceId) return true;
+    const sharedPath = (property) => {
+      const leftValue = String(left?.[property] || "").trim();
+      const rightValue = String(right?.[property] || "").trim();
+      return Boolean(leftValue && rightValue && leftValue === rightValue);
+    };
+    return sharedPath("remotePath") || sharedPath("localUrl") || sharedPath("localPath");
+  }
+
+  function openPdfTabIdForAttachment(attachment) {
+    for (const [tabId, data] of openPdfTabs) {
+      if (pdfAttachmentsMatch(data?.attachment, attachment)) return tabId;
+    }
+    return "";
+  }
+
   async function openPdfTab(entry, attachment) {
-    const tabId = `pdf:${attachment.id}`;
-    const previous = openPdfTabs.get(tabId);
+    const directTabId = `pdf:${attachment.id}`;
+    if (openPdfTabs.has(directTabId)) {
+      await activateWorkspaceTab(directTabId);
+      return;
+    }
     const attachments = await globalThis.CollabTeXAttachmentStore.list(entry);
     const currentAttachment = attachments.find((item) => item.id === attachment.id) || attachment;
+    const existingTabId = openPdfTabIdForAttachment(currentAttachment);
+    if (existingTabId) {
+      await activateWorkspaceTab(existingTabId);
+      return;
+    }
+    const tabId = directTabId;
     openPdfTabs.set(tabId, {
-      ...previous,
       entryKey: entry.key,
       attachment: currentAttachment,
       attachmentCount: attachments.length,
-      notesCollapsed: previous?.notesCollapsed || false,
-      detailsCollapsed: previous?.detailsCollapsed || false
+      notesCollapsed: false,
+      detailsCollapsed: false
     });
     await activateWorkspaceTab(tabId);
   }
@@ -5724,6 +5762,129 @@
       .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "")
       .replace(/[\s<>]+/g, "")
       .replace(/[),.;]+$/, "");
+  }
+
+  function doiFromPdfLink(value) {
+    try {
+      const url = new URL(String(value || ""));
+      const host = url.hostname.toLowerCase().replace(/^www\./, "");
+      if (host !== "doi.org" && host !== "dx.doi.org") return "";
+      const doi = normalizeDoi(decodeURIComponent(url.pathname.replace(/^\/+/, "")));
+      return /^10\.\d{4,9}\/\S+$/i.test(doi) ? doi : "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  async function openPdfLinkInBrowser(value) {
+    const response = await extensionApi.runtime.sendMessage({
+      type: "ctca-open-external-tab",
+      url: value,
+      active: true
+    });
+    if (!response?.ok) throw new Error(response?.error || "The link could not be opened.");
+  }
+
+  async function createEntryFromPdfDoi(doi) {
+    setStatus(`Retrieving DOI metadata for ${doi}â€¦`);
+    const metadata = await fetchDoiMetadata(doi);
+    const now = new Date().toISOString();
+    const entry = {
+      key: "",
+      type: metadata.entryType || "article",
+      fields: { doi },
+      aliases: [],
+      tags: [],
+      updatedAt: now,
+      doiSyncedAt: now,
+      addedOn: now,
+      starred: false
+    };
+    mergeMetadata(entry, { ...metadata, doi: metadata.doi || doi });
+    entry.key = generatedKey(entry.fields);
+    entries.push(entry);
+    markDirty(`Saving ${entry.key}â€¦`);
+    await saveDatabase(`Added ${entry.key} from DOI metadata.`);
+    return entry;
+  }
+
+  async function handlePdfLinkRequest(value) {
+    if (pdfLinkRequestInProgress) return;
+    pdfLinkRequestInProgress = true;
+    try {
+      const url = new URL(String(value || ""));
+      if (!/^https?:$/.test(url.protocol)) throw new Error("Only HTTP or HTTPS links can be opened.");
+      const doi = doiFromPdfLink(url.href);
+      if (!doi) {
+        await openPdfLinkInBrowser(url.href);
+        return;
+      }
+
+      let entry = entries.find((candidate) =>
+        normalizeDoi(candidate?.fields?.doi || "").toLowerCase() === doi.toLowerCase()
+      ) || null;
+      if (entry) {
+        const attachments = await globalThis.CollabTeXAttachmentStore.list(entry);
+        if (attachments.length) {
+          await openPdfTab(entry, attachments[0]);
+          return;
+        }
+        const readOnly = isReadOnlySharedEntry(entry.key);
+        const choice = await showDialog({
+          title: "DOI entry has no PDF",
+          message: readOnly
+            ? `${entry.key} matches ${doi}, but this shared entry is read-only and cannot receive an attachment.`
+            : `${entry.key} matches ${doi}, but it has no attached PDF. Would you like to look for the manuscript or open the DOI page in a browser tab?`,
+          buttons: readOnly
+            ? [
+                { label: "Cancel", value: null },
+                { label: "Open DOI page", value: "browser", primary: true }
+              ]
+            : [
+                { label: "Cancel", value: null },
+                { label: "Open DOI page", value: "browser" },
+                { label: "Try to download PDF", value: "download", primary: true }
+              ],
+          closeValue: null
+        });
+        if (choice === "browser") {
+          await openPdfLinkInBrowser(url.href);
+        } else if (choice === "download") {
+          await openAddPdfDialog(entry, {
+            getFromWeb: true,
+            sourceUrl: url.href,
+            openAfterAttach: true
+          });
+        }
+        return;
+      }
+
+      const choice = await showDialog({
+        title: "DOI not in the bibliography",
+        message: `${doi} is not in Smart Citations. Would you like to add it and look for the manuscript, or open the DOI page in a browser tab?`,
+        buttons: [
+          { label: "Cancel", value: null },
+          { label: "Open DOI page", value: "browser" },
+          { label: "Add entry and try download", value: "add", primary: true }
+        ],
+        closeValue: null
+      });
+      if (choice === "browser") {
+        await openPdfLinkInBrowser(url.href);
+        return;
+      }
+      if (choice !== "add") return;
+
+      entry = await createEntryFromPdfDoi(doi);
+      renderAll();
+      await openAddPdfDialog(entry, {
+        getFromWeb: true,
+        sourceUrl: url.href,
+        openAfterAttach: true
+      });
+    } finally {
+      pdfLinkRequestInProgress = false;
+    }
   }
 
   function wasUpdatedFromDoi(entry) {
@@ -7728,6 +7889,10 @@
       const attachment = data?.attachment;
       if (!attachment || (message.attachmentId && message.attachmentId !== attachment.id)) return;
 
+      if (message.type === "ctca-pdf-link-request") {
+        handlePdfLinkRequest(message.url).catch((error) => setStatus(error?.message || String(error), true));
+        return;
+      }
       if (message.type === "ctca-pdf-viewer-ready") {
         data.viewerReady = true;
         frame.contentWindow.postMessage({
