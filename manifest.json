@@ -101,6 +101,9 @@
     "file:///*"
   ],
   "background": {
+    "scripts": [
+      "background.js"
+    ],
     "service_worker": "background.js"
   },
   "optional_host_permissions": [

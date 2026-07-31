@@ -2,14 +2,14 @@
 
 **Current version: 2.0**
 
-Smart Citations is a browser extension for building a personal BibTeX library, reusing it in CollabTeX and Overleaf, and keeping the papers behind those citations close at hand. It combines citation autocomplete, bibliography management, PDF capture, a built-in reader, annotations, notes, and optional Nextcloud synchronization.
-
-The central idea is simple: a journal link should not make you start over. Once a paper is in Smart Citations, you can return to your own attached PDF—with your highlights, comments, drawings, and notes—instead of repeatedly opening a clean copy on the publisher site.
+Smart Citations is a browser extension for building a personal BibTeX library, reusing it in CollabTeX and Overleaf, and keeping the papers behind those citations close at hand. It combines citation autocomplete, bibliography management, ORCID-based publication discovery, author-impact statistics, PDF capture, a built-in reader, annotations, notes, and optional Nextcloud synchronization.
 
 ## Highlights
 
 - **Citation autocomplete in CollabTeX and Overleaf.** Type inside a supported `\cite{...}` command and search by citation key, author, title, keyword, abstract text, or DOI.
 - **A central personal bibliography.** Browse, edit, import, export, categorize, tag, star, search, and reuse BibTeX entries across projects.
+- **ORCID publication discovery.** Link an ORCID account through the official sign-in flow and review new authored or co-authored papers that are not yet in the library.
+- **Authorship and impact views.** Automatically collect first-authored and co-authored papers into dedicated categories, show OpenAlex citation counts, and review author-level impact metrics and citation history.
 - **Add entries directly from PDFs.** Smart Citations reads each PDF, finds its DOI, retrieves metadata, generates a citation key, and attaches the file.
 - **Fast PDF attachment.** Attach multiple named PDFs from a file picker, or drag a PDF directly onto an existing bibliography row.
 - **Journal PDF handoff.** On configured journal pages, PDF links can open your existing annotated attachment or create a new entry and capture the journal PDF.
@@ -52,8 +52,9 @@ Project synchronization is optional. You can keep a project bibliography indepen
 3. For the quickest PDF-first workflow, open the **+** menu and choose **Add new entry from PDF**.
 4. Drop one or more PDFs into the import area, or select them from the computer. Smart Citations scans each file for a DOI, retrieves its bibliography metadata, and creates or updates the matching entry.
 5. Organize the library with categories, nested categories, tags, stars, and advanced search filters.
-6. Open any attached PDF in a workspace tab. Add highlights, text, drawings, comments, or longer notes, then save the annotated PDF.
-7. Use the launcher button in the manager header if you want a bookmarkable direct link or a Windows desktop shortcut for the standalone library.
+6. Open the extension options and enter your published author name, or link your ORCID account, to populate **My authorships** and **My co-authorships** automatically. Add a free OpenAlex API key to enable citation counts and author-impact statistics.
+7. Open any attached PDF in a workspace tab. Add highlights, text, drawings, comments, or longer notes, then save the annotated PDF.
+8. Use the launcher button in the manager header if you want a bookmarkable direct link or a Windows desktop shortcut for the standalone library.
 
 ## Working with PDFs
 
@@ -125,6 +126,43 @@ The standalone and in-project managers provide the same core library tools:
 
 The central library is stored in the browser profile and is available to both the standalone manager and supported project pages in that browser profile.
 
+## Authorship discovery and author impact
+
+### Find new papers through ORCID
+
+Open the extension options and choose **Sign in and link ORCID**. Smart Citations uses ORCID's official authorization flow, records the authenticated ORCID iD, and loads the public author name and affiliations. The linked identity also improves exact author matching for OpenAlex.
+
+After an account is linked, Smart Citations checks its public ORCID works for DOI-backed publications that are not already in the central library. Automatic checks run at most once every 24 hours; **Check ORCID for new manuscripts now** in the options starts a manual check.
+
+When new authored or co-authored papers are found:
+
+1. Smart Citations retrieves full publication details from the DOI.
+2. A review dialog lists the title, authors, journal, volume, issue, pages, year, and DOI.
+3. Select the papers to import as complete bibliography entries.
+4. Papers left unselected are remembered, but remain available for reconsideration in a later check.
+
+Works without a DOI, works already present in the library, and works whose DOI metadata cannot be retrieved are not imported automatically. If the public ORCID record has no usable works, Smart Citations can use the OpenAlex profile linked to the ORCID iD as a fallback.
+
+### Review authorships and impact
+
+Set **Your author name** in the extension options, or let the linked ORCID profile fill it. Smart Citations compares that name with each entry's author list and maintains two automatic categories:
+
+- **My authorships** contains papers where the configured author is listed first.
+- **My co-authorships** contains papers where the configured author appears later in the author list.
+
+Full given names and matching initials are recognized. Optional institution entries can disambiguate name-based OpenAlex matches.
+
+Add a free OpenAlex API key in the extension options to enable:
+
+- citation counts on individual bibliography records;
+- an **Author impact** panel in the two automatic authorship categories;
+- h-index, i10-index, total citations, total works, citations per work, and OpenAlex's two-year mean citedness when available; and
+- a citations-per-year chart for the history available from OpenAlex.
+
+The impact panel uses the linked ORCID iD for exact matching by default. An OpenAlex author ID can be supplied as a fallback when ORCID is not linked; without either identifier, Smart Citations can infer a profile from matching library references, the configured author name, and institutions. Institution filters also limit the displayed impact metrics to works on which the matched author has one of those affiliations.
+
+OpenAlex results are cached and refreshed at most once every 24 hours. These metrics reflect OpenAlex coverage and can differ from Google Scholar, Web of Science, or Scopus.
+
 ## PDF storage choices
 
 | Storage | What it does | Best for |
@@ -169,11 +207,13 @@ The supplied XPI is unsigned and intended for temporary or developer installatio
 
 ## Privacy and network access
 
-Bibliography data, categories, tags, settings, project synchronization state, backups, and browser-stored PDFs remain in the browser profile unless Nextcloud synchronization is enabled.
+Bibliography data, categories, tags, author settings, ORCID linking details, cached OpenAlex results, project synchronization state, backups, and browser-stored PDFs remain in the browser profile unless Nextcloud synchronization is enabled.
 
 Network access is used for:
 
 - explicit DOI metadata retrieval from Crossref, DataCite, and `doi.org`;
+- ORCID sign-in, public-profile lookup, and publication discovery when an ORCID account is linked;
+- citation counts and author-impact statistics from OpenAlex when an API key is configured;
 - a connected Nextcloud server;
 - journal-page inspection and PDF download when the user invokes or remembers the Smart Citations journal workflow; and
 - opening ordinary publisher or DOI links selected by the user.
