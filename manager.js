@@ -317,7 +317,14 @@
             id: category.id,
             name: String(category.name || "Untitled category"),
             parentId: String(category.parentId || ""),
-            order: Number.isFinite(Number(category.order)) ? Number(category.order) : index
+            order: Number.isFinite(Number(category.order)) ? Number(category.order) : index,
+            ...(category.shared && typeof category.shared === "object"
+              ? { shared: {
+                  ...category.shared,
+                  categoryIds: { ...(category.shared.categoryIds || {}) },
+                  entryKeys: { ...(category.shared.entryKeys || {}) }
+                } }
+              : {})
           }))
       : [];
     const validIds = new Set(categories.map((category) => category.id));
@@ -803,6 +810,43 @@
     return parts.join(" / ");
   }
 
+  function sharedCategoryRoot(categoryId) {
+    let current = categoryById(categoryId);
+    const visited = new Set();
+    while (current && !visited.has(current.id)) {
+      visited.add(current.id);
+      if (current.shared?.id) return current;
+      current = categoryById(current.parentId);
+    }
+    return null;
+  }
+
+  function sharedCategoryForEntry(key) {
+    return entryCategoryIds(key).map(sharedCategoryRoot).find(Boolean) || null;
+  }
+
+  function isReadOnlySharedCategory(categoryId) {
+    const rootCategory = sharedCategoryRoot(categoryId);
+    return Boolean(rootCategory?.shared?.role === "member" && rootCategory.shared.permission !== "write");
+  }
+
+  function isReadOnlySharedEntry(key) {
+    const rootCategory = sharedCategoryForEntry(key);
+    return Boolean(rootCategory?.shared?.role === "member" && rootCategory.shared.permission !== "write");
+  }
+
+  function updateSharedLocalKeyOverride(oldKey, newKey) {
+    for (const category of categoryState.categories) {
+      if (!category.shared?.id) continue;
+      const entryKeys = { ...(category.shared.entryKeys || {}) };
+      const canonicalKey = Object.keys(entryKeys).find((key) => String(entryKeys[key]).toLowerCase() === String(oldKey).toLowerCase());
+      if (canonicalKey) {
+        entryKeys[canonicalKey] = newKey;
+        category.shared.entryKeys = entryKeys;
+      }
+    }
+  }
+
   function entryCategoryIds(key) {
     return Array.isArray(categoryState.memberships[key])
       ? categoryState.memberships[key].filter((id) => Boolean(categoryById(id)))
@@ -951,6 +995,19 @@
 
     const renderBranch = (parentId, depth) => {
       for (const category of categoryChildren(parentId)) {
+        const categorySharedRoot = sharedCategoryRoot(category.id);
+        const sharedStatusClass = categorySharedRoot?.shared?.syncStatus === "error"
+          ? "ctca-shared-error"
+          : categorySharedRoot?.shared?.role === "owner"
+            ? "ctca-shared-owner"
+            : "";
+        const sharedTitle = categorySharedRoot
+          ? categorySharedRoot.shared.syncStatus === "error"
+            ? `Last shared-category sync failed: ${categorySharedRoot.shared.syncError || "Unknown error"}`
+            : categorySharedRoot.shared.role === "owner"
+              ? "You own this shared category"
+              : `Shared category (${categorySharedRoot.shared.permission === "write" ? "read and write" : "read only"})`
+          : "";
         const row = document.createElement("div");
         row.className = "ctca-manager-category-row";
         row.classList.toggle("ctca-manager-category-selected", selectedCategoryId === category.id);
@@ -960,23 +1017,69 @@
         row.innerHTML = `
           <span class="ctca-manager-category-handle" title="Drag to reorder or nest" aria-hidden="true">⋮⋮</span>
           <button type="button" class="ctca-manager-category-name" title="${escapeHtml(categoryPath(category.id))}">${escapeHtml(category.name)}</button>
+          ${categorySharedRoot ? `<button type="button" class="ctca-manager-category-share-icon ${sharedStatusClass}" title="${escapeHtml(sharedTitle)}" aria-label="${escapeHtml(`${sharedTitle}. Open sharing menu`)}" aria-haspopup="menu">&#128279;&#xfe0e;</button>` : ""}
           <span class="ctca-manager-category-count">${categoryCount(category.id)}</span>
         `;
         $(".ctca-manager-category-name", row).addEventListener("click", () => {
           selectCategory(category.id);
+        });
+        $(".ctca-manager-category-share-icon", row)?.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          hideEntryContextMenu();
+          const menu = $(".ctca-category-context-menu", root);
+          menu.dataset.categoryId = categorySharedRoot.id;
+          $(".ctca-category-add-child", menu).hidden = true;
+          $(".ctca-category-share", menu).hidden = true;
+          $(".ctca-category-view-share-link", menu).hidden = false;
+          const stopButton = $(".ctca-category-stop-sharing", menu);
+          stopButton.hidden = false;
+          stopButton.textContent = categorySharedRoot.shared.role === "owner" ? "Stop sharing…" : "Stop remote sync…";
+          $(".ctca-category-remove", menu).hidden = true;
+          delete menu.dataset.pointerEntered;
+          menu.onpointerenter = () => { menu.dataset.pointerEntered = "true"; };
+          menu.onpointerleave = () => {
+            if (menu.dataset.pointerEntered === "true") hideCategoryContextMenu();
+          };
+          const bounds = event.currentTarget.getBoundingClientRect();
+          menu.style.left = `${Math.min(bounds.right, window.innerWidth - 220)}px`;
+          menu.style.top = `${Math.min(bounds.bottom + 2, window.innerHeight - 110)}px`;
+          menu.hidden = false;
         });
         row.addEventListener("contextmenu", (event) => {
           event.preventDefault();
           hideEntryContextMenu();
           const menu = $(".ctca-category-context-menu", root);
           menu.dataset.categoryId = category.id;
+          const sharedRoot = sharedCategoryRoot(category.id);
+          const isSharedRoot = sharedRoot?.id === category.id;
+          const readOnly = isReadOnlySharedCategory(category.id);
+          const addChildButton = $(".ctca-category-add-child", menu);
+          const shareButton = $(".ctca-category-share", menu);
+          const viewShareLinkButton = $(".ctca-category-view-share-link", menu);
+          const stopButton = $(".ctca-category-stop-sharing", menu);
+          const removeButton = $(".ctca-category-remove", menu);
+          addChildButton.hidden = false;
+          addChildButton.disabled = readOnly;
+          addChildButton.title = readOnly ? "This shared category is read-only." : "Add a subcategory";
+          shareButton.hidden = isSharedRoot;
+          shareButton.disabled = Boolean(!nextcloudConnected || !syncNextcloudBibliography || sharedRoot);
+          shareButton.title = !nextcloudConnected || !syncNextcloudBibliography
+            ? "Connect Nextcloud and enable bibliography synchronization to share categories."
+            : sharedRoot
+              ? "Subcategories of a shared category cannot be shared again."
+              : "Share this category through Nextcloud";
+          viewShareLinkButton.hidden = !sharedRoot;
+          stopButton.hidden = !isSharedRoot;
+          if (isSharedRoot) stopButton.textContent = sharedRoot.shared.role === "owner" ? "Stop sharing…" : "Stop remote sync…";
+          removeButton.hidden = false;
           delete menu.dataset.pointerEntered;
           menu.onpointerenter = () => { menu.dataset.pointerEntered = "true"; };
           menu.onpointerleave = () => {
             if (menu.dataset.pointerEntered === "true") hideCategoryContextMenu();
           };
           menu.style.left = `${Math.min(event.clientX, window.innerWidth - 220)}px`;
-          menu.style.top = `${Math.min(event.clientY, window.innerHeight - 90)}px`;
+          menu.style.top = `${Math.min(event.clientY, window.innerHeight - 180)}px`;
           menu.hidden = false;
         });
         row.addEventListener("dragstart", (event) => {
@@ -1050,6 +1153,16 @@
     if (!category || !target) return;
     const oldParentId = category.parentId;
     const newParentId = mode === "inside" ? target.id : target.parentId;
+    const sourceSharedRoot = sharedCategoryRoot(categoryId);
+    const targetSharedRoot = sharedCategoryRoot(newParentId);
+    if (isReadOnlySharedCategory(categoryId) || isReadOnlySharedCategory(newParentId)) {
+      setStatus("This shared category is read-only.", true);
+      return;
+    }
+    if (sourceSharedRoot?.id === categoryId || (sourceSharedRoot && sourceSharedRoot.id !== targetSharedRoot?.id)) {
+      setStatus("A shared category tree cannot be moved outside its shared root.", true);
+      return;
+    }
     if (!canMoveCategory(categoryId, newParentId)) return;
     category.parentId = newParentId;
     const siblings = categoryChildren(newParentId).filter((item) => item.id !== categoryId);
@@ -1067,6 +1180,10 @@
 
   function assignEntriesToCategory(keys, categoryId) {
     if (!categoryById(categoryId)) return;
+    if (isReadOnlySharedCategory(categoryId)) {
+      setStatus("Entries cannot be added to a read-only shared category.", true);
+      return;
+    }
     for (const key of keys) {
       const memberships = new Set(entryCategoryIds(key));
       memberships.add(categoryId);
@@ -1150,6 +1267,59 @@
     };
   }
 
+  function activeManagerTagFilterSet() {
+    return new Set(
+      globalThis.CollabTeXSearchTools.activeTagFilters(query)
+        .map((tag) => tag.toLocaleLowerCase())
+    );
+  }
+
+  function managerRowTagsHtml(entry) {
+    const activeTags = activeManagerTagFilterSet();
+    const tags = globalThis.CollabTeXSearchTools.splitTags(entry.tags || entry.fields?.ctca_tags || "");
+    if (!tags.length) return "";
+    return `<span class="ctca-manager-row-tags" aria-label="Tags">${tags.map((tag) => {
+      const selected = activeTags.has(tag.toLocaleLowerCase());
+      return `<button type="button" class="ctca-manager-row-tag${selected ? " ctca-manager-row-tag-selected" : ""}" data-manager-list-tag="${escapeHtml(tag)}" aria-pressed="${selected ? "true" : "false"}" title="${selected ? "Remove" : "Filter by"} tag ${escapeHtml(tag)}">${escapeHtml(tag)}</button>`;
+    }).join("")}<button type="button" class="ctca-manager-row-tag ctca-manager-row-tag-overflow" title="Show all tags in details" aria-label="Show all tags in details" hidden>...</button></span>`;
+  }
+
+  function fitManagerRowTags(row) {
+    const container = row.querySelector(".ctca-manager-row-tags");
+    const overflow = container?.querySelector(".ctca-manager-row-tag-overflow");
+    if (!container || !overflow) return;
+    const chips = [...container.querySelectorAll(".ctca-manager-row-tag[data-manager-list-tag]")];
+    chips.forEach((chip) => { chip.hidden = false; });
+    overflow.hidden = true;
+    const gap = Number.parseFloat(getComputedStyle(container).columnGap) || 0;
+    const chipWidths = chips.map((chip) => chip.getBoundingClientRect().width);
+    const totalChipWidth = chipWidths.reduce((sum, width) => sum + width, 0) + gap * Math.max(0, chips.length - 1);
+    const availableWidth = container.clientWidth;
+    if (totalChipWidth <= availableWidth + 1) return;
+    overflow.hidden = false;
+    overflow.style.visibility = "hidden";
+    const overflowWidth = overflow.getBoundingClientRect().width;
+    overflow.style.removeProperty("visibility");
+    let usedWidth = overflowWidth;
+    for (let index = 0; index < chips.length; index += 1) {
+      const nextWidth = chipWidths[index] + gap;
+      const fits = usedWidth + nextWidth <= availableWidth + 1;
+      chips[index].hidden = !fits;
+      if (fits) usedWidth += nextWidth;
+    }
+  }
+
+  function toggleManagerListTag(tag) {
+    window.clearTimeout(searchRenderTimer);
+    searchRenderTimer = null;
+    query = globalThis.CollabTeXSearchTools.toggleTagFilter(query, tag);
+    const searchInput = $(".ctca-manager-search", root);
+    searchInput.value = query;
+    $(".ctca-manager-search-clear", root).hidden = !query;
+    renderList();
+    searchInput.focus();
+  }
+
   function virtualListRowHeight() {
     return columnVisibility.authors ? 78 : 60;
   }
@@ -1229,7 +1399,7 @@
       volume ? `<strong>${escapeHtml(volume)}</strong>` : "",
       pages ? escapeHtml(pages) : ""
     ].filter(Boolean).join(", ") || "Publication not specified";
-    const publicationHtml = `<span class="ctca-manager-publication-text">${publicationBaseHtml}${!columnVisibility.year && year ? ` (${escapeHtml(year)})` : ""}</span>`;
+    const publicationHtml = `<span class="ctca-manager-publication-text">${publicationBaseHtml}${!columnVisibility.year && year ? ` (${escapeHtml(year)})` : ""}</span>${managerRowTagsHtml(entry)}`;
     const specifiedUrl = specifiedHttpUrl(entry);
     const doiSynchronized = wasUpdatedFromDoi(entry);
     const doiSyncTitle = doiSynchronized
@@ -1280,7 +1450,7 @@
     };
 
     row.addEventListener("click", (event) => {
-      if (event.target.closest(".ctca-manager-row-checkbox, .ctca-manager-row-star, .ctca-manager-row-doi-sync, .ctca-manager-row-pdf-action, .ctca-manager-author-eye, .ctca-manager-condensed-author")) return;
+      if (event.target.closest(".ctca-manager-row-checkbox, .ctca-manager-row-star, .ctca-manager-row-doi-sync, .ctca-manager-row-pdf-action, .ctca-manager-author-eye, .ctca-manager-condensed-author, .ctca-manager-row-tag")) return;
       activate(event);
     });
     row.addEventListener("contextmenu", (event) => {
@@ -1290,7 +1460,7 @@
       });
     });
     row.addEventListener("keydown", (event) => {
-      if (event.target.closest(".ctca-manager-row-doi-sync, .ctca-manager-row-pdf-action")) return;
+      if (event.target.closest(".ctca-manager-row-doi-sync, .ctca-manager-row-pdf-action, .ctca-manager-row-tag")) return;
       if (event.key !== "Enter" && event.key !== " ") return;
       event.preventDefault();
       activate(event);
@@ -1308,6 +1478,10 @@
     });
     $(".ctca-manager-row-star", row).addEventListener("click", (event) => {
       event.stopPropagation();
+      if (isReadOnlySharedEntry(entry.key)) {
+        setStatus("This shared entry is read-only. Its citation key may still be changed locally.", true);
+        return;
+      }
       entry.starred = !entry.starred;
       entry.updatedAt = new Date().toISOString();
       markDirty(entry.starred ? "Starring entry…" : "Removing star…");
@@ -1326,6 +1500,31 @@
     $(".ctca-manager-condensed-author", row)?.addEventListener("click", (event) => {
       event.stopPropagation();
       setColumnVisible("authors", true);
+    });
+    row.querySelectorAll(".ctca-manager-row-tag").forEach((button) => {
+      if (button.classList.contains("ctca-manager-row-tag-overflow")) return;
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleManagerListTag(button.dataset.managerListTag || "");
+      });
+    });
+    row.querySelector(".ctca-manager-row-tag-overflow")?.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const previousSelectedKeys = new Set(selectedKeys);
+      const previousActiveKey = selectedKey;
+      selectedKeys = new Set([entry.key]);
+      selectedKey = entry.key;
+      selectionAnchorKey = entry.key;
+      bibliographyDetailsCollapsed = false;
+      updateListSelectionState(visibleKeys, previousSelectedKeys, previousActiveKey);
+      renderDetails();
+      requestAnimationFrame(() => {
+        const tagInput = $(".ctca-manager-details .ctca-tag-input", root);
+        tagInput?.scrollIntoView({ block: "center", behavior: "smooth" });
+        tagInput?.focus();
+      });
     });
     row.addEventListener("dragstart", (event) => {
       if (!selectedKeys.has(entry.key)) {
@@ -1384,6 +1583,7 @@
     const bottomSpacer = virtualListSpacer(Math.max(0, totalHeight - (offsets[end] || totalHeight)));
     fragment.appendChild(bottomSpacer);
     list.replaceChildren(fragment);
+    mounted.forEach(({ row }) => fitManagerRowTags(row));
     if (virtualListState.attachmentsByKey) {
       mounted.forEach(({ row, entry }) => {
         updateRowPdfAction(row, entry, virtualListState.attachmentsByKey.get(entry.key) || []);
@@ -1650,6 +1850,7 @@
     menu.hidden = false;
 
     const contextEntries = entries.filter((candidate) => selectedKeys.has(candidate.key));
+    const readOnlyContext = contextEntries.some((candidate) => isReadOnlySharedEntry(candidate.key));
     const multiple = contextEntries.length > 1;
     const attachments = multiple ? [] : await globalThis.CollabTeXAttachmentStore.list(entry);
     if (menu.dataset.entryKey !== entry.key) return;
@@ -1681,6 +1882,10 @@
       const action = button.dataset.entryContextAction;
       hideEntryContextMenu();
       try {
+        if (readOnlyContext && !/^(?:visit|open|download|copy)/.test(action)) {
+          setStatus("Read-only shared entries cannot be changed.", true);
+          return;
+        }
         if (action === "update-dois") {
           await updateEntriesFromDoi(contextEntries, { showBatchConfirmation: true });
         } else if (action === "copy-keys") {
@@ -1795,6 +2000,113 @@
     return [...seen.values()].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
   }
 
+  function setInlineCompletionHint(input, completionValue, typedValue, hostSelector) {
+    const host = hostSelector ? input.closest(hostSelector) : input.parentElement;
+    host?.querySelector(":scope > .ctca-inline-completion-hint")?.remove();
+    input.classList.remove("ctca-inline-completion-active");
+    if (input.dataset.skipInlineCompletionOnce === "true") {
+      delete input.dataset.skipInlineCompletionOnce;
+      return false;
+    }
+    const candidate = String(completionValue || "");
+    const typed = String(typedValue || "");
+    if (
+      !candidate ||
+      !typed ||
+      candidate.length <= typed.length ||
+      !candidate.toLocaleLowerCase().startsWith(typed.toLocaleLowerCase()) ||
+      input.selectionStart !== input.selectionEnd
+    ) return false;
+    const caret = input.selectionStart;
+    const start = caret - typed.length;
+    if (start < 0 || input.value.slice(start, caret).toLocaleLowerCase() !== typed.toLocaleLowerCase()) return false;
+    input.setRangeText(candidate, start, caret, "end");
+    input.setSelectionRange(start + typed.length, start + candidate.length);
+    input.classList.add("ctca-inline-completion-active");
+    return true;
+  }
+
+  function acceptInlineCompletion(input) {
+    if (!input?.classList.contains("ctca-inline-completion-active") || input.selectionStart === input.selectionEnd) return false;
+    const end = input.selectionEnd;
+    input.setSelectionRange(end, end);
+    input.classList.remove("ctca-inline-completion-active");
+    input.dataset.skipInlineCompletionOnce = "true";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  }
+
+  function discardInlineCompletion(input) {
+    if (!input?.classList.contains("ctca-inline-completion-active") || input.selectionStart === input.selectionEnd) return false;
+    input.setRangeText("", input.selectionStart, input.selectionEnd, "end");
+    input.classList.remove("ctca-inline-completion-active");
+    return true;
+  }
+
+  function setSearchInlineTagCompletion(input, context, tag) {
+    input.classList.remove("ctca-inline-completion-active");
+    if (input.dataset.skipInlineCompletionOnce === "true") {
+      delete input.dataset.skipInlineCompletionOnce;
+      return false;
+    }
+    const typed = String(context?.query || "");
+    const candidate = String(tag || "");
+    if (!typed || candidate.length <= typed.length || !candidate.toLocaleLowerCase().startsWith(typed.toLocaleLowerCase())) return false;
+    const encoded = globalThis.CollabTeXSearchTools.quoteQueryValue(candidate);
+    const typedOffset = encoded.startsWith('"') ? 1 : 0;
+    if (encoded.slice(typedOffset, typedOffset + typed.length).toLocaleLowerCase() !== typed.toLocaleLowerCase()) return false;
+    input.setRangeText(encoded, context.replaceStart, context.replaceEnd, "end");
+    const selectionStart = context.replaceStart + typedOffset + typed.length;
+    const selectionEnd = context.replaceStart + encoded.length;
+    input.setSelectionRange(selectionStart, selectionEnd);
+    input.classList.add("ctca-inline-completion-active");
+    return true;
+  }
+
+  function renderSearchTagSuggestions(input) {
+    const container = input.closest(".ctca-manager-search-input-wrap")?.querySelector(".ctca-manager-tag-search-suggestions");
+    if (!container) return;
+    const context = globalThis.CollabTeXSearchTools.tagCompletionContext(input.value, input.selectionStart);
+    if (!context || input.selectionStart !== input.selectionEnd) {
+      container.hidden = true;
+      container.replaceChildren();
+      setInlineCompletionHint(input, "", "", ".ctca-manager-search-input-wrap");
+      return;
+    }
+    const typed = context.query.toLocaleLowerCase();
+    const suggestions = allKnownTags()
+      .filter((tag) => tag.toLocaleLowerCase() !== typed)
+      .filter((tag) => !typed || tag.toLocaleLowerCase().includes(typed))
+      .sort((left, right) => {
+        const leftStarts = left.toLocaleLowerCase().startsWith(typed) ? 0 : 1;
+        const rightStarts = right.toLocaleLowerCase().startsWith(typed) ? 0 : 1;
+        return leftStarts - rightStarts || left.localeCompare(right, undefined, { sensitivity: "base" });
+      })
+      .slice(0, 10);
+    container.innerHTML = suggestions.map((tag, index) =>
+      `<button type="button" data-search-tag="${escapeHtml(tag)}" role="option"><span>${escapeHtml(tag)}</span>${index === 0 ? '<span class="ctca-completion-option-hint" title="Press Right Arrow to complete">→</span>' : ""}</button>`
+    ).join("");
+    container.hidden = suggestions.length === 0;
+    setSearchInlineTagCompletion(input, context, suggestions[0]);
+  }
+
+  function acceptSearchTagSuggestion(input, tag) {
+    discardInlineCompletion(input);
+    const context = globalThis.CollabTeXSearchTools.tagCompletionContext(input.value, input.selectionStart);
+    if (!context || !tag) return false;
+    input.setRangeText(
+      globalThis.CollabTeXSearchTools.quoteQueryValue(tag),
+      context.replaceStart,
+      context.replaceEnd,
+      "end"
+    );
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    const container = input.closest(".ctca-manager-search-input-wrap")?.querySelector(".ctca-manager-tag-search-suggestions");
+    if (container) container.hidden = true;
+    setInlineCompletionHint(input, "", "", ".ctca-manager-search-input-wrap");
+    return true;
+  }
+
   function allKnownJournals(exceptKey = "") {
     const seen = new Map();
     for (const item of entries) {
@@ -1894,6 +2206,7 @@
       })
       .slice(0, 8);
     setFieldCompletionOptions(container, suggestions);
+    setInlineCompletionHint(input, suggestions[0]?.value, input.value, ".ctca-field-completion-wrap");
     input.setAttribute("aria-expanded", String(suggestions.length > 0));
   }
 
@@ -1932,6 +2245,7 @@
     input.value = value;
     const container = input.closest(".ctca-field-completion-wrap")?.querySelector(".ctca-field-completion");
     if (container) container.hidden = true;
+    setInlineCompletionHint(input, "", "", ".ctca-field-completion-wrap");
     input.setAttribute("aria-expanded", "false");
     input.dispatchEvent(new Event("change", { bubbles: true }));
     return true;
@@ -1955,7 +2269,9 @@
     const token = input.dataset.managerAutocomplete === "keywords"
       ? keywordCompletionToken(input)
       : { end: input.value.length };
-    if (
+    if (event.key === "ArrowRight" && acceptInlineCompletion(input)) {
+      event.preventDefault();
+    } else if (
       event.key === "ArrowRight" &&
       !container?.hidden &&
       input.selectionStart === input.selectionEnd &&
@@ -1971,6 +2287,7 @@
     } else if (event.key === "Escape" && container && !container.hidden) {
       event.preventDefault();
       container.hidden = true;
+      setInlineCompletionHint(input, "", "", ".ctca-field-completion-wrap");
       input.setAttribute("aria-expanded", "false");
     }
   }
@@ -2013,9 +2330,15 @@
     const suggestions = allKnownTags(entry.key)
       .filter((tag) => !current.has(tag.toLocaleLowerCase()))
       .filter((tag) => !queryText || tag.toLocaleLowerCase().includes(queryText))
+      .sort((left, right) => {
+        const leftStarts = left.toLocaleLowerCase().startsWith(queryText) ? 0 : 1;
+        const rightStarts = right.toLocaleLowerCase().startsWith(queryText) ? 0 : 1;
+        return leftStarts - rightStarts || left.localeCompare(right, undefined, { sensitivity: "base" });
+      })
       .slice(0, 10);
-    container.innerHTML = suggestions.map((tag) => `<button type="button" data-manager-action="add-tag" data-tag="${escapeHtml(tag)}" role="option">${escapeHtml(tag)}</button>`).join("");
+    container.innerHTML = suggestions.map((tag, index) => `<button type="button" data-manager-action="add-tag" data-tag="${escapeHtml(tag)}" role="option"><span>${escapeHtml(tag)}</span>${index === 0 ? '<span class="ctca-completion-option-hint" title="Press Right Arrow to complete">→</span>' : ""}</button>`).join("");
     container.hidden = suggestions.length === 0;
+    setInlineCompletionHint(input, suggestions[0], input.value, ".ctca-tag-input-wrap");
   }
 
   function addTagToEntry(entry, tagValue) {
@@ -2035,7 +2358,16 @@
     if (!input) return;
     const entry = entryByKey(selectedKey);
     if (!entry) return;
-    if (event.key === "Enter" || event.key === ",") {
+    if (event.key === "ArrowRight" && acceptInlineCompletion(input)) {
+      event.preventDefault();
+    } else if (event.key === "ArrowRight" && input.selectionStart === input.selectionEnd && input.selectionStart === input.value.length) {
+      const first = input.closest(".ctca-tag-input-wrap")?.querySelector(".ctca-tag-suggestions button");
+      if (first && addTagToEntry(entry, first.dataset.tag || "")) {
+        event.preventDefault();
+        renderDetails();
+        requestAnimationFrame(() => $(".ctca-tag-input", root)?.focus());
+      }
+    } else if (event.key === "Enter" || event.key === ",") {
       event.preventDefault();
       if (addTagToEntry(entry, input.value)) {
         renderDetails();
@@ -2053,6 +2385,7 @@
       }
     } else if (event.key === "Escape") {
       input.closest(".ctca-tag-input-wrap")?.querySelector(".ctca-tag-suggestions")?.setAttribute("hidden", "");
+      setInlineCompletionHint(input, "", "", ".ctca-tag-input-wrap");
     }
   }
 
@@ -2166,7 +2499,19 @@
       <div class="ctca-manager-unsaved-note">Changes are saved automatically.</div>
       <div class="ctca-manager-remove-entry-row"><button type="button" class="ctca-manager-remove-entry" data-manager-action="remove-entry">Remove entry</button></div>
     `;
-    bindPdfDropTarget(container, entry);
+    const readOnlySharedEntry = isReadOnlySharedEntry(entry.key);
+    if (!readOnlySharedEntry) bindPdfDropTarget(container, entry);
+    if (readOnlySharedEntry) {
+      container.querySelectorAll("input, textarea, select, button[data-manager-action]").forEach((control) => {
+        if (control.matches('[data-manager-property="key"], [data-manager-action="open-url"], [data-manager-action="open-paper"]')) return;
+        control.disabled = true;
+      });
+      container.querySelectorAll("[data-manager-inline-field]").forEach((control) => {
+        control.removeAttribute("role");
+        control.removeAttribute("tabindex");
+        control.title = "This shared entry is read-only.";
+      });
+    }
     renderAttachmentList(entry).catch((error) => setStatus(error.message || String(error), true));
     syncPdfAttachmentLoadingIndicators();
     syncPdfEntryDetails();
@@ -2523,11 +2868,21 @@
         selectedKey = entries.some((entry) => entry.key === selectedKey) ? selectedKey : entries[0]?.key || "";
         renderAll();
       }
+      const sharedResult = await globalThis.CollabTeXAttachmentStore.syncSharedCategories();
+      if (sharedResult.synchronized || sharedResult.errors.length) {
+        await loadDatabase();
+        selectedKey = entries.some((entry) => entry.key === selectedKey) ? selectedKey : entries[0]?.key || "";
+        renderAll();
+      }
       const recovered = nextcloudSyncFailureCount > 0;
       nextcloudSyncFailureCount = 0;
       window.clearTimeout(nextcloudSyncRetryTimer);
       nextcloudSyncRetryTimer = null;
-      if (showSuccess || recovered) setStatus("Nextcloud synchronization completed.");
+      if (sharedResult.errors.length) {
+        setStatus(`${sharedResult.errors.length} shared categor${sharedResult.errors.length === 1 ? "y" : "ies"} could not be synchronized.`, true);
+      } else if (showSuccess || recovered) {
+        setStatus("Nextcloud synchronization completed.");
+      }
       return result;
     } catch (error) {
       const message = error?.message || String(error);
@@ -3121,6 +3476,10 @@
   }
 
   async function addEntriesFromPdfs(initialFiles = []) {
+    if (isReadOnlySharedCategory(selectedCategoryId)) {
+      setStatus("Entries cannot be added to a read-only shared category.", true);
+      return;
+    }
     if (busy) return;
     const config = await globalThis.CollabTeXAttachmentStore.getConfig();
     let picker = null;
@@ -3501,6 +3860,11 @@
     if (!entry) return;
     const field = event.target.dataset.managerField;
     const property = event.target.dataset.managerProperty;
+    if (isReadOnlySharedEntry(entry.key) && property !== "key") {
+      setStatus("This shared entry is read-only. Its citation key may still be changed locally.", true);
+      renderDetails();
+      return;
+    }
     if (field) {
       entry.fields[field] = event.target.value;
     } else if (property === "type") {
@@ -3522,6 +3886,7 @@
       if (selectedKeys.delete(oldKey)) selectedKeys.add(newKey);
       if (selectedKey === oldKey) selectedKey = newKey;
       if (selectionAnchorKey === oldKey) selectionAnchorKey = newKey;
+      updateSharedLocalKeyOverride(oldKey, newKey);
     } else {
       return;
     }
@@ -3536,6 +3901,10 @@
     const field = display?.dataset.managerInlineField;
     const entry = entryByKey(selectedKey);
     if (!field || !entry || busy || display.classList.contains("ctca-manager-inline-editing")) return false;
+    if (isReadOnlySharedEntry(entry.key)) {
+      setStatus("This shared entry is read-only. Its citation key may still be changed locally.", true);
+      return false;
+    }
 
     const originalValue = String(entry.fields?.[field] || "");
     const textarea = document.createElement("textarea");
@@ -3591,6 +3960,11 @@
         return button;
       }));
       completionElement.hidden = authorCompletions.length === 0;
+      const topCompletion = authorCompletions[0];
+      const typedAuthor = topCompletion
+        ? textarea.value.slice(topCompletion.start, topCompletion.end).trim()
+        : "";
+      setInlineCompletionHint(textarea, topCompletion?.value, typedAuthor, ".ctca-manager-inline-editing");
       textarea.setAttribute("aria-expanded", String(authorCompletions.length > 0));
     };
 
@@ -3626,7 +4000,9 @@
       if (event.key !== "ArrowRight") updateAuthorCompletion();
     });
     textarea.addEventListener("keydown", (event) => {
-      if (event.key === "ArrowRight" && acceptAuthorCompletion()) {
+      if (event.key === "ArrowRight" && acceptInlineCompletion(textarea)) {
+        event.preventDefault();
+      } else if (event.key === "ArrowRight" && acceptAuthorCompletion()) {
         event.preventDefault();
       } else if (event.key === "Escape") {
         event.preventDefault();
@@ -3691,6 +4067,10 @@
       } catch (_error) {
         setStatus("Enter a valid HTTP or HTTPS URL first.", true);
       }
+      return;
+    }
+    if (isReadOnlySharedEntry(entry.key) && !/^(?:open|download|copy)/.test(action)) {
+      setStatus("This shared entry is read-only. Its citation key may still be changed locally.", true);
       return;
     }
     if (action === "add-tag") {
@@ -3926,6 +4306,11 @@
   }
 
   async function updateEntriesFromDoi(targets, { showBatchConfirmation = false } = {}) {
+    targets = (targets || []).filter((entry) => !isReadOnlySharedEntry(entry.key));
+    if (!targets.length) {
+      setStatus("Read-only shared entries cannot be updated.", true);
+      return;
+    }
     if (nextcloudSyncInProgress) {
       const targetKeys = targets.map((entry) => entry.key);
       setStatus("DOI metadata update queued; it will start when Nextcloud synchronization is complete.");
@@ -4045,6 +4430,10 @@
   }
 
   async function removeSelected() {
+    if ([...selectedKeys].some(isReadOnlySharedEntry)) {
+      setStatus("Read-only shared entries cannot be removed.", true);
+      return;
+    }
     if (selectedKeys.size < 2) return;
     const count = selectedKeys.size;
     const removedEntries = entries.filter((entry) => selectedKeys.has(entry.key));
@@ -4078,38 +4467,258 @@
     return `category-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
   }
 
-  async function createCategory() {
+  function applySharedDatabaseResult(database) {
+    entries = Array.isArray(database?.entries) ? database.entries.map(normalizeEntry) : entries;
+    categoryState = normalizeCategoryState(database || {});
+    deletionTombstones = normalizeDeletionTombstones(database?.deletedEntries);
+    documentSyncState = normalizeDocumentSyncState(database?.documentSync);
+    savedEntryContentByKey = entryContentMap(entries);
+    dirty = false;
+    savedRevision = changeRevision;
+  }
+
+  async function requestNextcloudSharePassword(title, message) {
+    while (true) {
+      let passwordInput;
+      const password = await showDialog({
+        title,
+        message,
+        controls: (container) => {
+          const label = document.createElement("label");
+          label.className = "ctca-app-dialog-field";
+          label.innerHTML = `<span>Share password</span><input type="password" autocomplete="new-password" required>`;
+          passwordInput = $("input", label);
+          container.appendChild(label);
+        },
+        buttons: [
+          { label: "Cancel", value: null },
+          { label: "Continue", primary: true, getValue: () => passwordInput?.value || "" }
+        ],
+        closeValue: null
+      });
+      if (password === null) return null;
+      if (password) return password;
+      setStatus("Enter a password for the Nextcloud share.", true);
+    }
+  }
+
+  async function createCategory(parentId = "") {
+    parentId = typeof parentId === "string" ? parentId : "";
+    if (parentId && isReadOnlySharedCategory(parentId)) {
+      setStatus("Subcategories cannot be added to a read-only shared category.", true);
+      return;
+    }
     let input;
-    const name = await showDialog({
+    let linkInput;
+    const result = await showDialog({
       title: "Create bibliography category",
-      message: "Create a top-level category. Drag it onto another category later to make it a subcategory.",
+      message: parentId
+        ? `Create a subcategory in “${categoryById(parentId)?.name || "category"}”.`
+        : "Create a top-level category, or add a shared category from a Nextcloud link.",
       controls: (container) => {
         const label = document.createElement("label");
         label.className = "ctca-app-dialog-field";
         label.innerHTML = `<span>Category name</span><input type="text" maxlength="120" placeholder="e.g. Plasma instabilities">`;
         input = $("input", label);
         container.appendChild(label);
+        if (!parentId) {
+          const separator = document.createElement("div");
+          separator.className = "ctca-shared-category-dialog-separator";
+          separator.textContent = "or add a shared category";
+          const linkLabel = document.createElement("label");
+          linkLabel.className = "ctca-app-dialog-field";
+          linkLabel.innerHTML = `<span>Nextcloud share link</span><input type="url" placeholder="https://cloud.example.org/s/…">`;
+          linkInput = $("input", linkLabel);
+          container.append(separator, linkLabel);
+        }
       },
       buttons: [
         { label: "Cancel", value: null },
-        { label: "Create category", primary: true, getValue: () => input?.value.trim() || "" }
+        ...(!parentId ? [{ label: "Add from link", getValue: () => ({ action: "import", value: linkInput?.value.trim() || "" }) }] : []),
+        { label: "Create category", primary: true, getValue: () => ({ action: "create", value: input?.value.trim() || "" }) }
       ],
       closeValue: null
     });
-    if (!name) return;
+    if (!result?.value) return;
+    if (result.action === "import") {
+      setBusy(true, "Adding shared category…");
+      try {
+        let sharePassword = "";
+        let imported;
+        while (!imported) {
+          try {
+            imported = await globalThis.CollabTeXAttachmentStore.importSharedCategory(result.value, sharePassword);
+          } catch (error) {
+            if (!error?.sharePasswordRequired) throw error;
+            setBusy(false);
+            const enteredPassword = await requestNextcloudSharePassword(
+              "Password-protected shared category",
+              sharePassword
+                ? "The password was not accepted. Enter the password for this Nextcloud share again."
+                : "This Nextcloud share is password-protected. Enter its password to add and synchronize the category."
+            );
+            if (enteredPassword === null) return;
+            sharePassword = enteredPassword;
+            setBusy(true, "Adding shared category…");
+          }
+        }
+        applySharedDatabaseResult(imported.database);
+        selectedCategoryId = imported.categoryId;
+        renderAll();
+        setStatus("Shared category added and copied to your Nextcloud account.");
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
     categoryState.categories.push({
       id: createCategoryId(),
-      name,
-      parentId: "",
-      order: categoryChildren("").length
+      name: result.value,
+      parentId,
+      order: categoryChildren(parentId).length
     });
     markDirty("Saving new category automatically…");
     renderCategories();
   }
 
+  async function shareCategory(categoryId) {
+    const category = categoryById(categoryId);
+    if (!category || sharedCategoryRoot(categoryId)) return;
+    if (!nextcloudConnected || !syncNextcloudBibliography) {
+      setStatus("Connect to Nextcloud and enable bibliography synchronization before sharing a category.", true);
+      return;
+    }
+    let permissionInput;
+    const permission = await showDialog({
+      title: `Share “${category.name}”`,
+      message: "The category, all subcategories, bibliography entries, and attached PDFs will be copied to a separate Nextcloud folder and kept in sync.",
+      controls: (container) => {
+        const wrapper = document.createElement("div");
+        wrapper.innerHTML = `
+          <label class="ctca-app-dialog-check"><input type="radio" name="ctca-share-permission" value="read" checked> Others may only read</label>
+          <label class="ctca-app-dialog-check"><input type="radio" name="ctca-share-permission" value="write"> Others may add and change categories, entries, and PDFs</label>`;
+        permissionInput = wrapper;
+        container.appendChild(wrapper);
+      },
+      buttons: [
+        { label: "Cancel", value: null },
+        { label: "Create share link", primary: true, getValue: () => permissionInput?.querySelector("input:checked")?.value || "read" }
+      ],
+      closeValue: null
+    });
+    if (!permission) return;
+    setBusy(true, "Creating Nextcloud share…");
+    try {
+      await flushAutoSave();
+      let sharePassword = "";
+      let result;
+      try {
+        result = await globalThis.CollabTeXAttachmentStore.createSharedCategory(databaseSnapshot(), categoryId, permission);
+      } catch (error) {
+        if (!error?.sharePasswordRequired) throw error;
+        setBusy(false);
+        const enteredPassword = await requestNextcloudSharePassword(
+          "Set a Nextcloud share password",
+          "Your Nextcloud server requires passwords for public links. Set a password for this shared category and send it to recipients separately."
+        );
+        if (enteredPassword === null) return;
+        sharePassword = enteredPassword;
+        setBusy(true, "Creating password-protected Nextcloud share…");
+        result = await globalThis.CollabTeXAttachmentStore.createSharedCategory(
+          databaseSnapshot(),
+          categoryId,
+          permission,
+          sharePassword
+        );
+      }
+      applySharedDatabaseResult(result.database);
+      renderAll();
+      await showDialog({
+        title: "Shared category link",
+        message: (permission === "write"
+          ? "Anyone with this link can add and change shared content."
+          : "Anyone with this link can add a synchronized read-only copy.")
+          + (sharePassword ? " The link is password-protected; send the password to recipients separately." : ""),
+        controls: (container) => {
+          const row = document.createElement("div");
+          row.className = "ctca-shared-category-link-row";
+          row.innerHTML = `<input type="url" readonly><button type="button">Copy</button>`;
+          $("input", row).value = result.shareUrl;
+          $("button", row).addEventListener("click", () => navigator.clipboard.writeText(result.shareUrl).catch(() => {}));
+          container.appendChild(row);
+        },
+        buttons: [{ label: "Done", primary: true, value: true }],
+        closeValue: true
+      });
+      setStatus("Category sharing is active.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function viewSharedCategoryLink(categoryId) {
+    const sharedRoot = sharedCategoryRoot(categoryId);
+    const shareUrl = String(sharedRoot?.shared?.shareUrl || "");
+    if (!sharedRoot || !shareUrl) throw new Error("No share link is available for this category.");
+    await showDialog({
+      title: `Share link for “${sharedRoot.name}”`,
+      message: sharedRoot.shared.role === "owner"
+        ? "Copy this link to invite another user to the shared category."
+        : "This is the link used to synchronize the remote shared category.",
+      controls: (container) => {
+        const row = document.createElement("div");
+        row.className = "ctca-shared-category-link-row";
+        row.innerHTML = `<input type="url" readonly><button type="button">Copy</button>`;
+        $("input", row).value = shareUrl;
+        $("button", row).addEventListener("click", () => navigator.clipboard.writeText(shareUrl).catch(() => {}));
+        container.appendChild(row);
+      },
+      buttons: [{ label: "Done", primary: true, value: true }],
+      closeValue: true
+    });
+  }
+
+  async function stopSharedCategory(categoryId) {
+    const category = categoryById(categoryId);
+    const sharedRoot = sharedCategoryRoot(categoryId);
+    if (!category || sharedRoot?.id !== categoryId) return;
+    const owner = sharedRoot.shared.role === "owner";
+    const confirmed = await showDialog({
+      title: owner ? `Stop sharing “${category.name}”?` : `Stop remote sync for “${category.name}”?`,
+      message: owner
+        ? "This revokes the share link and removes the separate shared folder from Nextcloud. The local category remains. This cannot be undone."
+        : "This removes the synchronized Nextcloud copy and disconnects the category. The local category remains. This cannot be undone.",
+      buttons: [
+        { label: "Cancel", value: false },
+        { label: owner ? "Stop sharing" : "Stop remote sync", value: true, danger: true }
+      ],
+      closeValue: false,
+      danger: true
+    });
+    if (!confirmed) return;
+    setBusy(true, owner ? "Stopping sharing…" : "Stopping remote sync…");
+    try {
+      const result = await globalThis.CollabTeXAttachmentStore.stopSharedCategory(databaseSnapshot(), categoryId);
+      applySharedDatabaseResult(result.database);
+      renderAll();
+      setStatus(owner ? "Sharing stopped; the local category was kept." : "Remote sync stopped; the local category was kept.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function removeCategory(categoryId) {
     const category = categoryById(categoryId);
     if (!category) return;
+    const sharedRoot = sharedCategoryRoot(categoryId);
+    if (sharedRoot?.id === categoryId) {
+      setStatus(`Use “${sharedRoot.shared.role === "owner" ? "Stop sharing" : "Stop remote sync"}” before removing this category.`, true);
+      return;
+    }
+    if (isReadOnlySharedCategory(categoryId)) {
+      setStatus("Subcategories cannot be removed from a read-only shared category.", true);
+      return;
+    }
     const parent = categoryById(category.parentId);
     const choice = await showDialog({
       title: `Remove category “${category.name}”?`,
@@ -4306,6 +4915,10 @@
   }
 
   async function addEntry() {
+    if (isReadOnlySharedCategory(selectedCategoryId)) {
+      setStatus("Entries cannot be added to a read-only shared category.", true);
+      return;
+    }
     let form;
     const result = await showDialog({
       title: "Add bibliography entry",
@@ -4960,6 +5573,7 @@
       virtualListResizeObserver?.disconnect();
       virtualListResizeObserver = new ResizeObserver(() => {
         syncManagerTableHeader();
+        list.querySelectorAll(".ctca-manager-row").forEach((row) => fitManagerRowTags(row));
         scheduleVirtualListWindow();
       });
       virtualListResizeObserver.observe(list);
@@ -5643,12 +6257,37 @@
       hideCategoryContextMenu();
       removeCategory(categoryId);
     });
+    $(".ctca-category-add-child", root).addEventListener("click", () => {
+      const menu = $(".ctca-category-context-menu", root);
+      const categoryId = menu.dataset.categoryId || "";
+      hideCategoryContextMenu();
+      createCategory(categoryId).catch((error) => setStatus(error?.message || String(error), true));
+    });
+    $(".ctca-category-share", root).addEventListener("click", () => {
+      const menu = $(".ctca-category-context-menu", root);
+      const categoryId = menu.dataset.categoryId || "";
+      hideCategoryContextMenu();
+      shareCategory(categoryId).catch((error) => setStatus(error?.message || String(error), true));
+    });
+    $(".ctca-category-view-share-link", root).addEventListener("click", () => {
+      const menu = $(".ctca-category-context-menu", root);
+      const categoryId = menu.dataset.categoryId || "";
+      hideCategoryContextMenu();
+      viewSharedCategoryLink(categoryId).catch((error) => setStatus(error?.message || String(error), true));
+    });
+    $(".ctca-category-stop-sharing", root).addEventListener("click", () => {
+      const menu = $(".ctca-category-context-menu", root);
+      const categoryId = menu.dataset.categoryId || "";
+      hideCategoryContextMenu();
+      stopSharedCategory(categoryId).catch((error) => setStatus(error?.message || String(error), true));
+    });
 
     const searchInput = $(".ctca-manager-search", root);
     const searchClear = $(".ctca-manager-search-clear", root);
     searchInput.addEventListener("input", () => {
       window.clearTimeout(searchRenderTimer);
       searchClear.hidden = !searchInput.value;
+      renderSearchTagSuggestions(searchInput);
       searchRenderTimer = window.setTimeout(() => {
         searchRenderTimer = null;
         query = searchInput.value || "";
@@ -5663,6 +6302,38 @@
       searchClear.hidden = true;
       renderList();
       searchInput.focus();
+    });
+    searchInput.addEventListener("keydown", (event) => {
+      const suggestions = searchInput.closest(".ctca-manager-search-input-wrap")?.querySelector(".ctca-manager-tag-search-suggestions");
+      if (event.key === "ArrowRight" && acceptInlineCompletion(searchInput)) {
+        event.preventDefault();
+      } else if (
+        event.key === "ArrowRight" &&
+        !suggestions?.hidden &&
+        searchInput.selectionStart === searchInput.selectionEnd &&
+        searchInput.selectionStart === searchInput.value.length
+      ) {
+        const first = suggestions.querySelector("[data-search-tag]");
+        if (first && acceptSearchTagSuggestion(searchInput, first.dataset.searchTag || "")) event.preventDefault();
+      } else if (event.key === "Escape" && suggestions && !suggestions.hidden) {
+        event.preventDefault();
+        suggestions.hidden = true;
+        setInlineCompletionHint(searchInput, "", "", ".ctca-manager-search-input-wrap");
+      }
+    });
+    searchInput.addEventListener("click", () => renderSearchTagSuggestions(searchInput));
+    const searchTagSuggestions = $(".ctca-manager-tag-search-suggestions", root);
+    searchTagSuggestions.addEventListener("mousedown", (event) => {
+      const option = event.target.closest("[data-search-tag]");
+      if (!option) return;
+      event.preventDefault();
+      if (acceptSearchTagSuggestion(searchInput, option.dataset.searchTag || "")) searchInput.focus();
+    });
+    searchInput.addEventListener("focusout", () => {
+      window.setTimeout(() => {
+        searchTagSuggestions.hidden = true;
+        setInlineCompletionHint(searchInput, "", "", ".ctca-manager-search-input-wrap");
+      }, 120);
     });
 
     const searchDetails = $(".ctca-manager-search-details", root);
@@ -5788,11 +6459,15 @@
     });
     details.addEventListener("focusout", (event) => {
       if (event.target.matches(".ctca-tag-input")) {
-        window.setTimeout(() => event.target.closest(".ctca-tag-input-wrap")?.querySelector(".ctca-tag-suggestions")?.setAttribute("hidden", ""), 120);
+        window.setTimeout(() => {
+          event.target.closest(".ctca-tag-input-wrap")?.querySelector(".ctca-tag-suggestions")?.setAttribute("hidden", "");
+          setInlineCompletionHint(event.target, "", "", ".ctca-tag-input-wrap");
+        }, 120);
       } else if (event.target.matches("[data-manager-autocomplete]")) {
         window.setTimeout(() => {
           const container = event.target.closest(".ctca-field-completion-wrap")?.querySelector(".ctca-field-completion");
           if (container) container.hidden = true;
+          setInlineCompletionHint(event.target, "", "", ".ctca-field-completion-wrap");
           event.target.setAttribute("aria-expanded", "false");
         }, 120);
       }
@@ -5827,6 +6502,7 @@
         window.setTimeout(() => {
           const container = event.target.closest(".ctca-field-completion-wrap")?.querySelector(".ctca-field-completion");
           if (container) container.hidden = true;
+          setInlineCompletionHint(event.target, "", "", ".ctca-field-completion-wrap");
           event.target.setAttribute("aria-expanded", "false");
         }, 120);
       }

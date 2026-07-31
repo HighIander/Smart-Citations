@@ -52,6 +52,102 @@
     return url;
   }
 
+  function wildcardPatternRegex(value) {
+    return new RegExp(`^${String(value).replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`, "i");
+  }
+
+  function journalSitePatternMatches(urlValue, pattern) {
+    const raw = String(pattern || "").trim();
+    if (!raw || raw.startsWith("#")) return false;
+    let url;
+    try {
+      url = new URL(String(urlValue || ""));
+    } catch (_error) {
+      return false;
+    }
+    if (!/^https?:$/.test(url.protocol)) return false;
+    if (raw.startsWith("*.")) {
+      const suffix = raw.slice(2).replace(/\/.*$/, "").toLowerCase();
+      return url.hostname.toLowerCase() === suffix
+        || url.hostname.toLowerCase().endsWith(`.${suffix}`);
+    }
+    if (!raw.includes("/") && !raw.includes(":")) {
+      return wildcardPatternRegex(raw).test(url.hostname);
+    }
+    const candidate = raw.includes("://") ? raw : `*://${raw}`;
+    return wildcardPatternRegex(candidate).test(url.href);
+  }
+
+  async function updateJournalSiteActionBadge(tabId, urlValue = "") {
+    if (!Number.isInteger(tabId) || !extensionApi.action?.setBadgeText) return;
+    if (humanCheckReturnTabs.has(tabId)) return;
+    let currentUrl = String(urlValue || "");
+    if (!currentUrl) {
+      try {
+        currentUrl = String((await extensionApi.tabs.get(tabId))?.url || "");
+      } catch (_error) {
+        return;
+      }
+    }
+    const stored = await extensionApi.storage.local.get(AUTHOR_OPTIONS_KEY).catch(() => ({}));
+    const patterns = Array.isArray(stored?.[AUTHOR_OPTIONS_KEY]?.pagePatterns)
+      ? stored[AUTHOR_OPTIONS_KEY].pagePatterns
+      : ["*.nature.com"];
+    const isJournalSite = patterns.some((pattern) => journalSitePatternMatches(currentUrl, pattern));
+    const calls = [
+      extensionApi.action.setBadgeText({ tabId, text: isJournalSite ? "✓" : "" }),
+      extensionApi.action.setTitle({
+        tabId,
+        title: isJournalSite
+          ? "Open Smart Citations bibliography manager — journal site detected"
+          : DEFAULT_ACTION_TITLE
+      })
+    ];
+    if (isJournalSite) {
+      calls.push(extensionApi.action.setBadgeBackgroundColor({ tabId, color: "#1a7f37" }));
+      if (extensionApi.action.setBadgeTextColor) {
+        calls.push(extensionApi.action.setBadgeTextColor({ tabId, color: "#ffffff" }));
+      }
+    }
+    await Promise.allSettled(calls);
+  }
+
+  async function refreshActiveJournalSiteBadges() {
+    const tabs = await extensionApi.tabs.query({ active: true }).catch(() => []);
+    await Promise.allSettled(
+      tabs.filter((tab) => Number.isInteger(tab?.id))
+        .map((tab) => updateJournalSiteActionBadge(tab.id, tab.url))
+    );
+  }
+
+  async function actionIsPinned() {
+    const actionApi = extensionApi.action || extensionApi.browserAction;
+    if (!actionApi?.getUserSettings) return false;
+    try {
+      return Boolean((await actionApi.getUserSettings())?.isOnToolbar);
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  async function showInstallWelcome() {
+    if (await actionIsPinned()) return;
+    const url = extensionApi.runtime.getURL("welcome.html");
+    if (extensionApi.windows?.create) {
+      try {
+        await extensionApi.windows.create({
+          url,
+          type: "popup",
+          width: 460,
+          height: 620,
+          focused: true
+        });
+        return;
+      } catch (_error) {}
+    }
+    await extensionApi.tabs.create({ url, active: true });
+  }
+
   extensionApi.downloads?.onDeterminingFilename?.addListener((item, suggest) => {
     let index = pendingBrowserDownloadNames.findIndex((pending) =>
       pending.downloadId === item?.id
@@ -294,10 +390,9 @@
     humanCheckNotificationTabs.delete(notificationId);
     humanCheckInitialUrls.delete(tabId);
     await Promise.allSettled([
-      extensionApi.action?.setBadgeText?.({ tabId, text: "" }),
-      extensionApi.action?.setTitle?.({ tabId, title: DEFAULT_ACTION_TITLE }),
       extensionApi.notifications?.clear?.(notificationId)
     ].filter(Boolean));
+    await updateJournalSiteActionBadge(tabId);
   }
 
   async function returnToSmartCitationsAndContinue(humanCheckTabId, returnTabId) {
@@ -2712,6 +2807,13 @@
       return true;
     }
 
+    if (message?.type === "ctca-open-standalone-manager") {
+      openStandaloneManager()
+        .then(() => sendResponse({ ok: true }))
+        .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+      return true;
+    }
+
     if (message?.type === "ctca-open-manuscript-pdf-workflow") {
       try {
         const doi = normalizeDoi(message.doi);
@@ -2882,6 +2984,29 @@
     humanCheckReturnTimers.set(tabId, timer);
   });
 
+  extensionApi.tabs.onActivated?.addListener(({ tabId }) => {
+    updateJournalSiteActionBadge(tabId).catch(() => {});
+  });
+
+  extensionApi.tabs.onUpdated?.addListener((tabId, changeInfo, tab) => {
+    if (!tab?.active || (!changeInfo?.url && changeInfo?.status !== "complete")) return;
+    updateJournalSiteActionBadge(tabId, changeInfo.url || tab.url).catch(() => {});
+  });
+
+  extensionApi.storage.onChanged?.addListener((changes, areaName) => {
+    if (areaName !== "local" || !(AUTHOR_OPTIONS_KEY in changes)) return;
+    refreshActiveJournalSiteBadges().catch(() => {});
+  });
+
+  extensionApi.runtime.onInstalled?.addListener((details) => {
+    refreshActiveJournalSiteBadges().catch(() => {});
+    if (details?.reason === "install") showInstallWelcome().catch(() => {});
+  });
+
+  extensionApi.runtime.onStartup?.addListener(() => {
+    refreshActiveJournalSiteBadges().catch(() => {});
+  });
+
   extensionApi.notifications?.onClicked?.addListener((notificationId) => {
     if (!humanCheckNotificationTabs.has(notificationId)) return;
     const humanCheckTabId = Number(String(notificationId).slice(HUMAN_CHECK_NOTIFICATION_PREFIX.length));
@@ -2902,4 +3027,6 @@
     }
     openManagerFromAction(tab).catch(() => openStandaloneManager());
   });
+
+  refreshActiveJournalSiteBadges().catch(() => {});
 })();

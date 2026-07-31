@@ -67,6 +67,7 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10M8 4v6M16 14v6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="16" cy="7" r="2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="8" cy="17" r="2" fill="none" stroke="currentColor" stroke-width="2"/></svg>
       </button>
       <button type="button" class="ctca-manager-search-clear" aria-label="Clear search" title="Clear search" hidden>×</button>
+      <span class="ctca-manager-tag-search-suggestions" hidden role="listbox"></span>
     </span>
     <span class="ctca-manager-search-menu-wrap">
       <span class="ctca-manager-search-menu" hidden role="dialog" aria-label="Search operators and filters">
@@ -173,6 +174,10 @@
       </div>
 
       <div class="ctca-category-context-menu" hidden role="menu">
+        <button type="button" class="ctca-category-add-child" role="menuitem">Add category…</button>
+        <button type="button" class="ctca-category-share" role="menuitem">Share…</button>
+        <button type="button" class="ctca-category-view-share-link" role="menuitem">View share link</button>
+        <button type="button" class="ctca-category-stop-sharing" role="menuitem">Stop sharing…</button>
         <button type="button" class="ctca-category-remove" role="menuitem">Remove category…</button>
       </div>
       <div class="ctca-entry-context-menu" hidden role="menu"></div>

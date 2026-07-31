@@ -2513,13 +2513,18 @@ button.ctca-manager-row-doi-sync:focus-visible,
 }
 
 .ctca-manager-category-row {
-  grid-template-columns: 16px minmax(0, 1fr) auto;
+  grid-template-columns: 16px minmax(0, 1fr) 22px auto;
   padding-left: calc(5px + var(--ctca-category-depth, 0) * 14px);
 }
 
 .ctca-manager-category-fixed:hover,
-.ctca-manager-category-row:hover,
-.ctca-manager-category-selected {
+.ctca-manager-category-row:hover {
+  background: #f6f8fa;
+  border-color: #d0d7de;
+}
+
+.ctca-manager-category-selected,
+.ctca-manager-category-selected:hover {
   background: #ddf4ff;
   border-color: #80ccff;
 }
@@ -2553,6 +2558,7 @@ button.ctca-manager-row-doi-sync:focus-visible,
   font-size: 10px;
   text-align: right;
 }
+.ctca-manager-category-row .ctca-manager-category-count { grid-column: 4; }
 
 .ctca-manager-category-dragging { opacity: 0.45; }
 .ctca-manager-category-drop-target,
@@ -2590,7 +2596,7 @@ button.ctca-manager-row-doi-sync:focus-visible,
 .ctca-category-context-menu button {
   width: 100%;
   padding: 7px 9px;
-  color: #cf222e;
+  color: #24292f;
   background: transparent;
   border: 0;
   border-radius: 4px;
@@ -2600,7 +2606,56 @@ button.ctca-manager-row-doi-sync:focus-visible,
   font-weight: 700;
   text-align: left;
 }
-.ctca-category-context-menu button:hover { background: #ffebe9; }
+.ctca-category-context-menu button:hover { background: #f6f8fa; }
+.ctca-category-context-menu button:disabled {
+  color: #8c959f;
+  background: transparent;
+  cursor: not-allowed;
+  opacity: .7;
+}
+.ctca-category-context-menu .ctca-category-remove,
+.ctca-category-context-menu .ctca-category-stop-sharing { color: #cf222e; }
+.ctca-manager-category-share-icon {
+  grid-column: 3;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  color: #24292f;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: "Segoe UI Symbol", sans-serif;
+  font-size: 13px;
+  line-height: 1;
+  text-align: center;
+}
+.ctca-manager-category-share-icon:hover,
+.ctca-manager-category-share-icon:focus-visible { background: rgba(9, 105, 218, 0.12); }
+.ctca-manager-category-share-icon.ctca-shared-owner { color: #0969da; }
+.ctca-manager-category-share-icon.ctca-shared-error { color: #cf222e; }
+.ctca-shared-category-dialog-separator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 8px;
+  color: #6e7781;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.ctca-shared-category-dialog-separator::before,
+.ctca-shared-category-dialog-separator::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: #d0d7de;
+}
+.ctca-shared-category-link-row {
+  display: grid;
+  grid-template-columns: minmax(0,1fr) auto;
+  gap: 8px;
+}
 
 .ctca-entry-context-menu {
   position: fixed;
@@ -2790,10 +2845,23 @@ button.ctca-manager-row-doi-sync:focus-visible,
   .ctca-global-import-entry:hover,
   .ctca-global-import-toolbar button:hover { background: #21262d; }
   .ctca-manager-category-fixed:hover,
-  .ctca-manager-category-row:hover,
+  .ctca-manager-category-row:hover {
+    background: #21262d;
+    border-color: #484f58;
+  }
   .ctca-manager-category-selected,
+  .ctca-manager-category-selected:hover,
   .ctca-manager-row-selected { background: #1f3a4d; border-color: #388bfd; }
-  .ctca-category-context-menu button:hover { background: #3d1418; }
+  .ctca-category-context-menu button { color: #e6edf3; }
+  .ctca-category-context-menu button:hover { background: #21262d; }
+  .ctca-category-context-menu button:disabled { color: #6e7681; }
+  .ctca-category-context-menu .ctca-category-remove,
+  .ctca-category-context-menu .ctca-category-stop-sharing { color: #ff7b72; }
+  .ctca-manager-category-share-icon { color: #e6edf3; }
+  .ctca-manager-category-share-icon.ctca-shared-owner { color: #58a6ff; }
+  .ctca-manager-category-share-icon.ctca-shared-error { color: #ff7b72; }
+  .ctca-shared-category-dialog-separator::before,
+  .ctca-shared-category-dialog-separator::after { background: #30363d; }
   .ctca-entry-context-menu button { color: #e6edf3; }
   .ctca-entry-context-menu button:hover,
   .ctca-entry-context-menu button:focus-visible { background: #21262d; }
@@ -3375,6 +3443,46 @@ button.ctca-manager-row-doi-sync:focus-visible,
   padding-right: 74px !important;
 }
 
+.ctca-manager-tag-search-suggestions {
+  position: absolute;
+  top: calc(100% + 5px);
+  right: 0;
+  left: 0;
+  z-index: 80;
+  display: grid;
+  max-height: 230px;
+  padding: 4px;
+  overflow-y: auto;
+  color: #24292f;
+  background: #fff;
+  border: 1px solid #8c959f;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(31, 35, 40, 0.2);
+}
+
+.ctca-manager-tag-search-suggestions[hidden] { display: none; }
+
+.ctca-manager-tag-search-suggestions button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.ctca-manager-tag-search-suggestions button:hover,
+.ctca-manager-tag-search-suggestions button:focus-visible {
+  background: #ddf4ff;
+  outline: none;
+}
+
 .ctca-manager-search-details,
 .ctca-manager-search-clear {
   position: absolute !important;
@@ -3702,6 +3810,38 @@ button.ctca-manager-row-doi-sync:focus-visible,
   min-width: 100px;
 }
 
+.ctca-inline-completion-hint {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  z-index: 2;
+  max-width: 48%;
+  overflow: hidden;
+  color: #8c959f;
+  font-size: 11px;
+  line-height: 1;
+  pointer-events: none;
+  text-overflow: ellipsis;
+  transform: translateY(-50%);
+  white-space: nowrap;
+}
+
+.ctca-manager-inline-editing > .ctca-inline-completion-hint {
+  top: 8px;
+  right: 10px;
+  transform: none;
+}
+
+.ctca-manager-search-input-wrap > .ctca-inline-completion-hint {
+  right: 76px;
+}
+
+input.ctca-inline-completion-active::selection,
+textarea.ctca-inline-completion-active::selection {
+  color: #57606a;
+  background: #d0d7de;
+}
+
 .ctca-tag-input {
   width: 100%;
   min-height: 27px;
@@ -3800,6 +3940,30 @@ button.ctca-manager-row-doi-sync:focus-visible,
   }
   .ctca-tag-suggestions button:hover {
     background: #1f3a4d !important;
+  }
+  .ctca-manager-tag-search-suggestions {
+    color: #e6edf3;
+    background: #0d1117;
+    border-color: #484f58;
+  }
+  .ctca-manager-tag-search-suggestions button:hover,
+  .ctca-manager-tag-search-suggestions button:focus-visible {
+    background: #1f3a4d;
+  }
+  .ctca-manager-row-tag {
+    color: #8c959f;
+    background: #21262d;
+    border-color: #484f58;
+  }
+  .ctca-manager-row-tag:hover {
+    color: #79c0ff;
+    background: #1f3a4d;
+    border-color: #388bfd;
+  }
+  .ctca-manager-row-tag.ctca-manager-row-tag-selected {
+    color: #a5d6ff;
+    background: #1f3a4d;
+    border-color: #58a6ff;
   }
 }
 
@@ -5630,13 +5794,82 @@ html.ctca-platform-overleaf #ctca-toolbar-button.ctca-overleaf-top-button {
 #ctca-bib-manager .ctca-manager-row-publication {
   display: flex;
   align-items: baseline;
+  gap: 7px;
 }
 
 #ctca-bib-manager .ctca-manager-publication-text {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ctca-manager-row-tags {
+  display: inline-flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 62%;
+  margin-left: auto;
+  gap: 4px;
+  overflow: hidden;
+  vertical-align: middle;
+}
+
+.ctca-manager-row-tag-overflow {
+  min-width: 27px;
+  font-weight: 750;
+  letter-spacing: 1px;
+}
+
+.ctca-manager-row-tag[hidden] { display: none; }
+
+.ctca-manager-row-tag {
+  flex: 0 0 auto;
+  max-width: 150px;
+  padding: 1px 7px;
+  overflow: hidden;
+  color: #57606a;
+  background: #f6f8fa;
+  border: 1px solid #d0d7de;
+  border-radius: 999px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ctca-manager-row-tag:hover {
+  color: #0969da;
+  background: #eef6ff;
+  border-color: #80ccff;
+}
+
+.ctca-manager-row-tag.ctca-manager-row-tag-selected {
+  color: #0550ae;
+  background: #ddf4ff;
+  border-color: #54aeff;
+  font-weight: 700;
+}
+
+@media (prefers-color-scheme: dark) {
+  .ctca-manager-row-tag {
+    color: #8c959f;
+    background: #21262d;
+    border-color: #484f58;
+  }
+  .ctca-manager-row-tag:hover {
+    color: #79c0ff;
+    background: #1f3a4d;
+    border-color: #388bfd;
+  }
+  .ctca-manager-row-tag.ctca-manager-row-tag-selected {
+    color: #a5d6ff;
+    background: #1f3a4d;
+    border-color: #58a6ff;
+  }
 }
 
 .ctca-openalex-citation[hidden] {

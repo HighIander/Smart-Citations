@@ -52,6 +52,7 @@
       skipSpace();
       if (index >= source.length) break;
 
+      const tokenStart = index;
       let exclude = false;
       if (source[index] === "!") {
         exclude = true;
@@ -59,7 +60,6 @@
         skipSpace();
       }
 
-      const start = index;
       let field = "";
       let probe = index;
       while (probe < source.length && /[A-Za-z]/.test(source[probe])) probe += 1;
@@ -88,12 +88,65 @@
 
       text = text.trim();
       if (!text && field) {
-        tokens.push({ field, text: "", exclude, exact, raw: source.slice(start, index) });
+        tokens.push({ field, text: "", exclude, exact, raw: source.slice(tokenStart, index), start: tokenStart, end: index });
       } else if (text) {
-        tokens.push({ field, text, exclude, exact, raw: source.slice(start, index) });
+        tokens.push({ field, text, exclude, exact, raw: source.slice(tokenStart, index), start: tokenStart, end: index });
       }
     }
     return tokens;
+  }
+
+  function activeTagFilters(query) {
+    return parseQuery(query)
+      .filter((token) => token.field === "tag" && !token.exclude && token.text)
+      .map((token) => token.text);
+  }
+
+  function quoteQueryValue(value) {
+    const text = String(value ?? "").trim();
+    return /\s/.test(text) ? `"${text.replace(/"/g, "")}"` : text;
+  }
+
+  function toggleTagFilter(query, tag) {
+    const source = String(query ?? "");
+    const normalizedTag = normalizeText(String(tag ?? "").trim());
+    if (!normalizedTag) return source;
+    const tokens = parseQuery(source);
+    const existing = tokens.find((token) =>
+      token.field === "tag" &&
+      !token.exclude &&
+      normalizeText(token.text) === normalizedTag
+    );
+    const removable = tokens.filter((token) =>
+      (existing && token === existing) ||
+      (token.field === "tag" && !token.exclude && !token.text)
+    );
+    const cleaned = removable
+      .sort((left, right) => right.start - left.start)
+      .reduce((value, token) => `${value.slice(0, token.start)}${value.slice(token.end)}`, source)
+      .trim()
+      .replace(/\s{2,}/g, " ");
+    if (existing) {
+      return cleaned
+        .trim()
+        .replace(/\s{2,}/g, " ");
+    }
+    return [cleaned, `tag:${quoteQueryValue(tag)}`].filter(Boolean).join(" ");
+  }
+
+  function tagCompletionContext(query, caretPosition) {
+    const source = String(query ?? "");
+    const caret = Math.max(0, Math.min(source.length, Number.isFinite(caretPosition) ? caretPosition : source.length));
+    const beforeCaret = source.slice(0, caret);
+    const match = /(?:^|\s)(tag:)[ \t]*(?:"([^"]*)|([^\s"]*))$/i.exec(beforeCaret);
+    if (!match) return null;
+    const operatorOffset = match[0].toLocaleLowerCase().lastIndexOf("tag:");
+    const operatorStart = match.index + operatorOffset;
+    return {
+      query: match[2] !== undefined ? match[2] : (match[3] || ""),
+      replaceStart: operatorStart + 4,
+      replaceEnd: caret
+    };
   }
 
   function entryFieldTexts(entry) {
@@ -191,7 +244,10 @@
     let bestRank = 4;
     for (const token of tokens) {
       const target = token.field ? texts[token.field] : generalFields;
-      const matched = tokenMatches(target, token);
+      const matched = token.field === "tag"
+        ? !token.text || splitTags(entry?.tags || entry?.fields?.ctca_tags || "")
+            .some((tag) => normalizeText(tag) === normalizeText(token.text))
+        : tokenMatches(target, token);
       if (token.exclude ? matched : !matched) return { matched: false, rank: 99 };
       if (!token.exclude) {
         if (token.field === "citekey" || (!token.field && tokenMatches(texts.citekey, token))) bestRank = Math.min(bestRank, 0);
@@ -212,6 +268,10 @@
     FIELD_ALIASES,
     splitTags,
     parseQuery,
+    activeTagFilters,
+    toggleTagFilter,
+    tagCompletionContext,
+    quoteQueryValue,
     entryFieldTexts,
     normalizeFilterState,
     matchesFilters,

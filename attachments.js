@@ -11,6 +11,9 @@
   const BIB_SYNC_BASE_KEY = `${PREFIX}nextcloud-bibliography-sync-base:v1`;
   const REMOTE_BIB_FILE = "global-bibliography.bib";
   const LEGACY_REMOTE_BIB_DATABASE = "bibliography-database.json";
+  const SHARED_CATEGORY_DIRECTORY = "shared-categories";
+  const SHARED_CATEGORY_MANIFEST = "manifest.json";
+  const SHARED_CATEGORY_BIB_FILE = "bibliography.bib";
   const DELETION_COMMENT_PREFIX = "ctca_deleted_entries:";
   const CONFIG_SCHEMA_VERSION = 2;
   const DB_NAME = "ctca-pdf-attachments-v1";
@@ -1247,6 +1250,702 @@
     };
   }
 
+  function normalizeSharedCategory(value) {
+    if (!value || typeof value !== "object" || !value.id) return null;
+    const role = value.role === "owner" ? "owner" : "member";
+    const permission = value.permission === "write" ? "write" : "read";
+    return {
+      id: String(value.id),
+      role,
+      permission,
+      shareId: String(value.shareId || ""),
+      shareUrl: String(value.shareUrl || ""),
+      token: String(value.token || ""),
+      sharePassword: String(value.sharePassword || ""),
+      remoteServer: String(value.remoteServer || ""),
+      remotePath: normalizeNextcloudPath(value.remotePath || ""),
+      mirrorPath: normalizeNextcloudPath(value.mirrorPath || ""),
+      categoryIds: value.categoryIds && typeof value.categoryIds === "object" ? { ...value.categoryIds } : {},
+      entryKeys: value.entryKeys && typeof value.entryKeys === "object" ? { ...value.entryKeys } : {},
+      lastLocalFingerprint: String(value.lastLocalFingerprint || ""),
+      lastRemoteFingerprint: String(value.lastRemoteFingerprint || ""),
+      lastSyncAt: String(value.lastSyncAt || ""),
+      syncStatus: value.syncStatus === "error" ? "error" : "ok",
+      syncError: String(value.syncError || "")
+    };
+  }
+
+  function categorySubtreeIds(database, rootId) {
+    const ids = new Set([rootId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const category of database.categories || []) {
+        if (!ids.has(category.id) && ids.has(category.parentId)) {
+          ids.add(category.id);
+          changed = true;
+        }
+      }
+    }
+    return ids;
+  }
+
+  function sharedCategoryRootFor(database, categoryId) {
+    let current = (database.categories || []).find((category) => category.id === categoryId) || null;
+    const visited = new Set();
+    while (current && !visited.has(current.id)) {
+      visited.add(current.id);
+      if (normalizeSharedCategory(current.shared)) return current;
+      current = (database.categories || []).find((category) => category.id === current.parentId) || null;
+    }
+    return null;
+  }
+
+  function sharedCategorySnapshot(databaseInput, rootCategory, sharedOverride = null) {
+    const database = normalizeDatabase(databaseInput);
+    const shared = normalizeSharedCategory(sharedOverride || rootCategory.shared) || {};
+    const subtree = categorySubtreeIds(database, rootCategory.id);
+    const categories = database.categories
+      .filter((category) => subtree.has(category.id))
+      .map((category) => ({
+        id: category.id,
+        name: String(category.name || "Untitled category"),
+        parentId: category.id === rootCategory.id ? "" : String(category.parentId || ""),
+        order: Number(category.order) || 0
+      }));
+    const inverseLocalKeys = new Map(
+      Object.entries(shared.entryKeys || {}).map(([remoteKey, localKey]) => [String(localKey).toLowerCase(), remoteKey])
+    );
+    const memberships = {};
+    const entries = [];
+    const localKeys = new Map();
+    for (const entry of database.entries || []) {
+      const memberIds = (database.memberships?.[entry.key] || []).filter((id) => subtree.has(id));
+      if (!memberIds.length) continue;
+      const canonicalKey = inverseLocalKeys.get(String(entry.key).toLowerCase()) || entry.key;
+      const clone = {
+        ...entry,
+        key: canonicalKey,
+        fields: { ...(entry.fields || {}) },
+        aliases: [...(entry.aliases || [])].filter((alias) => String(alias).toLowerCase() !== String(canonicalKey).toLowerCase()),
+        tags: [...(entry.tags || [])]
+      };
+      entries.push(clone);
+      memberships[canonicalKey] = memberIds;
+      localKeys.set(canonicalKey, entry.key);
+    }
+    const snapshot = normalizeDatabase({
+      version: 3,
+      entries,
+      categories,
+      memberships,
+      deletedEntries: [],
+      updatedAt: now()
+    });
+    return { snapshot, subtree, localKeys };
+  }
+
+  function sharedSnapshotFingerprint(snapshotInput) {
+    const snapshot = normalizeDatabase(snapshotInput);
+    return stableString({
+      entries: snapshot.entries.map((entry) => JSON.parse(comparableEntry(entry))).sort((left, right) => String(left.key).localeCompare(String(right.key))),
+      categories: snapshot.categories.map((category) => ({
+        id: category.id,
+        name: category.name,
+        parentId: category.parentId || "",
+        order: Number(category.order) || 0
+      })).sort((left, right) => left.id.localeCompare(right.id)),
+      memberships: snapshot.memberships
+    });
+  }
+
+  function sharedCategoryFolder(sharedId, imported = false) {
+    return `${SHARED_CATEGORY_DIRECTORY}/${imported ? "imported/" : ""}${sharedId}`;
+  }
+
+  async function ensureDavFolders(nc, relativePath) {
+    let current = "";
+    for (const part of normalizeNextcloudPath(relativePath).split("/").filter(Boolean)) {
+      current = current ? `${current}/${part}` : part;
+      const response = await davFetch(nc, current, { method: "MKCOL" });
+      if (![201, 405].includes(response.status)) {
+        throw new Error(`Could not create Nextcloud folder ${current} (${response.status}).`);
+      }
+    }
+  }
+
+  async function ocsShareRequest(nc, path, options = {}) {
+    const headers = headersToObject(options.headers);
+    setHeader(headers, "Authorization", basicAuth(nc.loginName, nc.appPassword));
+    setHeader(headers, "OCS-APIRequest", "true");
+    setHeader(headers, "Accept", "application/json");
+    const separator = path.includes("?") ? "&" : "?";
+    const response = await extensionFetch(
+      `${normalizeServer(nc.server)}/ocs/v2.php/apps/files_sharing/api/v1/${path}${separator}format=json`,
+      { ...options, headers }
+    );
+    const responseText = await response.text();
+    let payload = null;
+    if (responseText.trim()) {
+      try {
+        payload = JSON.parse(responseText);
+      } catch (_) {
+        if (response.ok) throw new Error("Nextcloud sharing request returned invalid JSON.");
+      }
+    }
+    const statusCode = Number(payload?.ocs?.meta?.statuscode || (response.ok ? 100 : response.status));
+    if (!response.ok || statusCode >= 400) {
+      const detail = String(payload?.ocs?.meta?.message || "").trim();
+      const displayedStatus = response.ok ? statusCode : response.status;
+      const error = new Error(
+        detail
+          ? `Nextcloud sharing request failed (${displayedStatus}): ${detail}`
+          : `Nextcloud sharing request failed (${displayedStatus}).`
+      );
+      error.httpStatus = Number(response.status || 0);
+      error.ocsStatus = statusCode;
+      error.ocsMessage = detail;
+      error.sharePasswordRequired = (error.httpStatus === 403 || error.ocsStatus === 403)
+        && /password|passw(?:o|ö)rt|mot de passe|contrase(?:n|ñ)a|senha|wachtwoord/i.test(detail);
+      throw error;
+    }
+    if (!payload) throw new Error("Nextcloud sharing request returned an empty response.");
+    return payload?.ocs?.data;
+  }
+
+  function publicShareDescriptor(value, password = "") {
+    const url = new URL(String(value || "").trim());
+    if (!/^https?:$/.test(url.protocol)) throw new Error("The shared-category link must use HTTP or HTTPS.");
+    const match = url.pathname.match(/^(.*?)(?:\/index\.php)?\/s\/([^/?#]+)/i);
+    if (!match?.[2]) throw new Error("This is not a valid Nextcloud public-share link.");
+    return {
+      shareUrl: url.href,
+      server: `${url.origin}${String(match[1] || "").replace(/\/+$/, "")}`,
+      token: decodeURIComponent(match[2]),
+      password: String(password || "")
+    };
+  }
+
+  function publicDavUrl(descriptor, relativePath = "") {
+    const suffix = encodePath(normalizeNextcloudPath(relativePath));
+    return `${descriptor.server}/remote.php/dav/public-files/${encodeURIComponent(descriptor.token)}${suffix ? `/${suffix}` : "/"}`;
+  }
+
+  async function publicDavFetch(descriptor, relativePath, options = {}) {
+    const headers = headersToObject(options.headers);
+    setHeader(headers, "Authorization", basicAuth(descriptor.token, descriptor.password || ""));
+    return extensionFetch(publicDavUrl(descriptor, relativePath), { ...options, headers });
+  }
+
+  async function readPublicSharedManifest(descriptor) {
+    const response = await publicDavFetch(descriptor, SHARED_CATEGORY_MANIFEST);
+    if (response.status === 404) throw new Error("The shared category is no longer available.");
+    if (response.status === 401 || response.status === 403) {
+      const error = new Error("This Nextcloud share requires a password, or the supplied password is incorrect.");
+      error.sharePasswordRequired = true;
+      error.httpStatus = response.status;
+      throw error;
+    }
+    if (!response.ok) throw new Error(`Could not read the shared category (${response.status}).`);
+    const manifest = await responseJson(response, "Shared-category manifest");
+    if (Number(manifest?.version) !== 1 || !manifest?.shareId || !manifest?.database) {
+      throw new Error("The link does not contain a valid Smart Citations shared category.");
+    }
+    return manifest;
+  }
+
+  async function collectSharedAttachments(snapshot, nc, folder, upload, localKeys = new Map(), sharedId = "") {
+    const index = await loadIndex();
+    const attachments = [];
+    const snapshotKeys = new Set(snapshot.entries.map((entry) => String(entry.key).toLowerCase()));
+    const entryByIdentity = new Map(snapshot.entries.map((entry) => [entryRef(entry).identity, entry]));
+    for (const attachment of index.attachments || []) {
+      const canonicalEntry = entryByIdentity.get(String(attachment?.entry?.identity || ""));
+      const keyMatch = snapshot.entries.find((entry) => {
+        const localKey = localKeys.get(entry.key) || entry.key;
+        const candidateKeys = [localKey, entry.key, ...(entry.aliases || [])].map((key) => String(key).toLowerCase());
+        return candidateKeys.includes(String(attachment?.entry?.key || "").toLowerCase());
+      });
+      const entry = canonicalEntry || keyMatch;
+      if (!entry || !snapshotKeys.has(String(entry.key).toLowerCase())) continue;
+      const blob = await getBlob(attachment);
+      if (!blob) continue;
+      const sharedPrefix = `shared-${sharedId}-`;
+      const sourceAttachmentId = sharedId && String(attachment.id).startsWith(sharedPrefix)
+        ? String(attachment.id).slice(sharedPrefix.length)
+        : String(attachment.id);
+      const remoteName = `${sourceAttachmentId}-${sanitizeFileName(attachment.fileName || `${attachment.name || "attachment"}.pdf`)}`;
+      if (upload === "owner") {
+        const response = await davFetch(nc, `${folder}/files/${remoteName}`, {
+          method: "PUT",
+          headers: { "Content-Type": blob.type || "application/pdf" },
+          body: blob
+        });
+        if (!response.ok) throw new Error(`Could not copy an attached PDF to the shared category (${response.status}).`);
+      } else if (upload?.descriptor) {
+        const response = await publicDavFetch(upload.descriptor, `files/${remoteName}`, {
+          method: "PUT",
+          headers: { "Content-Type": blob.type || "application/pdf" },
+          body: blob
+        });
+        if (!response.ok) throw new Error(`Could not synchronize an attached PDF to the shared category (${response.status}).`);
+      }
+      attachments.push({
+        id: sourceAttachmentId,
+        entryKey: entry.key,
+        name: String(attachment.name || ""),
+        fileName: sanitizeFileName(attachment.fileName || remoteName),
+        remoteName,
+        mimeType: String(attachment.mimeType || blob.type || "application/pdf"),
+        size: Number(blob.size) || 0,
+        notes: String(attachment.notes || ""),
+        updatedAt: String(attachment.updatedAt || "")
+      });
+    }
+    return attachments;
+  }
+
+  async function sharedAttachmentFingerprint(snapshot, localKeys = new Map(), sharedId = "") {
+    const index = await loadIndex();
+    const rows = [];
+    for (const attachment of index.attachments || []) {
+      const entry = snapshot.entries.find((candidate) => {
+        const localKey = localKeys.get(candidate.key) || candidate.key;
+        const keys = [localKey, candidate.key, ...(candidate.aliases || [])].map((key) => String(key).toLowerCase());
+        const attachmentKey = String(attachment?.entry?.key || "").toLowerCase();
+        return keys.includes(attachmentKey)
+          || (candidate.fields?.doi && normalizeDoi(candidate.fields.doi) === normalizeDoi(attachment?.entry?.doi));
+      });
+      if (!entry) continue;
+      const sharedPrefix = `shared-${sharedId}-`;
+      rows.push({
+        id: sharedId && String(attachment.id).startsWith(sharedPrefix)
+          ? String(attachment.id).slice(sharedPrefix.length)
+          : String(attachment.id),
+        entryKey: entry.key,
+        fileName: String(attachment.fileName || ""),
+        name: String(attachment.name || ""),
+        notes: String(attachment.notes || ""),
+        size: Number(attachment.size) || 0,
+        updatedAt: String(attachment.updatedAt || "")
+      });
+    }
+    return stableString(rows.sort((left, right) => left.id.localeCompare(right.id)));
+  }
+
+  async function writeSharedCategorySnapshot(databaseInput, rootCategory, { descriptor = null, force = false } = {}) {
+    const config = await getConfig();
+    const nc = config.nextcloud;
+    if (!nc?.server || !nc?.appPassword) throw new Error("Connect a Nextcloud account first.");
+    if (!nc.syncBibliography) throw new Error("Enable Nextcloud bibliography synchronization before sharing a category.");
+    const shared = normalizeSharedCategory(rootCategory.shared);
+    if (!shared) throw new Error("The category is not configured for sharing.");
+    const { snapshot, localKeys } = sharedCategorySnapshot(databaseInput, rootCategory, shared);
+    const fingerprint = stableString({
+      bibliography: sharedSnapshotFingerprint(snapshot),
+      attachments: await sharedAttachmentFingerprint(snapshot, localKeys, shared.id)
+    });
+    if (!force && fingerprint === shared.lastLocalFingerprint) {
+      return { fingerprint, manifest: null, shared: { ...shared, syncStatus: "ok", syncError: "", lastSyncAt: now() } };
+    }
+    const folder = shared.remotePath || sharedCategoryFolder(shared.id);
+    if (!descriptor) {
+      await ensureDavFolders(nc, `${folder}/files`);
+    }
+    const attachments = await collectSharedAttachments(snapshot, nc, folder, descriptor ? { descriptor } : "owner", localKeys, shared.id);
+    const manifest = {
+      version: 1,
+      shareId: shared.id,
+      permission: shared.permission,
+      owner: String(nc.loginName || ""),
+      updatedAt: now(),
+      fingerprint,
+      database: snapshot,
+      attachments
+    };
+    const bibText = databaseToBib(snapshot);
+    const put = descriptor
+      ? (path, body, contentType) => publicDavFetch(descriptor, path, { method: "PUT", headers: { "Content-Type": contentType }, body })
+      : (path, body, contentType) => davFetch(nc, `${folder}/${path}`, { method: "PUT", headers: { "Content-Type": contentType }, body });
+    const bibResponse = await put(SHARED_CATEGORY_BIB_FILE, bibText, "application/x-bibtex; charset=utf-8");
+    if (!bibResponse.ok) throw new Error(`Could not write the shared bibliography (${bibResponse.status}).`);
+    const manifestResponse = await put(SHARED_CATEGORY_MANIFEST, JSON.stringify(manifest, null, 2), "application/json");
+    if (!manifestResponse.ok) throw new Error(`Could not write shared-category metadata (${manifestResponse.status}).`);
+    return {
+      fingerprint,
+      manifest,
+      shared: {
+        ...shared,
+        entryKeys: { ...(shared.entryKeys || {}), ...Object.fromEntries(localKeys) },
+        lastLocalFingerprint: fingerprint,
+        lastRemoteFingerprint: fingerprint,
+        lastSyncAt: now(),
+        syncStatus: "ok",
+        syncError: ""
+      }
+    };
+  }
+
+  function uniqueSharedLocalKey(database, requested, current = "") {
+    const used = new Set((database.entries || []).map((entry) => String(entry.key).toLowerCase()));
+    if (current) used.delete(String(current).toLowerCase());
+    const base = String(requested || "Reference").replace(/[^A-Za-z0-9_.:-]+/g, "") || "Reference";
+    if (!used.has(base.toLowerCase())) return base;
+    let suffix = 2;
+    while (used.has(`${base}-${suffix}`.toLowerCase())) suffix += 1;
+    return `${base}-${suffix}`;
+  }
+
+  async function mirrorSharedAttachments(nc, descriptor, manifest, shared, database) {
+    const mirrorPath = shared.mirrorPath || sharedCategoryFolder(shared.id, true);
+    await ensureDavFolders(nc, `${mirrorPath}/files`);
+    const mirroredManifest = await davFetch(nc, `${mirrorPath}/${SHARED_CATEGORY_MANIFEST}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(manifest, null, 2)
+    });
+    if (!mirroredManifest.ok) throw new Error(`Could not copy shared-category metadata into this Nextcloud account (${mirroredManifest.status}).`);
+    const mirroredBib = await davFetch(nc, `${mirrorPath}/${SHARED_CATEGORY_BIB_FILE}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/x-bibtex; charset=utf-8" },
+      body: databaseToBib(manifest.database)
+    });
+    if (!mirroredBib.ok) throw new Error(`Could not copy the shared bibliography into this Nextcloud account (${mirroredBib.status}).`);
+    const index = await loadIndex();
+    const keepIds = new Set();
+    for (const item of manifest.attachments || []) {
+      const localKey = shared.entryKeys?.[item.entryKey] || item.entryKey;
+      const localEntry = (database.entries || []).find((entry) => entry.key === localKey);
+      if (!localEntry) continue;
+      const response = await publicDavFetch(descriptor, `files/${item.remoteName}`);
+      if (!response.ok) throw new Error(`Could not download a shared PDF (${response.status}).`);
+      const blob = await response.blob();
+      const localRemotePath = `${mirrorPath}/files/${item.remoteName}`;
+      const mirrorResponse = await davFetch(nc, localRemotePath, {
+        method: "PUT",
+        headers: { "Content-Type": item.mimeType || blob.type || "application/pdf" },
+        body: blob
+      });
+      if (!mirrorResponse.ok) throw new Error(`Could not copy a shared PDF into this Nextcloud account (${mirrorResponse.status}).`);
+      const attachmentId = `shared-${shared.id}-${item.id}`;
+      keepIds.add(attachmentId);
+      const attachment = index.attachments.find((entry) => entry.id === attachmentId);
+      const value = {
+        id: attachmentId,
+        entry: entryRef(localEntry),
+        name: String(item.name || item.fileName || "Shared PDF"),
+        provider: "nextcloud",
+        remotePath: localRemotePath,
+        fileName: sanitizeFileName(item.fileName || "attachment.pdf"),
+        mimeType: String(item.mimeType || "application/pdf"),
+        size: Number(item.size) || blob.size,
+        notes: String(item.notes || ""),
+        sharedCategoryId: shared.id,
+        createdAt: attachment?.createdAt || now(),
+        updatedAt: String(item.updatedAt || manifest.updatedAt || now())
+      };
+      if (attachment) Object.assign(attachment, value);
+      else index.attachments.push(value);
+    }
+    index.attachments = index.attachments.filter((attachment) =>
+      attachment.sharedCategoryId !== shared.id || keepIds.has(attachment.id)
+    );
+    await saveIndex(index);
+    await writeRemoteIndex(nc, index);
+    return mirrorPath;
+  }
+
+  function applySharedManifest(databaseInput, manifest, sharedInput, existingRootId = "") {
+    const database = normalizeDatabase(databaseInput);
+    const remote = normalizeDatabase(manifest.database);
+    const shared = normalizeSharedCategory(sharedInput);
+    if (!shared) throw new Error("Shared-category metadata is incomplete.");
+    const remoteRoot = remote.categories.find((category) => !category.parentId) || remote.categories[0];
+    if (!remoteRoot) throw new Error("The shared category contains no category tree.");
+    const idMap = { ...(shared.categoryIds || {}) };
+    for (const category of remote.categories) {
+      if (!idMap[category.id]) {
+        idMap[category.id] = category.id === remoteRoot.id && existingRootId
+          ? existingRootId
+          : `shared-${shared.id}-${category.id}`;
+      }
+    }
+    const localRootId = idMap[remoteRoot.id];
+    const previousSubtree = existingRootId ? categorySubtreeIds(database, existingRootId) : new Set();
+    database.categories = database.categories.filter((category) => !previousSubtree.has(category.id));
+    const topLevelOrder = database.categories.filter((category) => !category.parentId).length;
+    for (const category of remote.categories) {
+      const localId = idMap[category.id];
+      database.categories.push({
+        id: localId,
+        name: category.name,
+        parentId: category.id === remoteRoot.id ? "" : (idMap[category.parentId] || localRootId),
+        order: category.id === remoteRoot.id ? topLevelOrder : Number(category.order) || 0,
+        ...(category.id === remoteRoot.id ? { shared: { ...shared, categoryIds: idMap } } : {})
+      });
+    }
+    const oldEntryKeys = { ...(shared.entryKeys || {}) };
+    const nextEntryKeys = {};
+    const localSubtreeIds = new Set(Object.values(idMap));
+    for (const [key, ids] of Object.entries(database.memberships || {})) {
+      const kept = (ids || []).filter((id) => !localSubtreeIds.has(id) && !previousSubtree.has(id));
+      if (kept.length) database.memberships[key] = kept;
+      else delete database.memberships[key];
+    }
+    for (const remoteEntry of remote.entries) {
+      const canonicalKey = remoteEntry.key;
+      const previousCanonicalKey = (remoteEntry.aliases || []).find((alias) => oldEntryKeys[alias]);
+      const existingMappedKey = oldEntryKeys[canonicalKey] || oldEntryKeys[previousCanonicalKey] || "";
+      let localEntry = database.entries.find((entry) => entry.key === existingMappedKey) || null;
+      if (!localEntry && !existingMappedKey) {
+        localEntry = database.entries.find((entry) => String(entry.key).toLowerCase() === String(canonicalKey).toLowerCase()) || null;
+      }
+      const localKey = localEntry?.key || uniqueSharedLocalKey(database, canonicalKey);
+      const clone = {
+        ...remoteEntry,
+        key: localKey,
+        fields: { ...(remoteEntry.fields || {}) },
+        aliases: [...new Set([...(remoteEntry.aliases || []), ...(localKey !== canonicalKey ? [canonicalKey] : [])])],
+        tags: [...(remoteEntry.tags || [])]
+      };
+      if (localEntry) Object.assign(localEntry, clone);
+      else {
+        database.entries.push(clone);
+        localEntry = clone;
+      }
+      nextEntryKeys[canonicalKey] = localKey;
+      const mappedMemberships = (remote.memberships?.[canonicalKey] || []).map((id) => idMap[id]).filter(Boolean);
+      const currentMemberships = database.memberships[localKey] || [];
+      database.memberships[localKey] = [...new Set([...currentMemberships, ...mappedMemberships])];
+    }
+    const root = database.categories.find((category) => category.id === localRootId);
+    root.shared = {
+      ...shared,
+      categoryIds: idMap,
+      entryKeys: nextEntryKeys,
+      lastLocalFingerprint: String(manifest.fingerprint || sharedSnapshotFingerprint(remote)),
+      lastRemoteFingerprint: String(manifest.fingerprint || sharedSnapshotFingerprint(remote)),
+      lastSyncAt: now(),
+      syncStatus: "ok",
+      syncError: ""
+    };
+    database.updatedAt = now();
+    return { database, root, shared: root.shared };
+  }
+
+  async function createSharedCategory(databaseInput, categoryId, permission = "read", password = "") {
+    const database = normalizeDatabase(databaseInput || await storageGet(GLOBAL_DATABASE_KEY));
+    const root = (database.categories || []).find((category) => category.id === categoryId);
+    if (!root) throw new Error("Category not found.");
+    if (normalizeSharedCategory(root.shared)) throw new Error("This category is already shared.");
+    const config = await getConfig();
+    const nc = config.nextcloud;
+    if (!nc?.server || !nc?.appPassword) throw new Error("Connect a Nextcloud account first.");
+    const sharedId = globalThis.crypto?.randomUUID?.() || `category-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const remotePath = sharedCategoryFolder(sharedId);
+    root.shared = {
+      id: sharedId,
+      role: "owner",
+      permission: permission === "write" ? "write" : "read",
+      remotePath,
+      syncStatus: "ok"
+    };
+    await ensureDavFolders(nc, `${remotePath}/files`);
+    const written = await writeSharedCategorySnapshot(database, root, { force: true });
+    Object.assign(root.shared, written.shared);
+    const absoluteSharePath = `/${normalizeNextcloudPath([nc.directory, remotePath].filter(Boolean).join("/"))}`;
+    let shareData = null;
+    try {
+      const createParameters = new URLSearchParams({
+        path: absoluteSharePath,
+        shareType: "3",
+        permissions: "1",
+        publicUpload: "false"
+      });
+      if (String(password || "")) createParameters.set("password", String(password));
+      shareData = await ocsShareRequest(nc, "shares", {
+        method: "POST",
+        body: createParameters
+      });
+      const shareId = String(shareData?.id || "");
+      if (!shareId) throw new Error("Nextcloud created the share but did not return its ID.");
+      if (root.shared.permission === "write") {
+        try {
+          // Keep these as separate requests for compatibility with Nextcloud
+          // versions that allow only one share property update at a time.
+          await ocsShareRequest(nc, `shares/${encodeURIComponent(shareId)}`, {
+            method: "PUT",
+            body: new URLSearchParams({ publicUpload: "true" })
+          });
+          await ocsShareRequest(nc, `shares/${encodeURIComponent(shareId)}`, {
+            method: "PUT",
+            body: new URLSearchParams({ permissions: "15" })
+          });
+        } catch (error) {
+          if (error?.httpStatus === 403 || error?.ocsStatus === 403) {
+            const permissionError = new Error(
+              "This Nextcloud server has disabled writable public-link shares. Ask the administrator to enable public uploads, or share the category as read-only."
+            );
+            permissionError.cause = error;
+            throw permissionError;
+          }
+          throw error;
+        }
+      }
+      root.shared.shareId = shareId;
+      root.shared.shareUrl = String(shareData?.url || "");
+      root.shared.token = String(shareData?.token || "");
+      root.shared.remoteServer = normalizeServer(nc.server);
+      if (!root.shared.shareUrl) throw new Error("Nextcloud created the share but did not return a share link.");
+      await storageSet(GLOBAL_DATABASE_KEY, database);
+      return { database, categoryId: root.id, shareUrl: root.shared.shareUrl, shared: root.shared };
+    } catch (error) {
+      const shareId = String(shareData?.id || "");
+      if (shareId) {
+        try {
+          await ocsShareRequest(nc, `shares/${encodeURIComponent(shareId)}`, { method: "DELETE" });
+        } catch (_) {
+          // Best-effort cleanup; preserve the error that prevented sharing.
+        }
+      }
+      try {
+        const response = await davFetch(nc, remotePath, { method: "DELETE" });
+        if (!response.ok && response.status !== 404) {
+          console.warn(`Could not clean up failed shared-category folder (${response.status}).`);
+        }
+      } catch (_) {
+        // Best-effort cleanup; preserve the error that prevented sharing.
+      }
+      delete root.shared;
+      throw error;
+    }
+  }
+
+  async function importSharedCategory(shareUrl, password = "") {
+    const descriptor = publicShareDescriptor(shareUrl, password);
+    if (!(await requestOriginPermission(descriptor.server))) {
+      throw new Error("Permission to access the Nextcloud share was not granted.");
+    }
+    const manifest = await readPublicSharedManifest(descriptor);
+    const config = await getConfig();
+    const nc = config.nextcloud;
+    if (!nc?.server || !nc?.appPassword) {
+      throw new Error("Connect your own Nextcloud account before adding a shared category.");
+    }
+    if (!nc.syncBibliography) {
+      throw new Error("Enable Nextcloud bibliography synchronization before adding a shared category.");
+    }
+    let database = normalizeDatabase(await storageGet(GLOBAL_DATABASE_KEY));
+    const existing = database.categories.find((category) => normalizeSharedCategory(category.shared)?.id === String(manifest.shareId));
+    if (existing) throw new Error("This shared category has already been added.");
+    const shared = normalizeSharedCategory({
+      id: manifest.shareId,
+      role: "member",
+      permission: manifest.permission,
+      shareUrl: descriptor.shareUrl,
+      token: descriptor.token,
+      sharePassword: descriptor.password,
+      remoteServer: descriptor.server,
+      mirrorPath: sharedCategoryFolder(manifest.shareId, true)
+    });
+    const applied = applySharedManifest(database, manifest, shared);
+    database = applied.database;
+    await mirrorSharedAttachments(nc, descriptor, manifest, applied.shared, database);
+    await storageSet(GLOBAL_DATABASE_KEY, database);
+    return { database, categoryId: applied.root.id, shared: applied.root.shared };
+  }
+
+  async function syncSharedCategories(databaseInput = null) {
+    const config = await getConfig();
+    const nc = config.nextcloud;
+    if (!nc?.server || !nc?.appPassword || !nc.syncBibliography) {
+      return { database: normalizeDatabase(databaseInput), synchronized: 0, errors: [] };
+    }
+    let database = normalizeDatabase(databaseInput || await storageGet(GLOBAL_DATABASE_KEY));
+    let synchronized = 0;
+    const errors = [];
+    const rootIds = database.categories
+      .filter((category) => normalizeSharedCategory(category.shared))
+      .map((category) => category.id);
+    for (const rootId of rootIds) {
+      let root = database.categories.find((category) => category.id === rootId);
+      if (!root) continue;
+      const shared = normalizeSharedCategory(root.shared);
+      try {
+        if (shared.role === "owner") {
+          const written = await writeSharedCategorySnapshot(database, root);
+          root.shared = written.shared;
+        } else {
+          const descriptor = {
+            shareUrl: shared.shareUrl,
+            server: shared.remoteServer || publicShareDescriptor(shared.shareUrl).server,
+            token: shared.token || publicShareDescriptor(shared.shareUrl).token,
+            password: shared.sharePassword
+          };
+          const manifest = await readPublicSharedManifest(descriptor);
+          const remoteFingerprint = String(manifest.fingerprint || sharedSnapshotFingerprint(manifest.database));
+          const localState = sharedCategorySnapshot(database, root, shared);
+          const localFingerprint = stableString({
+            bibliography: sharedSnapshotFingerprint(localState.snapshot),
+            attachments: await sharedAttachmentFingerprint(localState.snapshot, localState.localKeys, shared.id)
+          });
+          const localChanged = Boolean(shared.lastLocalFingerprint && localFingerprint !== shared.lastLocalFingerprint);
+          const remoteChanged = Boolean(shared.lastRemoteFingerprint && remoteFingerprint !== shared.lastRemoteFingerprint);
+          if (shared.permission === "write" && localChanged && remoteChanged) {
+            throw new Error("This shared category changed locally and remotely. Synchronization was stopped to avoid overwriting either version.");
+          }
+          if (shared.permission === "write" && localChanged && !remoteChanged) {
+            const written = await writeSharedCategorySnapshot(database, root, { descriptor, force: true });
+            root.shared = written.shared;
+          } else if (remoteChanged || !shared.lastRemoteFingerprint || (shared.permission !== "write" && localChanged)) {
+            const applied = applySharedManifest(database, manifest, shared, root.id);
+            database = applied.database;
+            root = applied.root;
+            root.shared.mirrorPath = await mirrorSharedAttachments(nc, descriptor, manifest, root.shared, database);
+          } else {
+            root.shared = { ...shared, syncStatus: "ok", syncError: "", lastSyncAt: now() };
+          }
+        }
+        synchronized += 1;
+      } catch (error) {
+        const message = error?.message || String(error);
+        root = database.categories.find((category) => category.id === rootId) || root;
+        root.shared = { ...shared, syncStatus: "error", syncError: message, lastSyncAt: now() };
+        errors.push({ categoryId: rootId, message });
+      }
+    }
+    database.updatedAt = now();
+    await storageSet(GLOBAL_DATABASE_KEY, database);
+    return { database, synchronized, errors };
+  }
+
+  async function stopSharedCategory(databaseInput, categoryId) {
+    const database = normalizeDatabase(databaseInput || await storageGet(GLOBAL_DATABASE_KEY));
+    const root = (database.categories || []).find((category) => category.id === categoryId);
+    const shared = normalizeSharedCategory(root?.shared);
+    if (!root || !shared) throw new Error("This category is not shared.");
+    const config = await getConfig();
+    const nc = config.nextcloud;
+    if (shared.role === "owner") {
+      if (shared.shareId) await ocsShareRequest(nc, `shares/${encodeURIComponent(shared.shareId)}`, { method: "DELETE" });
+      if (shared.remotePath) {
+        const response = await davFetch(nc, shared.remotePath, { method: "DELETE" });
+        if (!response.ok && response.status !== 404) throw new Error(`Could not remove the remote shared folder (${response.status}).`);
+      }
+    } else if (shared.mirrorPath) {
+      const response = await davFetch(nc, shared.mirrorPath, { method: "DELETE" });
+      if (!response.ok && response.status !== 404) throw new Error(`Could not remove the local Nextcloud mirror (${response.status}).`);
+      const index = await loadIndex();
+      index.attachments = index.attachments.filter((attachment) => attachment.sharedCategoryId !== shared.id);
+      await saveIndex(index);
+      await writeRemoteIndex(nc, index);
+    }
+    delete root.shared;
+    database.updatedAt = now();
+    await storageSet(GLOBAL_DATABASE_KEY, database);
+    return { database, categoryId };
+  }
+
   function databaseEntryIdentity(entry) {
     // Keep each BibTeX citation-key record distinct during synchronization.
     return `key:${String(entry?.key || "").trim().toLowerCase()}`;
@@ -1871,6 +2570,7 @@
   globalThis.CollabTeXAttachmentStore = {
     INDEX_KEY, CONFIG_KEY, GLOBAL_DATABASE_KEY, entryRef, getConfig, saveConfig, checkNextcloudConnection, connectNextcloud, syncNextcloud,
     syncBibliographyNextcloud, deleteBibliographyEntriesNextcloud, resolveBibliographyConflicts, databaseToBib, bibToDatabase, isPdfFile,
+    createSharedCategory, importSharedCategory, syncSharedCategories, stopSharedCategory, sharedCategoryRootFor,
     list, listMany, reorder, addBrowser, addLocalLink, addLocalSession, addLocalHandle, addNextcloud, getBlob, update, replaceFile, remove, removeForEntries,
     normalizeLocalPath, ensureLocalFilePermission, isLocalFilePermissionGranted, openLocalFilePermissionSettings,
     discoverWebPdfs, showWebHumanCheck, closeWebTab, downloadWebPdf,

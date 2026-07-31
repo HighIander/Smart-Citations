@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Welcome to Smart Citations</title>
+  <link rel="stylesheet" href="welcome.css">
+</head>
+<body>
+  <main class="welcome-card" aria-labelledby="ctca-welcome-title">
+    <div class="brand-row">
+      <img src="icons/icon128.png" alt="">
+      <span>Smart Citations</span>
+      <span class="new-pill">Ready</span>
+    </div>
+
+    <section class="welcome-copy">
+      <p class="eyebrow">One small setup step</p>
+      <h1 id="ctca-welcome-title">Keep your reference manager one click away</h1>
+      <p>Pin Smart Citations to your toolbar so you can open the reference manager quickly from any tab.</p>
+    </section>
+
+    <div class="toolbar-demo" aria-hidden="true">
+      <span class="window-dot"></span>
+      <span class="window-dot"></span>
+      <span class="address-bar"></span>
+      <span class="extensions-button">🧩</span>
+      <span class="pin-arrow">→</span>
+      <span class="smart-icon"><img src="icons/icon32.png" alt=""></span>
+      <span class="check-bubble">✓</span>
+    </div>
+
+    <section class="instruction-card">
+      <div class="step-number">1</div>
+      <div>
+        <strong id="ctca-browser-heading">Open your browser’s Extensions menu</strong>
+        <p id="ctca-pin-instruction">Find Smart Citations and pin it to the toolbar.</p>
+      </div>
+    </section>
+
+    <div id="ctca-pin-status" class="pin-status" role="status" aria-live="polite">
+      <span class="status-symbol">○</span>
+      <span class="status-copy">Waiting for Smart Citations to be pinned…</span>
+    </div>
+
+    <button id="ctca-open-manager" class="manager-link" type="button">
+      Open the reference manager now <span aria-hidden="true">→</span>
+    </button>
+
+    <div class="actions">
+      <button id="ctca-dismiss" class="secondary" type="button">Not now</button>
+      <button id="ctca-check-pin" class="primary" type="button">Check again</button>
+    </div>
+  </main>
+  <script src="welcome.js"></script>
+</body>
+</html>
