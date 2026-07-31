@@ -23,6 +23,7 @@
   let attachmentIndexCache = null;
   let attachmentIndexLoadPromise = null;
   let attachmentIndexCacheRevision = 0;
+  let attachmentIndexWriteQueue = Promise.resolve();
 
   const now = () => new Date().toISOString();
   const uuid = () => globalThis.crypto?.randomUUID?.() || `att-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -217,7 +218,10 @@
       ...index,
       attachments: index.attachments.map((attachment) => ({
         ...attachment,
-        entry: attachment.entry ? { ...attachment.entry } : attachment.entry
+        entry: attachment.entry ? { ...attachment.entry } : attachment.entry,
+        noteItems: Array.isArray(attachment.noteItems)
+          ? attachment.noteItems.map((note) => ({ ...note }))
+          : attachment.noteItems
       }))
     };
   }
@@ -243,12 +247,36 @@
     return cloneAttachmentIndex(attachmentIndexCache);
   }
 
-  async function saveIndex(index) {
-    index.updatedAt = now();
-    const next = cloneAttachmentIndex(normalizeAttachmentIndex(index));
-    await storageSet(INDEX_KEY, next);
-    attachmentIndexCache = next;
-    attachmentIndexCacheRevision += 1;
+  async function saveIndex(index, { preserveChangesSince = "" } = {}) {
+    const requested = cloneAttachmentIndex(normalizeAttachmentIndex(index));
+    requested.updatedAt = now();
+    const operation = attachmentIndexWriteQueue.catch(() => {}).then(async () => {
+      let next = requested;
+      if (preserveChangesSince) {
+        const latest = attachmentIndexCache
+          ? cloneAttachmentIndex(attachmentIndexCache)
+          : cloneAttachmentIndex(normalizeAttachmentIndex(await storageGet(INDEX_KEY)));
+        const requestedById = new Map(next.attachments.map((attachment) => [attachment.id, attachment]));
+        for (const attachment of latest.attachments) {
+          if (String(attachment.updatedAt || "") < preserveChangesSince) continue;
+          const candidate = requestedById.get(attachment.id);
+          if (!candidate || String(attachment.updatedAt || "") >= String(candidate.updatedAt || "")) {
+            requestedById.set(attachment.id, attachment);
+          }
+        }
+        next = {
+          ...next,
+          attachments: [...requestedById.values()],
+          updatedAt: now()
+        };
+      }
+      await storageSet(INDEX_KEY, next);
+      attachmentIndexCache = next;
+      attachmentIndexCacheRevision += 1;
+      return cloneAttachmentIndex(next);
+    });
+    attachmentIndexWriteQueue = operation.then(() => undefined, () => undefined);
+    return operation;
   }
 
   api.storage.onChanged?.addListener((changes, areaName) => {
@@ -499,6 +527,7 @@
       entry: attachment.entry,
       name: attachment.name,
       notes: attachment.notes || "",
+      noteItems: Array.isArray(attachment.noteItems) ? attachment.noteItems : [],
       updatedAt: attachment.updatedAt
     }, null, 2);
     const response = await davFetch(nc, `annotations/${attachment.id}.json`, { method: "PUT", headers: { "Content-Type": "application/json" }, body });
@@ -643,7 +672,7 @@
       id, entry: ref, name: String(name || file.name.replace(/\.pdf$/i, "")).trim() || "PDF",
       provider: "browser", storageBackend, fileName: sanitizeFileName(file.name),
       mimeType: file.type || "application/pdf", size: file.size,
-      notes: "", createdAt: now(), updatedAt: now()
+      notes: "", noteItems: [], createdAt: now(), updatedAt: now()
     };
     const index = await loadIndex(); index.attachments.push(attachment); await saveIndex(index);
     return attachment;
@@ -843,7 +872,7 @@
     const attachment = {
       id: uuid(), entry: entryRef(entry), name: String(name || fileName.replace(/\.pdf$/i, "")).trim() || "Local PDF",
       provider: "local", localUrl: value, localPath: originalPath, fileName,
-      mimeType: "application/pdf", size: 0, notes: "", createdAt: now(), updatedAt: now()
+      mimeType: "application/pdf", size: 0, notes: "", noteItems: [], createdAt: now(), updatedAt: now()
     };
     const index = await loadIndex(); index.attachments.push(attachment); await saveIndex(index);
     return attachment;
@@ -871,6 +900,7 @@
       mimeType: file.type || "application/pdf",
       size: file.size,
       notes: "",
+      noteItems: [],
       createdAt: now(),
       updatedAt: now()
     };
@@ -893,7 +923,7 @@
     const attachment = {
       id, entry: entryRef(entry), name: String(name || file.name.replace(/\.pdf$/i, "")).trim() || "Local PDF",
       provider: "local", localHandle: true, fileName: sanitizeFileName(file.name), mimeType: "application/pdf", size: file.size,
-      notes: "", createdAt: now(), updatedAt: now()
+      notes: "", noteItems: [], createdAt: now(), updatedAt: now()
     };
     const index = await loadIndex(); index.attachments.push(attachment); await saveIndex(index);
     return attachment;
@@ -910,7 +940,7 @@
     const attachment = {
       id, entry: entryRef(entry), name: String(name || safe.replace(/\.pdf$/i, "")).trim() || "PDF",
       provider: "nextcloud", remotePath, fileName: safe, mimeType: "application/pdf", size: file.size,
-      notes: "", createdAt: now(), updatedAt: now()
+      notes: "", noteItems: [], createdAt: now(), updatedAt: now()
     };
     const index = await loadIndex(); index.attachments.push(attachment); await saveIndex(index);
     await uploadSidecar(nc, attachment); await writeRemoteIndex(nc, index);
@@ -1112,7 +1142,9 @@
   async function syncNextcloud() {
     const config = await getConfig(), nc = config.nextcloud;
     if (!nc?.server || !nc?.appPassword) throw new Error("Connect a Nextcloud account first.");
-    const [local, remote] = await Promise.all([loadIndex(), remoteIndex(nc)]);
+    const syncStartedAt = now();
+    const remote = await remoteIndex(nc);
+    const local = await loadIndex();
     const remoteMap = new Map((remote.attachments || []).map((item) => [item.id, item]));
     const nextcloud = [];
     for (const [id, remoteItem] of remoteMap) {
@@ -1123,9 +1155,9 @@
       ...local.attachments.filter((item) => item.provider !== "nextcloud"),
       ...nextcloud
     ];
-    await saveIndex(local);
-    await writeRemoteIndex(nc, local);
-    return local;
+    const saved = await saveIndex(local, { preserveChangesSince: syncStartedAt });
+    await writeRemoteIndex(nc, saved);
+    return saved;
   }
 
 
@@ -1222,6 +1254,64 @@
     return [...identities].filter((identity) => previousByIdentity.get(identity) !== nextByIdentity.get(identity));
   }
 
+  function rebaseConcurrentDatabaseEntryChanges(baseInput, producedInput, latestInput) {
+    const base = normalizeDatabase(baseInput);
+    const produced = normalizeDatabase(producedInput);
+    const latest = normalizeDatabase(latestInput);
+    const changedIdentities = changedDatabaseEntryIdentities(base, latest);
+    if (!changedIdentities.length) return produced;
+
+    const producedByIdentity = new Map(
+      produced.entries.map((entry) => [databaseEntryIdentity(entry), entry])
+    );
+    const latestByIdentity = new Map(
+      latest.entries.map((entry) => [databaseEntryIdentity(entry), entry])
+    );
+    for (const identity of changedIdentities) {
+      const latestEntry = latestByIdentity.get(identity);
+      if (latestEntry) producedByIdentity.set(identity, latestEntry);
+      else producedByIdentity.delete(identity);
+    }
+
+    const memberships = Object.fromEntries(
+      Object.entries(produced.memberships || {}).map(([key, ids]) => [key, [...ids]])
+    );
+    for (const identity of changedIdentities) {
+      if (!identity.startsWith("key:")) continue;
+      const key = identity.slice(4);
+      const producedKey = Object.keys(memberships).find((candidate) => candidate.toLowerCase() === key);
+      const latestKey = Object.keys(latest.memberships || {}).find((candidate) => candidate.toLowerCase() === key);
+      if (producedKey) delete memberships[producedKey];
+      if (latestKey) memberships[latestKey] = [...(latest.memberships[latestKey] || [])];
+    }
+
+    return normalizeDatabase({
+      ...produced,
+      entries: [...producedByIdentity.values()],
+      memberships,
+      deletedEntries: normalizeDeletionTombstones([
+        ...(produced.deletedEntries || []),
+        ...(latest.deletedEntries || [])
+      ]),
+      documentSync: normalizeDocumentSyncState(latest.documentSync),
+      updatedAt: now()
+    });
+  }
+
+  function normalizeStoredRichTextItem(item, index, prefix) {
+    const style = item?.style && typeof item.style === "object" ? item.style : {};
+    return {
+      id: String(item?.id || `${prefix}-${index}`),
+      text: String(item?.text || ""),
+      ...(item?.html == null ? {} : { html: String(item.html) }),
+      style: {
+        backgroundColor: String(style.backgroundColor || ""),
+        textColor: String(style.textColor || ""),
+        fontFamily: String(style.fontFamily || "")
+      }
+    };
+  }
+
   function normalizeDatabase(database) {
     const value = database && typeof database === "object" ? database : {};
     const entries = Array.isArray(value.entries) ? value.entries.map((entry) => ({
@@ -1230,6 +1320,11 @@
       fields: { ...(entry?.fields || {}) },
       aliases: [...new Set(entry?.aliases || [])],
       tags: [...new Set(entry?.tags || [])],
+      comments: (Array.isArray(entry?.comments) ? entry.comments : [])
+        .map((comment, index) => normalizeStoredRichTextItem(comment, index, "comment")),
+      crosslinks: [...new Set((Array.isArray(entry?.crosslinks) ? entry.crosslinks : [])
+        .map((key) => String(key || "").trim())
+        .filter(Boolean))],
       updatedAt: String(entry?.updatedAt || ""),
       doiSyncedAt: String(entry?.doiSyncedAt || ""),
       addedOn: String(entry?.addedOn || entry?.createdAt || entry?.updatedAt || ""),
@@ -1328,7 +1423,10 @@
         key: canonicalKey,
         fields: { ...(entry.fields || {}) },
         aliases: [...(entry.aliases || [])].filter((alias) => String(alias).toLowerCase() !== String(canonicalKey).toLowerCase()),
-        tags: [...(entry.tags || [])]
+        tags: [...(entry.tags || [])],
+        crosslinks: [...new Set((entry.crosslinks || []).map((key) =>
+          inverseLocalKeys.get(String(key).toLowerCase()) || key
+        ))]
       };
       entries.push(clone);
       memberships[canonicalKey] = memberIds;
@@ -1499,6 +1597,7 @@
         mimeType: String(attachment.mimeType || blob.type || "application/pdf"),
         size: Number(blob.size) || 0,
         notes: String(attachment.notes || ""),
+        noteItems: Array.isArray(attachment.noteItems) ? attachment.noteItems.map((note) => ({ ...note })) : [],
         updatedAt: String(attachment.updatedAt || "")
       });
     }
@@ -1526,6 +1625,7 @@
         fileName: String(attachment.fileName || ""),
         name: String(attachment.name || ""),
         notes: String(attachment.notes || ""),
+        noteItems: Array.isArray(attachment.noteItems) ? attachment.noteItems.map((note) => ({ ...note })) : [],
         size: Number(attachment.size) || 0,
         updatedAt: String(attachment.updatedAt || "")
       });
@@ -1640,6 +1740,7 @@
         mimeType: String(item.mimeType || "application/pdf"),
         size: Number(item.size) || blob.size,
         notes: String(item.notes || ""),
+        noteItems: Array.isArray(item.noteItems) ? item.noteItems.map((note) => ({ ...note })) : [],
         sharedCategoryId: shared.id,
         createdAt: attachment?.createdAt || now(),
         updatedAt: String(item.updatedAt || manifest.updatedAt || now())
@@ -1717,6 +1818,17 @@
       const mappedMemberships = (remote.memberships?.[canonicalKey] || []).map((id) => idMap[id]).filter(Boolean);
       const currentMemberships = database.memberships[localKey] || [];
       database.memberships[localKey] = [...new Set([...currentMemberships, ...mappedMemberships])];
+    }
+    const canonicalToLocal = new Map(
+      Object.entries(nextEntryKeys).map(([canonicalKey, localKey]) => [String(canonicalKey).toLowerCase(), localKey])
+    );
+    for (const remoteEntry of remote.entries) {
+      const localKey = canonicalToLocal.get(String(remoteEntry.key).toLowerCase());
+      const localEntry = database.entries.find((entry) => entry.key === localKey);
+      if (!localEntry) continue;
+      localEntry.crosslinks = [...new Set((remoteEntry.crosslinks || []).map((key) =>
+        canonicalToLocal.get(String(key).toLowerCase()) || key
+      ))].filter((key) => String(key).toLowerCase() !== String(localKey).toLowerCase());
     }
     const root = database.categories.find((category) => category.id === localRootId);
     root.shared = {
@@ -1862,6 +1974,7 @@
       return { database: normalizeDatabase(databaseInput), synchronized: 0, errors: [] };
     }
     let database = normalizeDatabase(databaseInput || await storageGet(GLOBAL_DATABASE_KEY));
+    const databaseAtStart = normalizeDatabase(database);
     let synchronized = 0;
     const errors = [];
     const rootIds = database.categories
@@ -1915,6 +2028,8 @@
       }
     }
     database.updatedAt = now();
+    const latestDatabase = normalizeDatabase(await storageGet(GLOBAL_DATABASE_KEY));
+    database = rebaseConcurrentDatabaseEntryChanges(databaseAtStart, database, latestDatabase);
     await storageSet(GLOBAL_DATABASE_KEY, database);
     return { database, synchronized, errors };
   }
@@ -1993,6 +2108,18 @@
       fields,
       aliases: normalizedSet(entry.aliases, { lower: true }),
       tags: normalizedSet(entry.tags, { lower: true }),
+      comments: (Array.isArray(entry.comments) ? entry.comments : []).map((comment, index) => {
+        const normalized = normalizeStoredRichTextItem(comment, index, "comment");
+        return {
+          id: normalized.id,
+          text: normalizeComparableText(normalized.text),
+          html: normalized.html || "",
+          style: normalized.style
+        };
+      }),
+      crosslinks: (Array.isArray(entry.crosslinks) ? entry.crosslinks : [])
+        .map((key) => normalizeComparableText(key).toLowerCase())
+        .filter(Boolean),
       addedOn: normalizeComparableText(entry.addedOn),
       starred: entry.starred === true
     });
@@ -2120,6 +2247,15 @@
     return String(value ?? "").replace(/\r?\n/g, " ").trim();
   }
 
+  function encodeBibMetadata(value) {
+    const bytes = new TextEncoder().encode(String(value ?? ""));
+    let binary = "";
+    for (let index = 0; index < bytes.length; index += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+    }
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+
   function databaseToBib(databaseInput) {
     const database = normalizeDatabase(databaseInput);
     const memberships = database.memberships || {};
@@ -2130,6 +2266,8 @@
       const fields = { ...(entry.fields || {}) };
       if ((entry.aliases || []).length) fields.ids = [...new Set(entry.aliases)].join(", ");
       if ((entry.tags || []).length) fields.ctca_tags = [...new Set(entry.tags)].join(",");
+      if ((entry.comments || []).length) fields.ctca_comments = encodeBibMetadata(JSON.stringify(entry.comments));
+      if ((entry.crosslinks || []).length) fields.ctca_crosslinks = [...new Set(entry.crosslinks)].join(", ");
       if ((memberships[entry.key] || []).length) fields.ctca_categories = memberships[entry.key].join(",");
       if (index === 0 && categoryTree) fields.ctca_category_tree = categoryTree;
       if (entry.doiSyncedAt) fields.ctca_doi_synced = entry.doiSyncedAt;
@@ -2195,7 +2333,7 @@
     const treeCandidates = [];
     const internalFields = new Set([
       "ctca_meta_version", "ctca_doi_synced", "ctca_tags",
-      "ctca_categories", "ctca_category_tree", "ctca_added_on", "ctca_starred"
+      "ctca_comments", "ctca_crosslinks", "ctca_categories", "ctca_category_tree", "ctca_added_on", "ctca_starred"
     ]);
 
     for (const record of records) {
@@ -2207,6 +2345,15 @@
       }
       const aliases = splitMetadataList(rawFields.ids || "");
       const tags = splitMetadataList(rawFields.ctca_tags || "");
+      const crosslinks = splitMetadataList(rawFields.ctca_crosslinks || "");
+      let comments = [];
+      const encodedComments = stripBibValue(rawFields.ctca_comments || "");
+      if (encodedComments) {
+        try {
+          const decodedComments = JSON.parse(decodeBibMetadata(encodedComments));
+          if (Array.isArray(decodedComments)) comments = decodedComments;
+        } catch (_error) {}
+      }
       const categoryIds = splitMetadataList(rawFields.ctca_categories || "");
       if (categoryIds.length) memberships[record.key] = categoryIds;
 
@@ -2224,6 +2371,8 @@
         fields,
         aliases,
         tags,
+        comments,
+        crosslinks,
         updatedAt: "",
         doiSyncedAt: stripBibValue(rawFields.ctca_doi_synced || ""),
         addedOn: stripBibValue(rawFields.ctca_added_on || ""),
@@ -2266,8 +2415,13 @@
   }
 
   async function saveSyncedDatabase(database, previousLocal, { remoteChanged = false } = {}) {
-    const normalized = normalizeDatabase(database);
-    const previous = normalizeDatabase(previousLocal);
+    let normalized = normalizeDatabase(database);
+    let previous = normalizeDatabase(previousLocal);
+    const latestLocal = normalizeDatabase(await storageGet(GLOBAL_DATABASE_KEY));
+    if (databaseContentString(latestLocal) !== databaseContentString(previous)) {
+      normalized = rebaseConcurrentDatabaseEntryChanges(previous, normalized, latestLocal);
+      previous = latestLocal;
+    }
     const liveEntryIdentities = new Set(normalized.entries.map(databaseEntryIdentity));
     const deletionIdentities = new Set(normalized.deletedEntries.map((item) => item.identity));
     const removedEntries = previous.entries.filter((entry) =>
@@ -2312,9 +2466,12 @@
     if (!nc?.syncBibliography) return { status: "disabled" };
     if (!nc?.server || !nc?.appPassword) throw new Error("Connect a Nextcloud account first.");
     await ensureNextcloudFolders(nc);
+    const [remote, baseValue] = await Promise.all([
+      readRemoteBibliography(nc),
+      storageGet(BIB_SYNC_BASE_KEY)
+    ]);
     const local = normalizeDatabase(await storageGet(GLOBAL_DATABASE_KEY));
-    const remote = await readRemoteBibliography(nc);
-    const base = normalizeDatabase(await storageGet(BIB_SYNC_BASE_KEY));
+    const base = normalizeDatabase(baseValue);
 
     if (!remote) {
       await writeRemoteBibliography(nc, local);

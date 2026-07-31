@@ -100,6 +100,7 @@
           <strong>Include/exclude from unqualified search</strong>
           <label><span>Abstract</span><input type="checkbox" class="ctca-search-include-abstract" checked></label>
           <label><span>PDF text / PDF-related fields</span><input type="checkbox" class="ctca-search-include-pdf"></label>
+          <label><span>PDF notes and entry comments</span><input type="checkbox" class="ctca-search-include-notes-comments"></label>
         </span>
         <span class="ctca-search-section ctca-search-filters">
           <span class="ctca-search-filter-heading"><strong>Filters</strong><button type="button" class="ctca-search-clear-filters">Clear filters</button></span>
@@ -187,7 +188,6 @@
       <section class="ctca-manager-view ctca-manager-pdf-view" data-view-id="pdf" hidden>
         <div class="ctca-pdf-layout">
           <section class="ctca-pdf-viewer-pane">
-            <iframe class="ctca-pdf-frame" title="PDF viewer"></iframe>
             <div class="ctca-pdf-unavailable" hidden></div>
           </section>
           <div class="ctca-pdf-resizer ctca-pdf-resizer-notes" role="separator" aria-orientation="vertical" tabindex="0"></div>
@@ -197,7 +197,8 @@
               <button type="button" class="ctca-pdf-collapse-notes" title="Collapse PDF notes" aria-label="Collapse PDF notes" aria-expanded="true">▶</button>
             </div>
             <div class="ctca-pdf-notes-content">
-              <label class="ctca-pdf-note-label"><span>Note</span><textarea class="ctca-pdf-note" rows="10" placeholder="Notes for this PDF are saved automatically."></textarea></label>
+              <div class="ctca-note-list ctca-pdf-note-list"></div>
+              <button type="button" class="ctca-note-add ctca-pdf-note-add" title="Add PDF note" aria-label="Add PDF note">+</button>
             </div>
           </section>
           <button type="button" class="ctca-pdf-restore-notes" title="Expand notes pane" aria-label="Expand PDF notes pane"><span class="ctca-pdf-restore-icon" aria-hidden="true">◀</span><span class="ctca-pdf-collapsed-label">PDF notes</span></button>

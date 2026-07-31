@@ -176,16 +176,17 @@
     const type = entry?.type || "";
     const tag = tags.join("\n");
     const category = categories.join("\n");
+    const notesComments = String(entry?.notesCommentsText || "");
     const categorized = new Set([
       "title", "author", "editor", "journal", "journaltitle", "booktitle", "publisher",
       "year", "date", "doi", "abstract", "ids", "url", "ctca_tags", "ctca_pdf_text",
-      "pdftext", "pdf_text", "pdf", "file", "attachment"
+      "pdftext", "pdf_text", "pdf", "file", "attachment", "ctca_comments"
     ]);
     const other = [];
     for (const [name, fieldValue] of Object.entries(fields)) {
       if (!categorized.has(String(name).toLocaleLowerCase())) other.push(name, fieldValue);
     }
-    return { title, author, journal, citekey, year, doi, abstract, pdf: pdfText, url, tag, category, type, other: other.join("\n") };
+    return { title, author, journal, citekey, year, doi, abstract, pdf: pdfText, notesComments, url, tag, category, type, other: other.join("\n") };
   }
 
   function tokenMatches(text, token) {
@@ -234,11 +235,13 @@
     const tokens = parseQuery(query);
     const includeAbstract = options.includeAbstract !== false;
     const includePdfText = options.includePdfText === true;
+    const includeNotesComments = options.includeNotesComments === true;
     const generalFields = [
       texts.citekey, texts.title, texts.author, texts.journal, texts.year, texts.doi,
       texts.tag, texts.category, texts.type, texts.url, texts.other,
       includeAbstract ? texts.abstract : "",
-      includePdfText ? texts.pdf : ""
+      includePdfText ? texts.pdf : "",
+      includeNotesComments ? texts.notesComments : ""
     ].join("\n");
 
     let bestRank = 4;
