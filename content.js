@@ -203,8 +203,11 @@
   let managerBulkDoiActiveRequestId = "";
   let managerBulkDoiStats = null;
   let managerNextcloudSyncTimer = null;
+  let managerNextcloudSyncRetryTimer = null;
   let managerNextcloudSyncInProgress = false;
+  let managerNextcloudSyncFailureCount = 0;
   let managerNextcloudConnected = false;
+  const MANAGER_NEXTCLOUD_SYNC_RETRY_DELAY_MS = 30 * 1000;
   let globalDatabaseSyncTimer = null;
   let globalDatabaseSyncInProgress = false;
   let globalDatabaseSyncQueued = false;
@@ -8065,6 +8068,8 @@
     if (managerNextcloudSyncInProgress) return null;
     const config = await globalThis.CollabTeXAttachmentStore.getConfig();
     if (!config.nextcloud?.appPassword) return null;
+    const retryAttempt = managerNextcloudSyncFailureCount > 0 ? managerNextcloudSyncFailureCount + 1 : 0;
+    if (retryAttempt) managerSetStatus(`Retrying Nextcloud synchronization (attempt ${retryAttempt})…`);
     managerNextcloudSyncInProgress = true;
     try {
       await globalThis.CollabTeXAttachmentStore.syncNextcloud();
@@ -8077,10 +8082,27 @@
         }
         await managerResolveNextcloudConflicts(result);
       }
-      if (showSuccess) managerSetStatus("Nextcloud synchronization completed.");
+      const recovered = managerNextcloudSyncFailureCount > 0;
+      managerNextcloudSyncFailureCount = 0;
+      window.clearTimeout(managerNextcloudSyncRetryTimer);
+      managerNextcloudSyncRetryTimer = null;
+      if (showSuccess || recovered) managerSetStatus("Nextcloud synchronization completed.");
       return result;
     } catch (error) {
-      managerSetStatus(`Nextcloud synchronization failed: ${error.message || String(error)}`, true);
+      const message = error?.message || String(error);
+      if (/failed to fetch/i.test(message)) {
+        managerNextcloudSyncFailureCount += 1;
+        managerSetStatus(
+          `Nextcloud synchronization failed: ${message}. Retrying in ${MANAGER_NEXTCLOUD_SYNC_RETRY_DELAY_MS / 1000} seconds.`,
+          true
+        );
+        managerScheduleNextcloudSyncRetry();
+      } else {
+        managerNextcloudSyncFailureCount = 0;
+        window.clearTimeout(managerNextcloudSyncRetryTimer);
+        managerNextcloudSyncRetryTimer = null;
+        managerSetStatus(`Nextcloud synchronization failed: ${message}`, true);
+      }
       return null;
     } finally {
       managerNextcloudSyncInProgress = false;
@@ -8091,6 +8113,18 @@
     window.clearTimeout(managerNextcloudSyncTimer);
     managerNextcloudSyncTimer = window.setTimeout(() => {
       managerNextcloudSyncTimer = null;
+      managerSynchronizeNextcloud().catch(() => {});
+    }, delay);
+  }
+
+  function managerScheduleNextcloudSyncRetry(delay = MANAGER_NEXTCLOUD_SYNC_RETRY_DELAY_MS) {
+    window.clearTimeout(managerNextcloudSyncRetryTimer);
+    managerNextcloudSyncRetryTimer = window.setTimeout(() => {
+      managerNextcloudSyncRetryTimer = null;
+      if (managerBusy || managerNextcloudSyncInProgress) {
+        managerScheduleNextcloudSyncRetry(1500);
+        return;
+      }
       managerSynchronizeNextcloud().catch(() => {});
     }, delay);
   }
