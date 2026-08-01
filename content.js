@@ -1539,7 +1539,8 @@
       if (!attachment || (message.attachmentId && message.attachmentId !== attachment.id)) return;
 
       if (message.type === 'ctca-pdf-link-request') {
-        managerHandlePdfLinkRequest(message.url).catch((error) => managerSetStatus(error?.message || String(error), true));
+        managerHandlePdfLinkRequest(message.url)
+          .catch((error) => managerShowPdfViewAttachmentFailure(error, message.url));
         return;
       }
       if (message.type === 'ctca-pdf-viewer-ready') {
@@ -2766,7 +2767,9 @@
   function managerSetStatus(message, isError = false) {
     const element = bibManager.querySelector(".ctca-manager-status");
     element.textContent = message || "";
+    element.title = element.textContent;
     element.classList.toggle("ctca-manager-error", Boolean(isError));
+    if (isError && message) console.error("[Smart Citations]", message);
   }
 
   function managerSetProgress(current = 0, total = 0, label = "", visible = true, options = {}) {
@@ -6108,9 +6111,58 @@
     }
   }
 
+  function managerSetPdfViewAttachmentProgress(visible, label = "Downloading and attaching PDF…") {
+    let overlay = bibManager.querySelector(".ctca-pdf-view-attachment-progress");
+    if (!overlay) {
+      overlay = document.createElement("div");
+      overlay.className = "ctca-pdf-view-attachment-progress";
+      overlay.hidden = true;
+      overlay.setAttribute("role", "status");
+      overlay.setAttribute("aria-live", "polite");
+      overlay.innerHTML = `
+        <div class="ctca-pdf-view-attachment-progress-card">
+          <span class="ctca-pdf-view-attachment-progress-spinner" aria-hidden="true"></span>
+          <span class="ctca-pdf-view-attachment-progress-label"></span>
+        </div>`;
+      bibManager.appendChild(overlay);
+    }
+    overlay.querySelector(".ctca-pdf-view-attachment-progress-label").textContent = label;
+    overlay.hidden = !visible;
+    overlay.setAttribute("aria-hidden", visible ? "false" : "true");
+  }
+
+  function managerValidJournalManuscriptUrl(value) {
+    try {
+      const url = new URL(String(value || ""));
+      return /^https?:$/.test(url.protocol) ? url.href : "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  async function managerShowPdfViewAttachmentFailure(error, journalUrl = "") {
+    const message = error?.message || String(error || "Unknown error");
+    const manuscriptUrl = managerValidJournalManuscriptUrl(journalUrl);
+    managerSetStatus(message, true);
+    const choice = await showAppDialog({
+      title: "PDF attachment failed",
+      message: `The PDF could not be downloaded or attached.\n\n${message}`,
+      buttons: [
+        { label: "OK", value: "ok", primary: !manuscriptUrl },
+        ...(manuscriptUrl
+          ? [{ label: "Go to journal manuscript site", value: "journal", primary: true }]
+          : [])
+      ],
+      closeValue: "ok"
+    });
+    if (choice === "journal") await managerOpenPdfLinkInBrowser(manuscriptUrl);
+  }
+
   async function managerOpenAddPdfDialog(draft, options = {}) {
     const config = await globalThis.CollabTeXAttachmentStore.getConfig();
-    const sourceUrl = managerSpecifiedHttpUrl(draft);
+    const sourceUrl = options.sourceUrl || managerSpecifiedHttpUrl(draft);
+    const fromPdfView = options.fromPdfView === true || managerWorkspaceTab !== "bibliography";
+    const failureJournalUrl = options.failureJournalUrl || sourceUrl;
     const initialFiles = globalThis.CollabTeXPdfImport.pdfFiles(options.files || []);
     let selectedProvider = (options.getFromWeb || initialFiles.length) && config.provider === "local" ? "browser" : (config.provider || "browser");
     let selectedFiles = [...initialFiles];
@@ -6246,6 +6298,7 @@
           getWebButton.disabled = true;
           continueWebButton.disabled = true;
           continueWebButton.hidden = true;
+          webStatus.removeAttribute('title');
           webStatus.textContent = 'Opening the webpage in the background and looking for PDFs…';
           webStatus.classList.remove('ctca-web-pdf-status-error');
           webStatus.classList.add('ctca-web-pdf-status-loading');
@@ -6299,7 +6352,9 @@
             webCandidates = [];
             renderWebCandidates();
             webStatus.textContent = error.message || String(error);
+            webStatus.title = webStatus.textContent;
             webStatus.classList.add('ctca-web-pdf-status-error');
+            console.error("[Smart Citations] Web PDF discovery failed.", error);
           } finally {
             getWebButton.disabled = false;
             continueWebButton.disabled = false;
@@ -6384,9 +6439,14 @@
 
     managerPdfAttachmentLoadingIds.add(draft.id);
     syncManagerPdfAttachmentLoadingIndicators();
+    if (fromPdfView) {
+      const downloading = Array.isArray(result.webFiles) && result.webFiles.length > 0;
+      managerSetPdfViewAttachmentProgress(true, downloading ? "Downloading and attaching PDF…" : "Attaching PDF…");
+    }
+    const attachedSources = [];
+    let partialFailure = null;
     try {
       const entryRef = { key: draft.key, fields: draft.fields };
-      const attachedSources = [];
       if (result.provider === 'local') {
         if (result.files.length) {
           for (let i = 0; i < result.files.length; i += 1) {
@@ -6430,7 +6490,13 @@
               name: candidate.name
             });
           } catch (error) {
-            failures.push(`${candidate.fileName || candidate.url}: ${error.message || String(error)}`);
+            const failure = `${candidate.fileName || candidate.url}: ${error.message || String(error)}`;
+            failures.push(failure);
+            console.error("[Smart Citations] Could not download a discovered web PDF.", {
+              candidate,
+              error,
+              message: failure
+            });
           }
         }
       } finally {
@@ -6458,18 +6524,31 @@
         }
       }
       if (!attached) throw new Error(failures.join('; ') || 'No PDF could be attached.');
-      managerSetStatus(failures.length
+      const attachmentStatus = failures.length
         ? `${attached} PDF${attached === 1 ? '' : 's'} attached; ${failures.length} failed: ${failures.join('; ')}`
-        : `${attached} PDF${attached === 1 ? '' : 's'} attached${result.provider === 'nextcloud' ? ' and uploaded to Nextcloud' : ''}.`,
-        failures.length > 0);
+        : `${attached} PDF${attached === 1 ? '' : 's'} attached${result.provider === 'nextcloud' ? ' and uploaded to Nextcloud' : ''}.`;
+      managerSetStatus(attachmentStatus, failures.length > 0);
+      if (failures.length) partialFailure = new Error(attachmentStatus);
       }
       await managerOfferAttachedPdfDoiUpdate(draft, attachedSources);
       await managerRenderPdfAttachmentList(draft);
       if (options.openAfterAttach && attachedSources[0]?.attachment) {
         await managerOpenPdfTab(draft, attachedSources[0].attachment);
       }
+      if (fromPdfView && partialFailure) {
+        managerSetPdfViewAttachmentProgress(false);
+        await managerShowPdfViewAttachmentFailure(partialFailure, failureJournalUrl);
+      }
       return attachedSources.map((source) => source.attachment).filter(Boolean);
+    } catch (error) {
+      if (fromPdfView) {
+        managerSetPdfViewAttachmentProgress(false);
+        await managerShowPdfViewAttachmentFailure(error, failureJournalUrl);
+        return attachedSources.map((source) => source.attachment).filter(Boolean);
+      }
+      throw error;
     } finally {
+      if (fromPdfView) managerSetPdfViewAttachmentProgress(false);
       await Promise.allSettled(
         [...webOpenTabIds].map((tabId) => globalThis.CollabTeXAttachmentStore.closeWebTab(tabId))
       );
@@ -7065,7 +7144,9 @@
           await managerOpenAddPdfDialog(draft, {
             getFromWeb: true,
             sourceUrl: url.href,
-            openAfterAttach: true
+            openAfterAttach: true,
+            fromPdfView: true,
+            failureJournalUrl: url.href
           });
         }
         return;
@@ -7091,7 +7172,9 @@
       await managerOpenAddPdfDialog(draft, {
         getFromWeb: true,
         sourceUrl: url.href,
-        openAfterAttach: true
+        openAfterAttach: true,
+        fromPdfView: true,
+        failureJournalUrl: url.href
       });
     } finally {
       managerPdfLinkRequestInProgress = false;
@@ -14099,8 +14182,10 @@
   function setStatus(message, isError = false) {
     const status = popup.querySelector(".ctca-status");
     status.textContent = message;
+    status.title = status.textContent;
     status.classList.add("ctca-show");
     status.classList.toggle("ctca-error", isError);
+    if (isError && message) console.error("[Smart Citations]", message);
   }
 
   function clearStatus() {
@@ -15279,6 +15364,12 @@
         .find((candidate) => Number(candidate.dataset.resumeTabId) === normalizedTabId);
       if (button && !button.disabled) {
         pendingWebPdfAutoContinueTabs.delete(normalizedTabId);
+        try {
+          Promise.resolve(extensionApi.runtime.sendMessage({
+            type: "ctca-auto-continue-web-pdf-ack",
+            tabId: normalizedTabId
+          })).catch(() => {});
+        } catch (_error) {}
         button.click();
         return;
       }

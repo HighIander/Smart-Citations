@@ -16,6 +16,7 @@
   const humanCheckInitialUrls = new Map();
   const humanCheckReturnTimers = new Map();
   const standaloneManagerPorts = new Map();
+  const pendingWebPdfAutoContinue = new Map();
   let standalonePendingCreationCommand = null;
   const DEFAULT_ACTION_TITLE = "Open Smart Citations bibliography manager";
   const HUMAN_CHECK_ACTION_TITLE = "Complete the human check. Smart Citations will return you automatically when the page changes.";
@@ -395,27 +396,61 @@
     await updateJournalSiteActionBadge(tabId);
   }
 
+  function clearPendingWebPdfAutoContinue(humanCheckTabId) {
+    const pending = pendingWebPdfAutoContinue.get(humanCheckTabId);
+    if (pending?.timer) globalThis.clearTimeout(pending.timer);
+    pendingWebPdfAutoContinue.delete(humanCheckTabId);
+  }
+
+  function deliverWebPdfAutoContinue(humanCheckTabId, returnTabId) {
+    clearPendingWebPdfAutoContinue(humanCheckTabId);
+    const pending = {
+      returnTabId,
+      expiresAt: Date.now() + 20000,
+      timer: null
+    };
+    pendingWebPdfAutoContinue.set(humanCheckTabId, pending);
+
+    const deliver = async () => {
+      if (pendingWebPdfAutoContinue.get(humanCheckTabId) !== pending) return;
+      if (Date.now() >= pending.expiresAt) {
+        clearPendingWebPdfAutoContinue(humanCheckTabId);
+        console.error("[Smart Citations] PDF discovery did not resume after the human check.", {
+          humanCheckTabId,
+          returnTabId
+        });
+        return;
+      }
+
+      const command = {
+        type: "ctca-auto-continue-web-pdf",
+        tabId: humanCheckTabId
+      };
+      const port = standaloneManagerPorts.get(returnTabId);
+      if (port) {
+        try {
+          port.postMessage(command);
+        } catch (_error) {
+          standaloneManagerPorts.delete(returnTabId);
+        }
+      }
+      try {
+        await extensionApi.tabs.sendMessage(returnTabId, command);
+      } catch (_error) {
+        // Standalone extension pages receive the command through their port.
+      }
+      if (pendingWebPdfAutoContinue.get(humanCheckTabId) === pending) {
+        pending.timer = globalThis.setTimeout(deliver, 400);
+      }
+    };
+
+    deliver();
+  }
+
   async function returnToSmartCitationsAndContinue(humanCheckTabId, returnTabId) {
     await clearHumanCheckActionNotice(humanCheckTabId);
     await extensionApi.tabs.update(returnTabId, { active: true });
-    const command = {
-      type: "ctca-auto-continue-web-pdf",
-      tabId: humanCheckTabId
-    };
-    const port = standaloneManagerPorts.get(returnTabId);
-    if (port) {
-      try {
-        port.postMessage(command);
-        return;
-      } catch (_error) {
-        standaloneManagerPorts.delete(returnTabId);
-      }
-    }
-    try {
-      await extensionApi.tabs.sendMessage(returnTabId, command);
-    } catch (_error) {
-      // The Smart Citations UI may have been closed while verification ran.
-    }
+    deliverWebPdfAutoContinue(humanCheckTabId, returnTabId);
   }
 
   function normalizeDoi(value) {
@@ -2648,7 +2683,17 @@
         message.preserveTab === true
       )
         .then((result) => sendResponse({ ok: true, ...result }))
-        .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+        .catch((error) => {
+          console.error("[Smart Citations] Web PDF discovery failed.", {
+            url: message.url,
+            tabId: message.tabId,
+            preserveTab: message.preserveTab,
+            error,
+            message: error?.message || String(error),
+            stack: error?.stack || ""
+          });
+          sendResponse({ ok: false, error: error?.message || String(error) });
+        });
       return true;
     }
 
@@ -2665,6 +2710,16 @@
       return true;
     }
 
+    if (message?.type === "ctca-auto-continue-web-pdf-ack") {
+      const humanCheckTabId = Number(message.tabId);
+      const pending = pendingWebPdfAutoContinue.get(humanCheckTabId);
+      if (pending && (!Number.isInteger(sender?.tab?.id) || sender.tab.id === pending.returnTabId)) {
+        clearPendingWebPdfAutoContinue(humanCheckTabId);
+      }
+      sendResponse({ ok: Boolean(pending) });
+      return false;
+    }
+
     if (message?.type === "ctca-download-web-pdf") {
       downloadWebPdf(
         message.url,
@@ -2672,11 +2727,21 @@
         Number.isInteger(message.tabId) ? message.tabId : null
       )
         .then(sendResponse)
-        .catch((error) => sendResponse({
-          ok: false,
-          error: error?.message || String(error),
-          code: error?.code || ""
-        }));
+        .catch((error) => {
+          console.error("[Smart Citations] Web PDF download failed.", {
+            url: message.url,
+            sourceUrl: message.sourceUrl,
+            tabId: message.tabId,
+            error,
+            message: error?.message || String(error),
+            stack: error?.stack || ""
+          });
+          sendResponse({
+            ok: false,
+            error: error?.message || String(error),
+            code: error?.code || ""
+          });
+        });
       return true;
     }
 
@@ -2949,6 +3014,10 @@
 
   extensionApi.tabs.onRemoved?.addListener((tabId) => {
     standaloneManagerPorts.delete(tabId);
+    clearPendingWebPdfAutoContinue(tabId);
+    for (const [humanCheckTabId, pending] of pendingWebPdfAutoContinue) {
+      if (pending.returnTabId === tabId) clearPendingWebPdfAutoContinue(humanCheckTabId);
+    }
     const returnTimer = humanCheckReturnTimers.get(tabId);
     if (returnTimer) globalThis.clearTimeout(returnTimer);
     humanCheckReturnTimers.delete(tabId);

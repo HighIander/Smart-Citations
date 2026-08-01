@@ -58,6 +58,13 @@
       <section>
         <label for="ctca-page-patterns">Journal sites</label>
         <p class="hint">Define domains where to watch for manuscripts. You will be prompted to let you add the manuscript to the Smart Citations database upon opening a PDF file on one of these domains. Enter one hostname or page pattern per line. Wildcards are supported; for example, <code>*.nature.com</code> includes Nature subdomains and the main domain. Lines beginning with <code>#</code> are ignored.</p>
+        <p class="hint ctca-journal-detection-hint">
+          <span>You can see when Smart Citations detects a journal page—the extension icon in the toolbar will show a green checkmark:</span>
+          <span class="ctca-journal-detection-icon" role="img" aria-label="Smart Citations extension icon with a green checkmark">
+            <img src="icons/icon32.png" alt="">
+            <span aria-hidden="true">✓</span>
+          </span>
+        </p>
         <textarea id="ctca-page-patterns" rows="10" spellcheck="false" placeholder="*.nature.com"></textarea>
       </section>
 
@@ -81,6 +88,15 @@
       <h2 id="ctca-desktop-launcher-heading">Desktop launcher</h2>
       <p class="hint">Open Smart Citations directly from a bookmark, desktop shortcut, or app-style browser window.</p>
       <div id="ctca-desktop-launcher-content"></div>
+    </section>
+
+    <section class="ctca-options-card ctca-options-github" aria-labelledby="ctca-github-heading">
+      <h2 id="ctca-github-heading">GitHub</h2>
+      <p class="hint">
+        Inspect the source code, get help, report issues and help to improve Smart Citations:
+        Visit the Smart Citations repository page at GitHub at
+        <a href="https://github.com/HighIander/Smart-Citations" target="_blank" rel="noopener noreferrer">HighIander/Smart-Citations</a>.
+      </p>
     </section>
 
     <section class="license-notice" aria-labelledby="ctca-license-heading">

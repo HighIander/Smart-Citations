@@ -4850,6 +4850,62 @@ textarea.ctca-inline-completion-active::selection {
   height: 100%;
   min-height: 0;
 }
+.ctca-pdf-view-attachment-progress {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(246, 248, 250, 0.72);
+  backdrop-filter: blur(2px);
+}
+.ctca-pdf-view-attachment-progress[hidden] {
+  display: none;
+}
+.ctca-pdf-view-attachment-progress-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  max-width: min(440px, calc(100vw - 48px));
+  padding: 17px 22px;
+  color: #24292f;
+  background: #fff;
+  border: 1px solid #d0d7de;
+  border-radius: 12px;
+  box-shadow: 0 18px 48px rgba(27, 31, 36, 0.28);
+  font-size: 15px;
+  font-weight: 700;
+}
+.ctca-pdf-view-attachment-progress-spinner {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border: 3px solid #b6d7ff;
+  border-top-color: #0969da;
+  border-radius: 50%;
+  animation: ctca-pdf-view-attachment-spin 720ms linear infinite;
+}
+@keyframes ctca-pdf-view-attachment-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-color-scheme: dark) {
+  .ctca-pdf-view-attachment-progress {
+    background: rgba(13, 17, 23, 0.72);
+  }
+  .ctca-pdf-view-attachment-progress-card {
+    color: #f0f6fc;
+    background: #161b22;
+    border-color: #30363d;
+  }
+  .ctca-pdf-view-attachment-progress-spinner {
+    border-color: #244b74;
+    border-top-color: #58a6ff;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ctca-pdf-view-attachment-progress-spinner { animation-duration: 1.4s; }
+}
 .ctca-pdf-viewer-pane,
 .ctca-pdf-frame {
   min-height: 0;

@@ -80,6 +80,45 @@ label {
   text-underline-offset: 2px;
 }
 
+.ctca-journal-detection-hint {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.ctca-journal-detection-icon {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  margin: 2px 7px 2px 1px;
+}
+
+.ctca-journal-detection-icon img {
+  display: block;
+  width: 32px;
+  height: 32px;
+}
+
+.ctca-journal-detection-icon > span {
+  position: absolute;
+  right: -7px;
+  bottom: -3px;
+  display: grid;
+  width: 18px;
+  height: 16px;
+  place-items: center;
+  color: #fff;
+  background: #1a7f37;
+  border: 2px solid #fff;
+  border-radius: 6px;
+  box-shadow: 0 1px 3px rgba(27, 31, 36, .28);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+}
+
 code {
   padding: 2px 5px;
   border-radius: 4px;
@@ -227,6 +266,10 @@ button {
 .ctca-options-card h2 {
   margin: 0 0 8px;
   font-size: 18px;
+}
+
+.ctca-options-github .hint {
+  margin-bottom: 0;
 }
 
 .ctca-desktop-launcher-menu {

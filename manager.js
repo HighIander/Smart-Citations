@@ -408,7 +408,9 @@
   function setStatus(message, error = false) {
     const node = $(".ctca-manager-status", root);
     node.textContent = message || "";
+    node.title = node.textContent;
     node.classList.toggle("ctca-manager-error", Boolean(error));
+    if (error && message) console.error("[Smart Citations]", message);
   }
 
   function nextcloudCredentialsPresent(config) {
@@ -4325,9 +4327,58 @@
     });
   }
 
+  function setPdfViewAttachmentProgress(visible, label = "Downloading and attaching PDF…") {
+    let overlay = $(".ctca-pdf-view-attachment-progress", root);
+    if (!overlay) {
+      overlay = document.createElement("div");
+      overlay.className = "ctca-pdf-view-attachment-progress";
+      overlay.hidden = true;
+      overlay.setAttribute("role", "status");
+      overlay.setAttribute("aria-live", "polite");
+      overlay.innerHTML = `
+        <div class="ctca-pdf-view-attachment-progress-card">
+          <span class="ctca-pdf-view-attachment-progress-spinner" aria-hidden="true"></span>
+          <span class="ctca-pdf-view-attachment-progress-label"></span>
+        </div>`;
+      root.appendChild(overlay);
+    }
+    $(".ctca-pdf-view-attachment-progress-label", overlay).textContent = label;
+    overlay.hidden = !visible;
+    overlay.setAttribute("aria-hidden", visible ? "false" : "true");
+  }
+
+  function validJournalManuscriptUrl(value) {
+    try {
+      const url = new URL(String(value || ""));
+      return /^https?:$/.test(url.protocol) ? url.href : "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  async function showPdfViewAttachmentFailure(error, journalUrl = "") {
+    const message = error?.message || String(error || "Unknown error");
+    const manuscriptUrl = validJournalManuscriptUrl(journalUrl);
+    setStatus(message, true);
+    const choice = await showDialog({
+      title: "PDF attachment failed",
+      message: `The PDF could not be downloaded or attached.\n\n${message}`,
+      buttons: [
+        { label: "OK", value: "ok", primary: !manuscriptUrl },
+        ...(manuscriptUrl
+          ? [{ label: "Go to journal manuscript site", value: "journal", primary: true }]
+          : [])
+      ],
+      closeValue: "ok"
+    });
+    if (choice === "journal") await openPdfLinkInBrowser(manuscriptUrl);
+  }
+
   async function openAddPdfDialog(entry, options = {}) {
     const config = await globalThis.CollabTeXAttachmentStore.getConfig();
     const sourceUrl = options.sourceUrl || specifiedHttpUrl(entry);
+    const fromPdfView = options.fromPdfView === true || activeWorkspaceTab !== "bibliography";
+    const failureJournalUrl = options.failureJournalUrl || sourceUrl;
     const initialFiles = globalThis.CollabTeXPdfImport.pdfFiles(options.files || []);
     let selectedProvider = (options.getFromWeb || initialFiles.length) && config.provider === "local" ? "browser" : (config.provider || "browser");
     let fileInput = null;
@@ -4475,6 +4526,7 @@
           getWebButton.disabled = true;
           continueWebButton.disabled = true;
           continueWebButton.hidden = true;
+          webStatus.removeAttribute("title");
           webStatus.textContent = "Opening the webpage in the background and looking for PDFs…";
           webStatus.classList.remove("ctca-web-pdf-status-error");
           webStatus.classList.add("ctca-web-pdf-status-loading");
@@ -4528,7 +4580,9 @@
             webCandidates = [];
             renderWebCandidates();
             webStatus.textContent = error.message || String(error);
+            webStatus.title = webStatus.textContent;
             webStatus.classList.add("ctca-web-pdf-status-error");
+            console.error("[Smart Citations] Web PDF discovery failed.", error);
           } finally {
             getWebButton.disabled = false;
             continueWebButton.disabled = false;
@@ -4613,7 +4667,12 @@
     }
     pdfAttachmentLoadingKeys.add(entry.key);
     syncPdfAttachmentLoadingIndicators();
+    if (fromPdfView) {
+      const downloading = Array.isArray(result.webFiles) && result.webFiles.length > 0;
+      setPdfViewAttachmentProgress(true, downloading ? "Downloading and attaching PDF…" : "Attaching PDF…");
+    }
     const attachedItems = [];
+    let partialFailure = null;
     try {
       if (result.provider === "local") {
         if (result.files.length) {
@@ -4658,7 +4717,13 @@
                 name: candidate.name
               });
             } catch (error) {
-              failures.push(`${candidate.fileName || candidate.url}: ${error.message || String(error)}`);
+              const failure = `${candidate.fileName || candidate.url}: ${error.message || String(error)}`;
+              failures.push(failure);
+              console.error("[Smart Citations] Could not download a discovered web PDF.", {
+                candidate,
+                error,
+                message: failure
+              });
             }
           }
         } finally {
@@ -4686,18 +4751,29 @@
           }
         }
         if (!attached) throw new Error(failures.join("; ") || "No PDF could be attached.");
-        setStatus(failures.length
+        const attachmentStatus = failures.length
           ? `${attached} PDF${attached === 1 ? "" : "s"} attached; ${failures.length} failed: ${failures.join("; ")}`
-          : `${attached} PDF${attached === 1 ? "" : "s"} attached${result.provider === "nextcloud" ? " and uploaded to Nextcloud" : ""}.`,
-          failures.length > 0);
+          : `${attached} PDF${attached === 1 ? "" : "s"} attached${result.provider === "nextcloud" ? " and uploaded to Nextcloud" : ""}.`;
+        setStatus(attachmentStatus, failures.length > 0);
+        if (failures.length) partialFailure = new Error(attachmentStatus);
       }
       await renderAttachmentList(entry);
       if (options.openAfterAttach && attachedItems[0]) {
         await openPdfTab(entry, attachedItems[0]);
       }
+      if (fromPdfView && partialFailure) {
+        setPdfViewAttachmentProgress(false);
+        await showPdfViewAttachmentFailure(partialFailure, failureJournalUrl);
+      }
     } catch (error) {
-      setStatus(error.message || String(error), true);
+      if (fromPdfView) {
+        setPdfViewAttachmentProgress(false);
+        await showPdfViewAttachmentFailure(error, failureJournalUrl);
+      } else {
+        setStatus(error.message || String(error), true);
+      }
     } finally {
+      if (fromPdfView) setPdfViewAttachmentProgress(false);
       await Promise.allSettled(
         [...webOpenTabIds].map((tabId) => globalThis.CollabTeXAttachmentStore.closeWebTab(tabId))
       );
@@ -5853,7 +5929,9 @@
           await openAddPdfDialog(entry, {
             getFromWeb: true,
             sourceUrl: url.href,
-            openAfterAttach: true
+            openAfterAttach: true,
+            fromPdfView: true,
+            failureJournalUrl: url.href
           });
         }
         return;
@@ -5880,7 +5958,9 @@
       await openAddPdfDialog(entry, {
         getFromWeb: true,
         sourceUrl: url.href,
-        openAfterAttach: true
+        openAfterAttach: true,
+        fromPdfView: true,
+        failureJournalUrl: url.href
       });
     } finally {
       pdfLinkRequestInProgress = false;
@@ -6966,6 +7046,7 @@
     }
 
     setStatus(`Downloading the journal PDF for ${entry.key}…`);
+    setPdfViewAttachmentProgress(true, "Downloading PDF…");
     let file;
     try {
       file = await globalThis.CollabTeXAttachmentStore.downloadWebPdf(
@@ -6973,7 +7054,12 @@
         workflow.sourceUrl,
         Number.isInteger(workflow.sourceTabId) ? workflow.sourceTabId : null
       );
+    } catch (error) {
+      setPdfViewAttachmentProgress(false);
+      await showPdfViewAttachmentFailure(error, workflow.sourceUrl);
+      return;
     } finally {
+      setPdfViewAttachmentProgress(false);
       if (Number.isInteger(workflow.sourceTabId)) {
         await globalThis.CollabTeXAttachmentStore.closeWebTab(workflow.sourceTabId);
       }
@@ -6983,7 +7069,9 @@
       files: [file],
       getFromWebFile: true,
       sourceUrl: workflow.sourceUrl,
-      openAfterAttach: true
+      openAfterAttach: true,
+      fromPdfView: true,
+      failureJournalUrl: workflow.sourceUrl
     });
   }
 
@@ -7046,6 +7134,12 @@
         .find((candidate) => Number(candidate.dataset.resumeTabId) === normalizedTabId);
       if (button && !button.disabled) {
         pendingWebPdfAutoContinueTabs.delete(normalizedTabId);
+        try {
+          Promise.resolve(extensionApi.runtime.sendMessage({
+            type: "ctca-auto-continue-web-pdf-ack",
+            tabId: normalizedTabId
+          })).catch(() => {});
+        } catch (_error) {}
         button.click();
         return;
       }
@@ -7890,7 +7984,8 @@
       if (!attachment || (message.attachmentId && message.attachmentId !== attachment.id)) return;
 
       if (message.type === "ctca-pdf-link-request") {
-        handlePdfLinkRequest(message.url).catch((error) => setStatus(error?.message || String(error), true));
+        handlePdfLinkRequest(message.url)
+          .catch((error) => showPdfViewAttachmentFailure(error, message.url));
         return;
       }
       if (message.type === "ctca-pdf-viewer-ready") {
