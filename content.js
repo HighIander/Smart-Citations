@@ -3,11 +3,11 @@
 (() => {
   "use strict";
 
-  const IS_COLLABTEX = /^collabtex\./i.test(window.location.hostname);
+  if (globalThis.__smartCitationsEditorContentLoaded) return;
+  globalThis.__smartCitationsEditorContentLoaded = true;
+
   const IS_OVERLEAF = /(^|\.)overleaf\.com$/i.test(window.location.hostname);
-  if (!IS_COLLABTEX && !IS_OVERLEAF) {
-    return;
-  }
+  const IS_COLLABTEX = !IS_OVERLEAF;
 
   if (window.top !== window) {
     return;
@@ -89,6 +89,13 @@
     "pmid", "publisher", "school", "series", "title", "type", "url", "urldate", "volume", "year", "ids"
   ];
   const BIB_ENTRY_TYPES = ["article", "book", "booklet", "conference", "inbook", "incollection", "inproceedings", "manual", "mastersthesis", "misc", "phdthesis", "proceedings", "techreport", "unpublished"];
+  const MANAGER_RICH_TEXT_FONTS = [
+    ["", "Default"], ["Arial, sans-serif", "Arial"], ["Georgia, serif", "Georgia"],
+    ["Times New Roman, serif", "Times New Roman"], ["Courier New, monospace", "Courier New"],
+    ["Verdana, sans-serif", "Verdana"]
+  ];
+  const MANAGER_RICH_TEXT_TAGS = new Set(["b", "strong", "i", "em", "u", "span", "br", "div", "p"]);
+  const MANAGER_RICH_TEXT_BLOCKS = new Set(["div", "p"]);
   const extensionApi = globalThis.browser ?? globalThis.chrome;
   const DEFAULT_SETTINGS = Object.freeze({
     caseSensitive: false,
@@ -107,6 +114,14 @@
       mode: "full",
       showTitleInCompact: true,
       fontSize: 13
+    },
+    citationSort: {
+      field: "year",
+      direction: "desc"
+    },
+    citationDetails: {
+      showCrosslinks: false,
+      showNotesComments: false
     },
     managerSearchFields: {
       key: true,
@@ -222,6 +237,8 @@
   let managerRenderingPdfEntryDetails = false;
   let managerDetailRenderPending = false;
   let managerDetailRenderFlushTimer = null;
+  const managerRichTextSelections = new WeakMap();
+  let managerRichTextOutsideDismissBound = false;
 
   function normalizeManagerDetailSectionOrder(value) {
     const saved = Array.isArray(value)
@@ -293,6 +310,8 @@
       caseSensitive: DEFAULT_SETTINGS.caseSensitive,
       searchFields: { ...DEFAULT_SETTINGS.searchFields },
       appearance: { ...DEFAULT_SETTINGS.appearance },
+      citationSort: { ...DEFAULT_SETTINGS.citationSort },
+      citationDetails: { ...DEFAULT_SETTINGS.citationDetails },
       managerSearchFields: { ...DEFAULT_SETTINGS.managerSearchFields },
       managerColumns: { ...DEFAULT_SETTINGS.managerColumns },
       managerColumnVisibility: { ...DEFAULT_SETTINGS.managerColumnVisibility },
@@ -711,6 +730,18 @@
         merged.appearance.fontSize = fontSize;
       }
     }
+    if (value.citationSort && typeof value.citationSort === "object") {
+      if (["year", "key", "author"].includes(value.citationSort.field)) {
+        merged.citationSort.field = value.citationSort.field;
+      }
+      if (["asc", "desc"].includes(value.citationSort.direction)) {
+        merged.citationSort.direction = value.citationSort.direction;
+      }
+    }
+    if (value.citationDetails && typeof value.citationDetails === "object") {
+      merged.citationDetails.showCrosslinks = value.citationDetails.showCrosslinks === true;
+      merged.citationDetails.showNotesComments = value.citationDetails.showNotesComments === true;
+    }
 
     return merged;
   }
@@ -770,6 +801,25 @@
             <label><input type="checkbox" data-search-field="abstract"> Abstract</label>
             <label><input type="checkbox" data-search-field="doi"> DOI</label>
             <label><input type="checkbox" data-search-field="other"> All remaining BibTeX fields</label>
+
+            <div class="ctca-menu-title ctca-menu-section-title">Sort results</div>
+            <label class="ctca-sort-row">Sort by
+              <select class="ctca-citation-sort-field">
+                <option value="year">Year</option>
+                <option value="key">Citation key</option>
+                <option value="author">Author</option>
+              </select>
+            </label>
+            <label class="ctca-sort-row">Direction
+              <select class="ctca-citation-sort-direction">
+                <option value="asc">Ascending</option>
+                <option value="desc">Descending</option>
+              </select>
+            </label>
+
+            <div class="ctca-menu-title ctca-menu-section-title">Result details</div>
+            <label><input type="checkbox" class="ctca-show-citation-crosslinks"> Show cross-references</label>
+            <label><input type="checkbox" class="ctca-show-citation-notes-comments"> Show notes and comments</label>
 
             <div class="ctca-menu-title ctca-menu-section-title">Appearance</div>
             <label><input type="radio" name="ctca-view-mode" value="full"> Full cards</label>
@@ -863,6 +913,36 @@
       });
     });
 
+    root.querySelector(".ctca-citation-sort-field").addEventListener("change", (event) => {
+      settings.citationSort.field = ["year", "key", "author"].includes(event.target.value)
+        ? event.target.value
+        : DEFAULT_SETTINGS.citationSort.field;
+      selectedIndex = 0;
+      renderSuggestions();
+      saveCachedState(cachedFiles).catch(() => {});
+    });
+
+    root.querySelector(".ctca-citation-sort-direction").addEventListener("change", (event) => {
+      settings.citationSort.direction = event.target.value === "asc" ? "asc" : "desc";
+      selectedIndex = 0;
+      renderSuggestions();
+      saveCachedState(cachedFiles).catch(() => {});
+    });
+
+    root.querySelector(".ctca-show-citation-crosslinks").addEventListener("change", (event) => {
+      settings.citationDetails.showCrosslinks = Boolean(event.target.checked);
+      renderSuggestions();
+      positionPopup();
+      saveCachedState(cachedFiles).catch(() => {});
+    });
+
+    root.querySelector(".ctca-show-citation-notes-comments").addEventListener("change", (event) => {
+      settings.citationDetails.showNotesComments = Boolean(event.target.checked);
+      renderSuggestions();
+      positionPopup();
+      saveCachedState(cachedFiles).catch(() => {});
+    });
+
     root.querySelector(".ctca-show-compact-title").addEventListener("change", (event) => {
       settings.appearance.showTitleInCompact = Boolean(event.target.checked);
       renderSuggestions();
@@ -909,6 +989,10 @@
     });
     target.querySelector(".ctca-show-compact-title").checked = settings.appearance.showTitleInCompact;
     target.querySelector(".ctca-font-size").value = String(settings.appearance.fontSize);
+    target.querySelector(".ctca-citation-sort-field").value = settings.citationSort.field;
+    target.querySelector(".ctca-citation-sort-direction").value = settings.citationSort.direction;
+    target.querySelector(".ctca-show-citation-crosslinks").checked = settings.citationDetails.showCrosslinks;
+    target.querySelector(".ctca-show-citation-notes-comments").checked = settings.citationDetails.showNotesComments;
     target.querySelector(".ctca-compact-title-option")?.classList.toggle(
       "ctca-option-disabled",
       settings.appearance.mode !== "compact"
@@ -942,6 +1026,7 @@
             <button type="button" class="ctca-manager-options" aria-label="Open Smart Citations options" title="Options">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"></path></svg>
             </button>
+            ${IS_COLLABTEX ? '<button type="button" class="ctca-manager-window-close" aria-label="Close Smart Citations" title="Close">×</button>' : ""}
           </div>
         </header>
         <nav class="ctca-manager-tabs ctca-manager-inline-tabs" role="tablist" aria-label="Bibliography and PDF tabs" hidden>
@@ -1233,6 +1318,9 @@
     });
     root.querySelector(".ctca-manager-cloud-settings").addEventListener("click", () => managerOpenCloudSettings());
     root.querySelector(".ctca-manager-options").addEventListener("click", () => managerOpenOptionsPage());
+    root.querySelector(".ctca-manager-window-close")?.addEventListener("click", (event) => {
+      closeBibManager(event).catch((error) => managerSetStatus(error?.message || String(error), true));
+    });
     const globalSyncCheckbox = root.querySelector(".ctca-manager-global-sync-checkbox");
     globalSyncCheckbox.checked = Boolean(settings.syncGlobalDatabase);
     globalSyncCheckbox.addEventListener("change", () => {
@@ -4526,16 +4614,6 @@
       managerSetInlineCompletionHint(input, "", "", ".ctca-tag-input-wrap");
     }
   }
-
-  const MANAGER_RICH_TEXT_FONTS = [
-    ["", "Default"], ["Arial, sans-serif", "Arial"], ["Georgia, serif", "Georgia"],
-    ["Times New Roman, serif", "Times New Roman"], ["Courier New, monospace", "Courier New"],
-    ["Verdana, sans-serif", "Verdana"]
-  ];
-  const MANAGER_RICH_TEXT_TAGS = new Set(["b", "strong", "i", "em", "u", "span", "br", "div", "p"]);
-  const MANAGER_RICH_TEXT_BLOCKS = new Set(["div", "p"]);
-  const managerRichTextSelections = new WeakMap();
-  let managerRichTextOutsideDismissBound = false;
 
   function managerNormalizeRichColor(value) {
     const candidate = String(value || "").trim();
@@ -10254,6 +10332,9 @@
       abstract: normalizeAbstractText(stripOneBibDelimiter(fields.abstract || "")),
       doi: normalizeDoiInput(stripOneBibDelimiter(fields.doi || "")),
       url: stripOneBibDelimiter(fields.url || ""),
+      tags: globalThis.CollabTeXSearchTools.splitTags(item?.tags || []),
+      comments: Array.isArray(item?.comments) ? item.comments : [],
+      crosslinks: Array.isArray(item?.crosslinks) ? item.crosslinks : [],
       sourceFile: "",
       ctcaGlobalPending: true
     };
@@ -11161,6 +11242,37 @@
     }) || null;
   }
 
+  function clearProjectNextcloudTreeItemNameClasses(item) {
+    item.querySelectorAll(
+      ".ctca-nextcloud-linked-name-region, .ctca-nextcloud-linked-name-control, .ctca-nextcloud-linked-name-text"
+    ).forEach((element) => {
+      element.classList.remove(
+        "ctca-nextcloud-linked-name-region",
+        "ctca-nextcloud-linked-name-control",
+        "ctca-nextcloud-linked-name-text"
+      );
+    });
+  }
+
+  function decorateProjectNextcloudTreeItemName(item, link) {
+    clearProjectNextcloudTreeItemNameClasses(item);
+    const expectedName = String(link?.targetName || projectFileTreeItemBaseName(item)).trim();
+    if (!expectedName) return;
+    const candidates = [...item.querySelectorAll(
+      ".item-name-button span, .item-name, .entity-name span, [data-testid*='file-name'], [data-testid*='entity-name']"
+    )].filter((element) => String(element.textContent || "").trim() === expectedName);
+    const textElement = candidates.sort((left, right) =>
+      left.childElementCount - right.childElementCount
+    )[0];
+    if (!textElement) return;
+    textElement.classList.add("ctca-nextcloud-linked-name-text");
+    textElement.title = expectedName;
+    const control = textElement.closest(".item-name-button, button")
+      || textElement.closest(".item-name, [data-testid*='file-name'], [data-testid*='entity-name']");
+    control?.classList.add("ctca-nextcloud-linked-name-control");
+    textElement.closest(".entity-name")?.classList.add("ctca-nextcloud-linked-name-region");
+  }
+
   function scheduleProjectNextcloudUiRefresh(delayMs = 80) {
     window.clearTimeout(projectNextcloudUiTimer);
     projectNextcloudUiTimer = window.setTimeout(() => {
@@ -11176,9 +11288,11 @@
       if (!link) {
         existing?.remove();
         item.classList.remove("ctca-nextcloud-linked-tree-item");
+        clearProjectNextcloudTreeItemNameClasses(item);
         continue;
       }
       item.classList.add("ctca-nextcloud-linked-tree-item");
+      decorateProjectNextcloudTreeItemName(item, link);
       if (existing) {
         existing.dataset.linkId = link.id;
         continue;
@@ -11187,7 +11301,11 @@
       button.type = "button";
       button.className = "ctca-nextcloud-file-refresh";
       button.dataset.linkId = link.id;
-      button.textContent = "☁↻";
+      button.innerHTML = `
+        <svg viewBox="0 0 32 20" aria-hidden="true">
+          <path class="ctca-nextcloud-refresh-cloud" d="M2.5 14.5h11.2a3.3 3.3 0 0 0 .5-6.6A5.2 5.2 0 0 0 4.3 9.2a2.8 2.8 0 0 0-1.8 5.3Z"/>
+          <path class="ctca-nextcloud-refresh-arrow" d="M27.5 8.2A6 6 0 1 0 29 14M27.5 4.7v3.5H24"/>
+        </svg>`;
       button.title = `Refresh ${link.targetName} from Nextcloud`;
       button.setAttribute("aria-label", `Refresh ${link.targetName} from Nextcloud`);
       button.addEventListener("click", (event) => {
@@ -13666,19 +13784,55 @@
     return match ? Number(match[1]) : Number.NEGATIVE_INFINITY;
   }
 
+  function citationRecordAuthor(record) {
+    const rawAuthor = window.CollabTeXBibTeX.splitAuthorsRaw(
+      record?.fields?.author || record?.fields?.editor || ""
+    )[0] || "";
+    const plainAuthor = String(record?.authors?.[0] || rawAuthor).trim();
+    if (!plainAuthor) return "";
+    const rawFamilyName = rawAuthor.includes(",")
+      ? rawAuthor.split(",", 1)[0]
+      : plainAuthor.split(/\s+/).at(-1);
+    const familyName = String(rawFamilyName || plainAuthor)
+      .replace(/[{}]/g, "")
+      .trim();
+    return `${familyName}\u0000${plainAuthor}`;
+  }
+
+  function compareCitationSortValues(leftRecord, rightRecord) {
+    const field = settings.citationSort.field;
+    const direction = settings.citationSort.direction === "asc" ? 1 : -1;
+    if (field === "year") {
+      const leftYear = citationRecordYear(leftRecord);
+      const rightYear = citationRecordYear(rightRecord);
+      const leftMissing = !Number.isFinite(leftYear);
+      const rightMissing = !Number.isFinite(rightYear);
+      if (leftMissing !== rightMissing) return leftMissing ? 1 : -1;
+      if (!leftMissing && leftYear !== rightYear) return (leftYear - rightYear) * direction;
+      return 0;
+    }
+
+    const leftValue = field === "author"
+      ? citationRecordAuthor(leftRecord)
+      : String(leftRecord?.key || "");
+    const rightValue = field === "author"
+      ? citationRecordAuthor(rightRecord)
+      : String(rightRecord?.key || "");
+    if (!leftValue && rightValue) return 1;
+    if (leftValue && !rightValue) return -1;
+    return leftValue.localeCompare(rightValue, undefined, {
+      sensitivity: settings.caseSensitive ? "variant" : "base"
+    }) * direction;
+  }
+
   function matchingRecords(query) {
     const exactDoiRecord = isDoiQuery(query) ? findRecordByDoi(query) : null;
     const matches = pendingSuggestionRecords()
       .map((record) => ({ record, score: scoreRecord(record, query) }))
       .filter((item) => Number.isFinite(item.score))
       .sort((left, right) => {
-        const leftYear = citationRecordYear(left.record);
-        const rightYear = citationRecordYear(right.record);
-        if (leftYear !== rightYear) {
-          if (!Number.isFinite(leftYear)) return 1;
-          if (!Number.isFinite(rightYear)) return -1;
-          return rightYear - leftYear;
-        }
+        const configuredOrder = compareCitationSortValues(left.record, right.record);
+        if (configuredOrder) return configuredOrder;
         if (left.score !== right.score) return left.score - right.score;
         return left.record.key.localeCompare(right.record.key, undefined, {
           sensitivity: settings.caseSensitive ? "variant" : "base"
@@ -13759,6 +13913,133 @@
     return metadata;
   }
 
+  function citationRecordTags(record) {
+    const direct = globalThis.CollabTeXSearchTools.splitTags(record?.tags || []);
+    return direct.length
+      ? direct
+      : globalThis.CollabTeXSearchTools.splitTags(
+          stripOneBibDelimiter(record?.fields?.[CTCA_TAGS_FIELD] || "")
+        );
+  }
+
+  function citationRecordCrosslinks(record) {
+    const values = Array.isArray(record?.crosslinks) && record.crosslinks.length
+      ? record.crosslinks
+      : managerCrosslinkKeys(record);
+    const self = String(record?.key || "").trim().toLocaleLowerCase();
+    const seen = new Set();
+    return values.map((key) => String(key || "").trim()).filter((key) => {
+      const normalized = key.toLocaleLowerCase();
+      if (!key || normalized === self || seen.has(normalized)) return false;
+      seen.add(normalized);
+      return true;
+    });
+  }
+
+  function citationRecordComments(record) {
+    if (Array.isArray(record?.comments) && record.comments.length) {
+      return record.comments
+        .map((comment, index) => managerNormalizeRichTextItem(comment, index, "comment"))
+        .filter((comment) => comment.text);
+    }
+    return managerCommentItems(record).filter((comment) => comment.text);
+  }
+
+  function findCitationCrosslinkRecord(key) {
+    const normalized = String(key || "").trim().toLocaleLowerCase();
+    if (!normalized) return null;
+    return pendingSuggestionRecords().find((record) =>
+      String(record?.key || "").trim().toLocaleLowerCase() === normalized
+      || splitAliasKeys(record?.fields?.ids || "").some((alias) => alias.toLocaleLowerCase() === normalized)
+    ) || null;
+  }
+
+  function citationCrosslinkChipText(target, fallbackKey) {
+    if (!target) return String(fallbackKey || "");
+    const authors = Array.isArray(target.authors) && target.authors.length
+      ? target.authors
+      : window.CollabTeXBibTeX.splitAuthors(
+          stripOneBibDelimiter(target?.fields?.author || target?.fields?.editor || "")
+        );
+    const firstAuthor = managerAbbreviatedCrosslinkAuthor(authors[0] || "") || target.key;
+    const authorLabel = `${firstAuthor}${authors.length > 1 ? " et al." : ""}`;
+    const journal = target.journal || stripOneBibDelimiter(
+      target?.fields?.journal || target?.fields?.journaltitle || target?.fields?.booktitle || ""
+    );
+    const year = target.year || stripOneBibDelimiter(target?.fields?.year || target?.fields?.date || "");
+    return `${authorLabel}${journal ? `, ${journal}` : ""}${year ? ` (${year})` : ""}`;
+  }
+
+  function createCitationChipGroup(label, className, values, formatValue = (value) => String(value)) {
+    if (!values.length) return null;
+    const group = document.createElement("div");
+    group.className = `ctca-citation-chip-group ${className}`;
+    group.setAttribute("aria-label", label);
+    const heading = document.createElement("span");
+    heading.className = "ctca-citation-chip-label";
+    heading.textContent = label;
+    group.appendChild(heading);
+    for (const value of values) {
+      const chip = document.createElement("span");
+      chip.className = "ctca-citation-chip";
+      const formattedValue = formatValue(value);
+      const formatted = formattedValue && typeof formattedValue === "object"
+        ? formattedValue
+        : { text: String(formattedValue || "") };
+      chip.textContent = formatted.text;
+      chip.title = formatted.title || formatted.text;
+      group.appendChild(chip);
+    }
+    return group;
+  }
+
+  function createCitationSupplementalElement(record) {
+    const root = document.createElement("div");
+    root.className = "ctca-citation-supplemental";
+    const tags = citationRecordTags(record);
+    const tagGroup = createCitationChipGroup("Tags", "ctca-citation-tags", tags, (tag) => ({
+      text: tag,
+      title: `Tag: ${tag}`
+    }));
+    if (tagGroup) root.appendChild(tagGroup);
+
+    if (settings.citationDetails.showCrosslinks) {
+      const crosslinkGroup = createCitationChipGroup(
+        "Cross-references",
+        "ctca-citation-crosslinks",
+        citationRecordCrosslinks(record),
+        (key) => {
+          const target = findCitationCrosslinkRecord(key);
+          return {
+            text: `↔ ${citationCrosslinkChipText(target, key)}`,
+            title: target?.title || target?.key || key
+          };
+        }
+      );
+      if (crosslinkGroup) root.appendChild(crosslinkGroup);
+    }
+
+    if (settings.citationDetails.showNotesComments) {
+      const note = stripOneBibDelimiter(record?.fields?.note || "").trim();
+      const notesAndComments = [
+        ...(note ? [{ text: note, label: "Note" }] : []),
+        ...citationRecordComments(record).map((comment) => ({ text: comment.text, label: "Comment" }))
+      ];
+      const notesGroup = createCitationChipGroup(
+        "Notes/comments",
+        "ctca-citation-notes-comments",
+        notesAndComments,
+        (item) => ({
+          text: item.text,
+          title: `${item.label}: ${item.text}`
+        })
+      );
+      if (notesGroup) root.appendChild(notesGroup);
+    }
+
+    return root.childElementCount ? root : null;
+  }
+
   function getPaperUrl(record) {
     let candidate = "";
 
@@ -13783,15 +14064,22 @@
     event.stopPropagation();
   }
 
+  async function showRecordInDatabase(record) {
+    const response = await extensionApi.runtime.sendMessage({
+      type: "ctca-open-standalone-manager-entry",
+      key: record?.key || ""
+    });
+    if (!response?.ok) {
+      throw new Error(response?.error || `Could not show ${record?.key || "the entry"} in the database.`);
+    }
+    hidePopup();
+  }
+
   function createRecordActions(record) {
     const paperUrl = getPaperUrl(record);
     const hasAbstract = Boolean(record.abstract);
     const canJumpToSource = Boolean(record.sourceFile);
     const hasDoi = Boolean(record.doi);
-
-    if (!hasAbstract && !paperUrl && !canJumpToSource && !hasDoi) {
-      return null;
-    }
 
     const actions = document.createElement("div");
     actions.className = "ctca-actions";
@@ -13811,13 +14099,31 @@
       actions.appendChild(abstractButton);
     }
 
+    const databaseButton = document.createElement("button");
+    databaseButton.type = "button";
+    databaseButton.className = "ctca-action ctca-database-button";
+    databaseButton.textContent = "Show in database";
+    databaseButton.title = `Show ${record.key} in the Smart Citations database`;
+    databaseButton.addEventListener("mousedown", stopActionPointer);
+    databaseButton.addEventListener("click", (event) => {
+      stopActionPointer(event);
+      databaseButton.disabled = true;
+      showRecordInDatabase(record).catch((error) => {
+        databaseButton.disabled = false;
+        showPopup();
+        setStatus(error?.message || String(error), true);
+      });
+    });
+    actions.appendChild(databaseButton);
+
     if (paperUrl) {
       const link = document.createElement("a");
       link.className = "ctca-action ctca-paper-link";
       link.href = paperUrl;
       link.target = "_blank";
       link.rel = "noopener noreferrer";
-      link.textContent = "Open paper ↗";
+      link.textContent = "Open on journal site ↗";
+      link.title = `Open ${record.key} on the journal site`;
       link.addEventListener("mousedown", (event) => event.stopPropagation());
       link.addEventListener("click", (event) => event.stopPropagation());
       actions.appendChild(link);
@@ -13995,6 +14301,9 @@
         heading.append(title, key);
         item.append(heading, metadata, authors);
       }
+
+      const supplemental = createCitationSupplementalElement(record);
+      if (supplemental) item.appendChild(supplemental);
 
       const actions = createRecordActions(record);
       if (actions) item.appendChild(actions);

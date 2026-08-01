@@ -3,12 +3,12 @@
 (() => {
   "use strict";
 
+  if (globalThis.__smartCitationsEditorBridgeLoaded) return;
+  globalThis.__smartCitationsEditorBridgeLoaded = true;
+
   const hostname = window.location.hostname;
-  const IS_COLLABTEX = /^collabtex\./i.test(hostname);
   const IS_OVERLEAF = /(^|\.)overleaf\.com$/i.test(hostname);
-  if (!IS_COLLABTEX && !IS_OVERLEAF) {
-    return;
-  }
+  const IS_COLLABTEX = !IS_OVERLEAF;
 
   const REQUEST_EVENT = "collabtex-cite-assistant:request";
   const RESPONSE_EVENT = "collabtex-cite-assistant:response";

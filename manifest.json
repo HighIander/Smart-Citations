@@ -25,46 +25,6 @@
         "manuscript-links.js"
       ],
       "run_at": "document_idle"
-    },
-    {
-      "matches": [
-        "https://*/*"
-      ],
-      "js": [
-        "page-bridge.js"
-      ],
-      "run_at": "document_idle",
-      "world": "MAIN",
-      "include_globs": [
-        "https://collabtex.*/*",
-        "https://overleaf.com/*",
-        "https://*.overleaf.com/*"
-      ]
-    },
-    {
-      "matches": [
-        "https://*/*"
-      ],
-      "css": [
-        "content.css",
-        "privacy-consent.css"
-      ],
-      "js": [
-        "latex-renderer.js",
-        "bibtex-parser.js",
-        "search-tools.js",
-        "attachments.js",
-        "pdf-import.js",
-        "privacy-consent.js",
-        "openalex.js",
-        "content.js"
-      ],
-      "run_at": "document_idle",
-      "include_globs": [
-        "https://collabtex.*/*",
-        "https://overleaf.com/*",
-        "https://*.overleaf.com/*"
-      ]
     }
   ],
   "action": {
@@ -98,6 +58,9 @@
     "https://orcid.org/*",
     "https://pub.orcid.org/*",
     "https://doi.org/*",
+    "https://collabtex.helmholtz.cloud/*",
+    "https://overleaf.com/*",
+    "https://*.overleaf.com/*",
     "file:///*"
   ],
   "background": {

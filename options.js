@@ -5,10 +5,17 @@
 
   const extensionApi = globalThis.browser ?? globalThis.chrome;
   const SETTINGS_KEY = "collabtex-citation-assistant:manuscript-links:v1";
+  const EDITOR_SITES_KEY = "collabtex-citation-assistant:editor-sites:v1";
   const defaults = {
     pagePatterns: ["*.nature.com"],
-    preferredAction: "ask"
+    preferredAction: "ask",
+    editorSites: [
+      "collabtex.helmholtz.cloud",
+      "overleaf.com",
+      "*.overleaf.com"
+    ]
   };
+  const builtInEditorSites = new Set(defaults.editorSites);
   const form = document.querySelector("#ctca-options-form");
   const userName = document.querySelector("#ctca-user-name");
   const authorNameSettings = document.querySelector("#ctca-author-name-settings");
@@ -21,6 +28,7 @@
   const openAlexApiKey = document.querySelector("#ctca-openalex-api-key");
   const openAlexAuthorId = document.querySelector("#ctca-openalex-author-id");
   const patterns = document.querySelector("#ctca-page-patterns");
+  const editorSites = document.querySelector("#ctca-editor-sites");
   const preferredAction = document.querySelector("#ctca-preferred-action");
   const status = document.querySelector("#ctca-options-status");
   const desktopLauncherContent = document.querySelector("#ctca-desktop-launcher-content");
@@ -53,6 +61,31 @@
     )];
   }
 
+  function normalizeEditorSiteDomain(value) {
+    let domain = String(value || "").trim().replace(/\/+$/, "");
+    if (!domain || domain.startsWith("#")) return "";
+    domain = domain.replace(/^[a-z][a-z\d+.-]*:\/\//i, "");
+    domain = domain.split(/[/?#]/, 1)[0].replace(/\.$/, "").toLowerCase();
+    if (domain.startsWith("*.")) {
+      const suffix = domain.slice(2);
+      return /^[a-z\d](?:[a-z\d.-]*[a-z\d])?$/i.test(suffix) ? `*.${suffix}` : "";
+    }
+    return /^[a-z\d](?:[a-z\d.-]*[a-z\d])?$/i.test(domain) ? domain : "";
+  }
+
+  function editorSiteDomainsFromForm() {
+    return [...new Set(
+      editorSites.value
+        .split(/\r?\n/)
+        .map(normalizeEditorSiteDomain)
+        .filter(Boolean)
+    )];
+  }
+
+  function editorSiteOriginPatterns(domains) {
+    return domains.map((domain) => `https://${domain}/*`);
+  }
+
   function settingsFromForm() {
     return {
       ...loadedSettings,
@@ -68,13 +101,31 @@
 
   async function saveCurrentSettings() {
     loadedSettings = settingsFromForm();
-    await extensionApi.storage.local.set({ [SETTINGS_KEY]: loadedSettings });
+    const configuredEditorSites = editorSiteDomainsFromForm();
+    const editorOrigins = editorSiteOriginPatterns(
+      configuredEditorSites.filter((domain) => !builtInEditorSites.has(domain))
+    );
+    if (editorOrigins.length && extensionApi.permissions?.request) {
+      const granted = await extensionApi.permissions.request({ origins: editorOrigins });
+      if (!granted) {
+        throw new Error("Access to the configured document editor sites was not granted.");
+      }
+    }
+    await extensionApi.storage.local.set({
+      [SETTINGS_KEY]: loadedSettings,
+      [EDITOR_SITES_KEY]: { sites: configuredEditorSites }
+    });
+    const response = await extensionApi.runtime.sendMessage({ type: "ctca-sync-editor-sites" });
+    if (response?.ok === false) {
+      throw new Error(response.error || "The document editor sites could not be activated.");
+    }
   }
 
   async function load() {
     await globalThis.SmartCitationsPrivacy.ensureAccepted();
     desktopLauncherContent.appendChild(globalThis.SmartCitationsDesktopLauncher.createMenuContent());
-    const rawStored = (await extensionApi.storage.local.get(SETTINGS_KEY))?.[SETTINGS_KEY] || {};
+    const storedValues = await extensionApi.storage.local.get([SETTINGS_KEY, EDITOR_SITES_KEY]);
+    const rawStored = storedValues?.[SETTINGS_KEY] || {};
     const { orcidOAuthClientId: _legacyOrcidClientId, ...stored } = rawStored;
     loadedSettings = stored;
     userName.value = String(stored.userName || "");
@@ -94,6 +145,11 @@
       .map(normalizeJournalSitePattern)
       .filter(Boolean)
       .join("\n");
+    const storedEditorSites = storedValues?.[EDITOR_SITES_KEY]?.sites;
+    editorSites.value = (Array.isArray(storedEditorSites) ? storedEditorSites : defaults.editorSites)
+      .map(normalizeEditorSiteDomain)
+      .filter(Boolean)
+      .join("\n");
     preferredAction.value = ["ask", "journal", "smart-citations"].includes(stored.preferredAction)
       ? stored.preferredAction
       : defaults.preferredAction;
@@ -101,9 +157,13 @@
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    await saveCurrentSettings();
-    status.textContent = "Options saved.";
-    window.setTimeout(() => { status.textContent = ""; }, 2500);
+    try {
+      await saveCurrentSettings();
+      status.textContent = "Options saved. Reload open document editor tabs to activate changes.";
+      window.setTimeout(() => { status.textContent = ""; }, 4500);
+    } catch (error) {
+      status.textContent = error?.message || String(error);
+    }
   });
 
   linkOrcid.addEventListener("click", async () => {

@@ -26,6 +26,16 @@
   const WEB_PAGE_SETTLE_MS = 1200;
   const MAX_WEB_PDF_CANDIDATES = 4;
   const AUTHOR_OPTIONS_KEY = "collabtex-citation-assistant:manuscript-links:v1";
+  const EDITOR_SITES_KEY = "collabtex-citation-assistant:editor-sites:v1";
+  const EDITOR_BRIDGE_SCRIPT_ID = "smart-citations-configured-editor-bridge";
+  const EDITOR_CONTENT_SCRIPT_ID = "smart-citations-configured-editor-content";
+  const BUILTIN_EDITOR_DOMAINS = new Set([
+    "collabtex.helmholtz.cloud",
+    "overleaf.com",
+    "*.overleaf.com"
+  ]);
+  const DEFAULT_EDITOR_DOMAINS = [...BUILTIN_EDITOR_DOMAINS];
+  let editorContentScriptRegistrationQueue = Promise.resolve();
   const ORCID_OAUTH_CLIENT_ID = "APP-RXI3XG6S7KUHH9C5";
   const ORCID_AUTOMATIC_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
   const ORCID_IGNORED_DOIS_LIMIT = 2000;
@@ -40,6 +50,92 @@
   const openAlexImpactPromises = new Map();
   let orcidAutomaticCheckPromise = null;
   let creatingOffscreenDocument = null;
+
+  function normalizeEditorSiteDomain(value) {
+    let domain = String(value || "").trim().replace(/\/+$/, "");
+    if (!domain || domain.startsWith("#")) return "";
+    domain = domain.replace(/^[a-z][a-z\d+.-]*:\/\//i, "");
+    domain = domain.split(/[/?#]/, 1)[0].replace(/\.$/, "").toLowerCase();
+    if (domain.startsWith("*.")) {
+      const suffix = domain.slice(2);
+      return /^[a-z\d](?:[a-z\d.-]*[a-z\d])?$/i.test(suffix) ? `*.${suffix}` : "";
+    }
+    return /^[a-z\d](?:[a-z\d.-]*[a-z\d])?$/i.test(domain) ? domain : "";
+  }
+
+  function editorSiteDomainMatches(hostnameValue, domainValue) {
+    const hostname = String(hostnameValue || "").toLowerCase();
+    const domain = normalizeEditorSiteDomain(domainValue);
+    if (!hostname || !domain) return false;
+    if (!domain.startsWith("*.")) return hostname === domain;
+    const suffix = domain.slice(2);
+    return hostname === suffix || hostname.endsWith(`.${suffix}`);
+  }
+
+  function editorSiteMatchPattern(domain) {
+    return `https://${domain}/*`;
+  }
+
+  async function configuredEditorDomains() {
+    const stored = (await extensionApi.storage.local.get(EDITOR_SITES_KEY))?.[EDITOR_SITES_KEY];
+    const values = Array.isArray(stored?.sites) ? stored.sites : DEFAULT_EDITOR_DOMAINS;
+    return [...new Set(values.map(normalizeEditorSiteDomain).filter(Boolean))];
+  }
+
+  async function synchronizeConfiguredEditorContentScripts() {
+    if (
+      !extensionApi.scripting?.registerContentScripts ||
+      !extensionApi.scripting?.unregisterContentScripts
+    ) {
+      return { supported: false, matches: [] };
+    }
+
+    const domains = await configuredEditorDomains();
+    const matches = domains
+      .map(editorSiteMatchPattern);
+    const ids = [EDITOR_BRIDGE_SCRIPT_ID, EDITOR_CONTENT_SCRIPT_ID];
+    await extensionApi.scripting.unregisterContentScripts({ ids }).catch(() => {});
+    if (!matches.length) return { supported: true, matches };
+
+    await extensionApi.scripting.registerContentScripts([
+      {
+        id: EDITOR_BRIDGE_SCRIPT_ID,
+        matches,
+        js: ["page-bridge.js"],
+        runAt: "document_idle",
+        allFrames: false,
+        persistAcrossSessions: true,
+        world: "MAIN"
+      },
+      {
+        id: EDITOR_CONTENT_SCRIPT_ID,
+        matches,
+        css: ["content.css", "privacy-consent.css"],
+        js: [
+          "latex-renderer.js",
+          "bibtex-parser.js",
+          "search-tools.js",
+          "attachments.js",
+          "pdf-import.js",
+          "privacy-consent.js",
+          "openalex.js",
+          "content.js"
+        ],
+        runAt: "document_idle",
+        allFrames: false,
+        persistAcrossSessions: true,
+        world: "ISOLATED"
+      }
+    ]);
+    return { supported: true, matches };
+  }
+
+  function queueConfiguredEditorContentScriptSync() {
+    editorContentScriptRegistrationQueue = editorContentScriptRegistrationQueue
+      .catch(() => {})
+      .then(() => synchronizeConfiguredEditorContentScripts());
+    return editorContentScriptRegistrationQueue;
+  }
 
   async function openLocalFileAccessSettings() {
     const userAgent = globalThis.navigator?.userAgent || "";
@@ -2523,6 +2619,17 @@
   }
 
   extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === "ctca-sync-editor-sites") {
+      queueConfiguredEditorContentScriptSync()
+        .then((result) => sendResponse({
+          ok: result.supported,
+          ...result,
+          error: result.supported ? "" : "This browser does not support configurable content scripts."
+        }))
+        .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+      return true;
+    }
+
     if (message?.type === "ctca-orcid-oauth-info") {
       sendResponse({ ok: true, redirectUri: orcidOAuthRedirectUri() });
       return false;
@@ -2931,9 +3038,16 @@
     return true;
   });
 
-  function isSupportedEditorUrl(url) {
-    const value = String(url || "");
-    return /^https:\/\/collabtex\./i.test(value) || /^https:\/\/(?:[^/]+\.)?overleaf\.com\//i.test(value);
+  async function isSupportedEditorUrl(urlValue) {
+    let url;
+    try {
+      url = new URL(String(urlValue || ""));
+    } catch (_error) {
+      return false;
+    }
+    if (url.protocol !== "https:") return false;
+    const domains = await configuredEditorDomains();
+    return domains.some((domain) => editorSiteDomainMatches(url.hostname, domain));
   }
 
   function isStandaloneManagerUrl(value) {
@@ -2988,7 +3102,7 @@
   }
 
   async function openManagerFromAction(clickedTab) {
-    const activeEditorTab = clickedTab?.active && isSupportedEditorUrl(clickedTab.url)
+    const activeEditorTab = clickedTab?.active && await isSupportedEditorUrl(clickedTab.url)
       ? clickedTab
       : null;
 
@@ -3063,17 +3177,24 @@
   });
 
   extensionApi.storage.onChanged?.addListener((changes, areaName) => {
-    if (areaName !== "local" || !(AUTHOR_OPTIONS_KEY in changes)) return;
-    refreshActiveJournalSiteBadges().catch(() => {});
+    if (areaName !== "local") return;
+    if (AUTHOR_OPTIONS_KEY in changes) refreshActiveJournalSiteBadges().catch(() => {});
+    if (EDITOR_SITES_KEY in changes) {
+      queueConfiguredEditorContentScriptSync().catch((error) => {
+        console.error("[Smart Citations] Could not activate configured document editor sites.", error);
+      });
+    }
   });
 
   extensionApi.runtime.onInstalled?.addListener((details) => {
     refreshActiveJournalSiteBadges().catch(() => {});
+    queueConfiguredEditorContentScriptSync().catch(() => {});
     if (details?.reason === "install") showInstallWelcome().catch(() => {});
   });
 
   extensionApi.runtime.onStartup?.addListener(() => {
     refreshActiveJournalSiteBadges().catch(() => {});
+    queueConfiguredEditorContentScriptSync().catch(() => {});
   });
 
   extensionApi.notifications?.onClicked?.addListener((notificationId) => {
@@ -3098,4 +3219,7 @@
   });
 
   refreshActiveJournalSiteBadges().catch(() => {});
+  queueConfiguredEditorContentScriptSync().catch((error) => {
+    console.error("[Smart Citations] Could not activate configured document editor sites.", error);
+  });
 })();

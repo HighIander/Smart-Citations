@@ -69,6 +69,12 @@
       </section>
 
       <section>
+        <label for="ctca-editor-sites">Document editor sites</label>
+        <p class="hint">Define domains where Smart Citations should hook into CollabTeX-compatible document editors. Enter one hostname per line. Wildcard subdomains are supported; for example, <code>*.example.org</code> includes the main domain and all of its subdomains. CollabTeX at Helmholtz and Overleaf are enabled by default. Lines beginning with <code>#</code> are ignored.</p>
+        <textarea id="ctca-editor-sites" rows="6" spellcheck="false" placeholder="collabtex.helmholtz.cloud"></textarea>
+      </section>
+
+      <section>
         <label for="ctca-preferred-action">PDF link behavior</label>
         <p class="hint">“Remember my choice” in the journal-page dialog changes this setting.</p>
         <select id="ctca-preferred-action">

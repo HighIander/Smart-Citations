@@ -472,6 +472,12 @@
   gap: 4px;
 }
 
+.ctca-config-menu {
+  max-height: min(680px, 72vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 .ctca-menu-title {
   padding: 2px 5px 4px;
   color: #57606a;
@@ -522,6 +528,21 @@
   background: inherit;
   border: 1px solid #b6bec8;
   border-radius: 4px;
+}
+
+.ctca-sort-row {
+  justify-content: space-between;
+  cursor: default !important;
+}
+
+.ctca-sort-row select {
+  min-width: 112px;
+  padding: 3px 5px;
+  color: inherit;
+  background: inherit;
+  border: 1px solid #b6bec8;
+  border-radius: 4px;
+  font: inherit;
 }
 
 .ctca-config-menu .ctca-update,
@@ -646,6 +667,60 @@
 .ctca-journal-volume {
   color: inherit;
   font-weight: 750;
+}
+
+.ctca-citation-supplemental {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  margin-top: 6px;
+  pointer-events: none;
+}
+
+.ctca-citation-chip-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  min-width: 0;
+}
+
+.ctca-citation-chip-label {
+  flex: 0 0 auto;
+  margin-right: 1px;
+  color: #6e7781;
+  font-size: .72em;
+  font-weight: 700;
+  letter-spacing: .025em;
+  text-transform: uppercase;
+}
+
+.ctca-citation-chip {
+  display: inline-block;
+  max-width: min(280px, 100%);
+  padding: 2px 7px;
+  overflow: hidden;
+  color: #0550ae;
+  background: #ddf4ff;
+  border: 1px solid #80ccff;
+  border-radius: 999px;
+  font-size: .78em;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ctca-citation-crosslinks .ctca-citation-chip {
+  color: #6639ba;
+  background: #f5f0ff;
+  border-color: #c6a7ff;
+}
+
+.ctca-citation-notes-comments .ctca-citation-chip {
+  color: #5d4417;
+  background: #fff8c5;
+  border-color: #d4a72c;
+  border-radius: 7px;
 }
 
 .ctca-actions {
@@ -855,6 +930,16 @@
   font-size: 0.86em;
 }
 
+#ctca-popup.ctca-compact-view .ctca-citation-supplemental {
+  gap: 3px;
+  margin-top: 4px;
+}
+
+#ctca-popup.ctca-compact-view .ctca-citation-chip {
+  padding: 1px 6px;
+  font-size: .73em;
+}
+
 #ctca-popup.ctca-compact-view .ctca-actions {
   gap: 4px;
   margin-top: 5px;
@@ -1059,7 +1144,8 @@
   .ctca-update-all-doi,
   #ctca-toolbar-button,
   .ctca-action,
-  .ctca-font-size {
+  .ctca-font-size,
+  .ctca-sort-row select {
     color: #e6edf3;
     background: #0d1117;
     border-color: #484f58;
@@ -1081,6 +1167,28 @@
   .ctca-empty,
   .ctca-doi-missing-description {
     color: #8c959f;
+  }
+
+  .ctca-citation-chip-label {
+    color: #8c959f;
+  }
+
+  .ctca-citation-chip {
+    color: #79c0ff;
+    background: #0d2742;
+    border-color: #1f6feb;
+  }
+
+  .ctca-citation-crosslinks .ctca-citation-chip {
+    color: #d2a8ff;
+    background: #291d3a;
+    border-color: #8957e5;
+  }
+
+  .ctca-citation-notes-comments .ctca-citation-chip {
+    color: #eac54f;
+    background: #2d2600;
+    border-color: #9e6a03;
   }
 
   .ctca-title,
@@ -1341,6 +1449,24 @@
   display: flex;
   align-items: center;
   gap: 7px;
+}
+
+.ctca-manager-header .ctca-manager-window-close {
+  display: inline-grid;
+  width: 32px;
+  min-width: 32px;
+  padding: 0;
+  place-items: center;
+  font-size: 21px;
+  font-weight: 500;
+  line-height: 1;
+}
+
+.ctca-manager-header .ctca-manager-window-close:hover,
+.ctca-manager-header .ctca-manager-window-close:focus-visible {
+  color: #cf222e;
+  background: #ffebe9;
+  border-color: #ff8182;
 }
 
 .ctca-manager-header button,
@@ -8040,12 +8166,18 @@ button.ctca-manager-row-info-box:focus-visible,
 
 
 /* Version 1.11.1: modal focus, responsive picker, and linked-file controls. */
+#ctca-app-dialog:has(.ctca-nextcloud-picker-dialog-card) {
+  align-items: center;
+  padding: 12px 20px;
+}
+
 .ctca-nextcloud-picker-dialog-card {
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   width: min(960px, calc(100vw - 32px));
+  height: min(720px, calc(100vh - 24px));
   max-height: calc(100vh - 24px);
-  overflow: auto;
+  overflow: hidden;
 }
 
 .ctca-nextcloud-picker-dialog-card .ctca-app-dialog-message {
@@ -8053,59 +8185,87 @@ button.ctca-manager-row-info-box:focus-visible,
 }
 
 .ctca-nextcloud-picker-dialog-card .ctca-app-dialog-controls {
+  display: grid;
   min-height: 0;
-  overflow: visible;
+  overflow: hidden;
 }
 
 .ctca-nextcloud-picker-dialog-card .ctca-nextcloud-file-picker {
-  grid-template-rows: auto minmax(140px, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   width: 100%;
-  height: clamp(220px, calc(100vh - 245px), 620px);
+  height: 100%;
   min-height: 0;
+  overflow: hidden;
 }
 
 .ctca-nextcloud-picker-dialog-card .ctca-nextcloud-picker-list {
   min-height: 0;
   max-height: none;
+  overscroll-behavior: contain;
 }
 
 .ctca-nextcloud-linked-tree-item {
   position: relative !important;
+  box-sizing: border-box !important;
   min-width: 0 !important;
-  padding-right: 38px !important;
+  padding-right: 94px !important;
 }
 
-.ctca-nextcloud-linked-tree-item .item-name-button,
-.ctca-nextcloud-linked-tree-item .item-name,
-.ctca-nextcloud-linked-tree-item .entity-name,
-.ctca-nextcloud-linked-tree-item [data-testid*="file-name"],
-.ctca-nextcloud-linked-tree-item [data-testid*="entity-name"] {
+.ctca-nextcloud-linked-tree-item .ctca-nextcloud-linked-name-region,
+.ctca-nextcloud-linked-tree-item .ctca-nextcloud-linked-name-control {
+  flex: 1 1 auto !important;
   min-width: 0 !important;
   max-width: 100% !important;
   overflow: hidden !important;
-  text-overflow: ellipsis !important;
-  white-space: nowrap !important;
 }
 
-.ctca-nextcloud-linked-tree-item .item-name-button span,
-.ctca-nextcloud-linked-tree-item .item-name span,
-.ctca-nextcloud-linked-tree-item .entity-name span,
-.ctca-nextcloud-linked-tree-item [data-testid*="file-name"] span,
-.ctca-nextcloud-linked-tree-item [data-testid*="entity-name"] span {
-  display: block;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.ctca-nextcloud-linked-tree-item .ctca-nextcloud-linked-name-text {
+  display: block !important;
+  min-width: 0 !important;
+  max-width: 100% !important;
+  overflow: hidden !important;
+  direction: ltr !important;
+  text-align: left !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
 }
 
 .ctca-nextcloud-linked-tree-item > .ctca-nextcloud-file-refresh,
 .ctca-nextcloud-linked-tree-item .ctca-nextcloud-file-refresh {
   position: absolute;
-  z-index: 5;
-  top: 3px;
-  right: 4px;
+  z-index: 6;
+  top: 50%;
+  right: 42px;
+  width: 44px;
+  min-width: 44px;
+  height: 32px;
   margin: 0;
+  padding: 4px 6px;
+  color: #0969da;
+  background: #ddf4ff;
+  border: 1px solid #54aeff;
+  transform: translateY(-50%);
+  box-shadow: 0 1px 2px rgba(27, 31, 36, .18);
+}
+
+.ctca-nextcloud-linked-tree-item .ctca-nextcloud-file-refresh svg {
+  display: block;
+  width: 30px;
+  height: 20px;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.ctca-nextcloud-linked-tree-item .ctca-nextcloud-refresh-cloud {
+  fill: currentColor;
+}
+
+.ctca-nextcloud-linked-tree-item .ctca-nextcloud-refresh-arrow {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .ctca-nextcloud-view-actions {
@@ -8141,6 +8301,12 @@ button.ctca-manager-row-info-box:focus-visible,
 }
 
 @media (prefers-color-scheme: dark) {
+  .ctca-nextcloud-linked-tree-item .ctca-nextcloud-file-refresh {
+    color: #79c0ff;
+    background: #0d2742;
+    border-color: #1f6feb;
+  }
+
   .ctca-nextcloud-view-refresh {
     color: #79c0ff;
     border-color: #484f58;
@@ -8162,7 +8328,7 @@ button.ctca-manager-row-info-box:focus-visible,
   }
 
   .ctca-nextcloud-picker-dialog-card .ctca-nextcloud-file-picker {
-    height: clamp(190px, calc(100vh - 230px), 520px);
+    height: 100%;
     min-height: 0;
   }
 
