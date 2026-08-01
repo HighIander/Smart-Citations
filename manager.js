@@ -3010,7 +3010,8 @@
     const authors = globalThis.CollabTeXBibTeX.splitAuthors(stripBibValue(target.fields?.author || target.fields?.editor || ""));
     const firstAuthorLabel = `${abbreviatedCrosslinkAuthor(authors[0] || "") || "Unknown"}${authors.length > 1 ? " et al." : ""}`;
     const citation = crosslinkCitationHtml(target);
-    return `<button type="button" class="ctca-manager-row-info-box ctca-manager-row-crosslink-box" data-manager-list-crosslink-key="${escapeHtml(target.key)}" title="${escapeHtml(stripBibValue(target.fields?.title || target.key))}"><span class="ctca-manager-row-crosslink-author">${escapeHtml(firstAuthorLabel)}${citation ? "," : ""}</span>${citation ? `<span>${citation}</span>` : ""}</button>`;
+    const title = stripBibValue(target.fields?.title || target.key);
+    return `<button type="button" class="ctca-manager-row-info-box ctca-manager-row-crosslink-box" data-manager-list-crosslink-key="${escapeHtml(target.key)}" title="${escapeHtml(title)}"><strong class="ctca-manager-row-crosslink-title">${escapeHtml(title)}</strong><span class="ctca-manager-row-crosslink-citation"><span class="ctca-manager-row-crosslink-author">${escapeHtml(firstAuthorLabel)}${citation ? "," : ""}</span>${citation ? `<span>${citation}</span>` : ""}</span></button>`;
   }
 
   function managerListEntryNotesHtml(entry) {
@@ -5659,7 +5660,7 @@
       }
       entry.updatedAt = new Date().toISOString();
       markDirty("Saving reciprocal crosslinks automatically…");
-      scheduleListRender();
+      renderList();
       renderDetails();
       return;
     }
@@ -5677,7 +5678,7 @@
       }
       entry.updatedAt = new Date().toISOString();
       markDirty("Removing reciprocal crosslink automatically…");
-      scheduleListRender();
+      renderList();
       renderDetails();
       return;
     }

@@ -664,6 +664,58 @@
   color: #424a53;
 }
 
+.ctca-publication-row {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  min-width: 0;
+  margin-top: 4px;
+}
+
+.ctca-publication-row .ctca-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin-top: 0;
+}
+
+.ctca-publication-row .ctca-citation-tags {
+  flex: 0 1 auto;
+  justify-content: flex-end;
+  margin-left: auto;
+}
+
+.ctca-citation-detail-toggles {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 4px;
+}
+
+.ctca-citation-detail-toggle {
+  display: inline-grid;
+  width: 25px;
+  height: 25px;
+  place-items: center;
+  padding: 0;
+  color: #57606a;
+  background: #fff;
+  border: 1px solid #b6bec8;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.ctca-citation-detail-toggle svg {
+  width: 14px;
+  height: 14px;
+}
+
+.ctca-citation-detail-toggle:hover,
+.ctca-citation-detail-toggle:focus-visible,
+.ctca-citation-detail-toggle-active {
+  color: #0969da;
+  background: #ddf4ff;
+  border-color: #54aeff;
+}
+
 .ctca-journal-volume {
   color: inherit;
   font-weight: 750;
@@ -710,17 +762,69 @@
   white-space: nowrap;
 }
 
+.ctca-citation-crosslinks,
+.ctca-citation-notes-comments {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 3px;
+  align-items: start;
+}
+
+.ctca-citation-chip-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: flex-start;
+  min-width: 0;
+}
+
 .ctca-citation-crosslinks .ctca-citation-chip {
-  color: #6639ba;
-  background: #f5f0ff;
-  border-color: #c6a7ff;
+  color: #24292f;
+  background: #f6f8fa;
+  border-color: #d0d7de;
+  border-radius: 8px;
 }
 
 .ctca-citation-notes-comments .ctca-citation-chip {
-  color: #5d4417;
-  background: #fff8c5;
-  border-color: #d4a72c;
+  color: var(--ctca-rich-color, #24292f);
+  background: var(--ctca-rich-background, #fff);
+  border-color: #d0d7de;
   border-radius: 7px;
+  font-family: var(--ctca-rich-font, inherit);
+}
+
+.ctca-citation-crosslink-card {
+  display: grid;
+  gap: 2px;
+  width: min(340px, 100%);
+  max-width: min(340px, 100%);
+  white-space: normal;
+}
+
+.ctca-citation-crosslink-card strong {
+  display: -webkit-box;
+  overflow: hidden;
+  font-size: 1em;
+  line-height: 1.3;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.ctca-citation-crosslink-card small {
+  overflow: hidden;
+  color: #57606a;
+  font-size: .94em;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ctca-citation-note-card {
+  display: -webkit-box;
+  max-width: min(360px, 100%);
+  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .ctca-actions {
@@ -928,6 +1032,14 @@
 #ctca-popup.ctca-compact-view .ctca-meta {
   margin-top: 2px;
   font-size: 0.86em;
+}
+
+#ctca-popup.ctca-compact-view .ctca-publication-row {
+  margin-top: 2px;
+}
+
+#ctca-popup.ctca-compact-view .ctca-publication-row .ctca-meta {
+  margin-top: 0;
 }
 
 #ctca-popup.ctca-compact-view .ctca-citation-supplemental {
@@ -1180,15 +1292,33 @@
   }
 
   .ctca-citation-crosslinks .ctca-citation-chip {
-    color: #d2a8ff;
-    background: #291d3a;
-    border-color: #8957e5;
+    color: #24292f;
+    background: #f6f8fa;
+    border-color: #d0d7de;
+  }
+
+  .ctca-citation-crosslink-card small {
+    color: #57606a;
   }
 
   .ctca-citation-notes-comments .ctca-citation-chip {
-    color: #eac54f;
-    background: #2d2600;
-    border-color: #9e6a03;
+    color: var(--ctca-rich-color, #24292f);
+    background: var(--ctca-rich-background, #fff);
+    border-color: #d0d7de;
+  }
+
+  .ctca-citation-detail-toggle {
+    color: #8c959f;
+    background: #0d1117;
+    border-color: #484f58;
+  }
+
+  .ctca-citation-detail-toggle:hover,
+  .ctca-citation-detail-toggle:focus-visible,
+  .ctca-citation-detail-toggle-active {
+    color: #79c0ff;
+    background: #0d2742;
+    border-color: #1f6feb;
   }
 
   .ctca-title,
@@ -6307,11 +6437,17 @@ html.ctca-platform-overleaf #ctca-toolbar-button.ctca-overleaf-top-button {
   opacity: .5;
 }
 
+#ctca-app-dialog:has(.ctca-crosslink-picker-dialog) {
+  align-items: center;
+  padding: 12px 20px;
+}
+
 .ctca-crosslink-picker-dialog {
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   width: min(760px, calc(100vw - 32px));
-  max-height: calc(100vh - 32px);
+  height: min(700px, calc(100vh - 24px));
+  max-height: calc(100vh - 24px);
   overflow: hidden;
 }
 
@@ -6322,10 +6458,11 @@ html.ctca-platform-overleaf #ctca-toolbar-button.ctca-overleaf-top-button {
 
 .ctca-crosslink-picker {
   display: grid;
-  grid-template-rows: auto minmax(160px, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 9px;
-  min-height: 260px;
-  max-height: min(620px, calc(100vh - 230px));
+  height: 100%;
+  min-height: 0;
+  max-height: none;
 }
 
 .ctca-crosslink-search-composite {
@@ -6998,11 +7135,31 @@ button.ctca-manager-row-info-box:focus-visible,
 }
 
 .ctca-manager-row-crosslink-box {
-  white-space: nowrap;
-  text-overflow: ellipsis;
+  display: inline-grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  white-space: normal;
 }
 
-.ctca-manager-row-crosslink-box > span {
+.ctca-manager-row-crosslink-title {
+  display: -webkit-box;
+  overflow: hidden;
+  font-size: 10px;
+  font-weight: 750;
+  line-height: 1.3;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.ctca-manager-row-crosslink-citation {
+  display: flex;
+  gap: 5px;
+  align-items: baseline;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.ctca-manager-row-crosslink-citation > span {
   overflow: hidden;
   text-overflow: ellipsis;
 }

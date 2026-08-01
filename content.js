@@ -5075,7 +5075,8 @@
     const authors = window.CollabTeXBibTeX.splitAuthors(stripOneBibDelimiter(target.fields?.author || target.fields?.editor || ""));
     const firstAuthorLabel = `${managerAbbreviatedCrosslinkAuthor(authors[0] || "") || "Unknown"}${authors.length > 1 ? " et al." : ""}`;
     const citation = managerCrosslinkCitationHtml(target);
-    return `<button type="button" class="ctca-manager-row-info-box ctca-manager-row-crosslink-box" data-manager-list-crosslink-id="${managerEscapeHtml(target.id)}" title="${managerEscapeHtml(stripOneBibDelimiter(target.fields?.title || target.key))}"><span class="ctca-manager-row-crosslink-author">${managerEscapeHtml(firstAuthorLabel)}${citation ? "," : ""}</span>${citation ? `<span>${citation}</span>` : ""}</button>`;
+    const title = stripOneBibDelimiter(target.fields?.title || target.key);
+    return `<button type="button" class="ctca-manager-row-info-box ctca-manager-row-crosslink-box" data-manager-list-crosslink-id="${managerEscapeHtml(target.id)}" title="${managerEscapeHtml(title)}"><strong class="ctca-manager-row-crosslink-title">${managerEscapeHtml(title)}</strong><span class="ctca-manager-row-crosslink-citation"><span class="ctca-manager-row-crosslink-author">${managerEscapeHtml(firstAuthorLabel)}${citation ? "," : ""}</span>${citation ? `<span>${citation}</span>` : ""}</span></button>`;
   }
 
   function managerListEntryNotesHtml(draft) {
@@ -7688,6 +7689,7 @@
         const target = managerCrosslinkDraft(key);
         if (target) managerSetCrosslinkKeys(target, [...managerCrosslinkKeys(target), draft.key]);
       }
+      renderManagerList();
       renderManagerDetails();
       return;
     }
@@ -7702,6 +7704,7 @@
         managerSetCrosslinkKeys(target, managerCrosslinkKeys(target)
           .filter((linkedKey) => !managerCrosslinkKeyMatchesDraft(linkedKey, draft)));
       }
+      renderManagerList();
       renderManagerDetails();
       return;
     }
@@ -9754,7 +9757,10 @@
     managerSessionChanged = false;
     bibManager.classList.add("ctca-manager-visible");
     bibManager.setAttribute("aria-hidden", "false");
-    setManagerListLoading(true);
+    // The in-page manager is session-resident. Reopening it must reuse its
+    // current drafts; BibTeX is reread only when no in-session list exists.
+    const shouldLoadBibliography = managerDrafts.size === 0;
+    setManagerListLoading(shouldLoadBibliography);
     managerBulkDoiAbortRequested = false;
     managerBulkDoiActiveRequestId = "";
     managerSetProgress(0, 1, "", false);
@@ -9762,31 +9768,17 @@
     searchInput.value = managerQuery;
     bibManager.querySelector(".ctca-manager-search-clear").hidden = !managerQuery;
     applyManagerColumnWidths();
-    const requestedFileAlreadyLoaded = requestedBibFile
-      ? managerFiles.length === 1 && bibSourceMatches(managerFiles[0], requestedBibFile)
-      : true;
-    let reusedPopulatedList = managerDrafts.size > 0 && requestedFileAlreadyLoaded;
-    const requestedFileAlreadyCached = requestedBibFile
-      ? cachedFiles.length === 1 && bibSourceMatches(cachedFiles[0], requestedBibFile)
-      : true;
-    if (!reusedPopulatedList && records.length > 0 && cachedFiles.length > 0 && requestedFileAlreadyCached) {
-      managerFiles = cachedFiles.slice();
-      managerRecords = records.slice();
-      resetManagerDrafts();
-      reusedPopulatedList = managerDrafts.size > 0;
-    }
-
     try {
-      await managerEnsureAuthorshipUserName();
-      extensionApi.runtime.sendMessage({ type: "ctca-check-orcid-and-open" }).catch(() => {});
-      if (reusedPopulatedList) {
+      if (!shouldLoadBibliography) {
         updateManagerBibButton(false);
         renderManagerCategories();
         renderManagerList();
         renderManagerDetails();
         updateManagerCount();
-        managerSetStatus(`Showing ${managerDrafts.size} previously loaded bibliography entries.`);
+        managerSetStatus(`Showing ${managerDrafts.size} in-session bibliography entries.`);
       } else {
+        await managerEnsureAuthorshipUserName();
+        extensionApi.runtime.sendMessage({ type: "ctca-check-orcid-and-open" }).catch(() => {});
         setManagerBusy(true, "Loading…");
         managerSetStatus("Detecting bibliography configuration…");
         await managerLoadBibliography({
@@ -9825,10 +9817,10 @@
       managerScheduleNextcloudSync(200);
       bibManager.querySelector(".ctca-manager-search")?.focus();
       Promise.resolve().then(async () => {
+        if (!settings.syncGlobalDatabase) return;
         if (!globalPromptChecked && !startupAssistantCheckInProgress) {
           await checkGlobalDatabasePrompts({ allowAutomaticSync: false });
-        }
-        if (settings.syncGlobalDatabase) {
+        } else {
           await checkCurrentDocumentGlobalFlag({ allowAutomaticSync: false });
         }
         await refreshManagerPendingHighlights();
@@ -13901,7 +13893,7 @@
     return true;
   }
 
-  function createMetadataElement(record, openAlexLookupKey = "") {
+  function createMetadataElement(record) {
     const metadata = document.createElement("div");
     metadata.className = "ctca-meta";
     let hasPart = false;
@@ -13933,14 +13925,6 @@
 
     if (!hasPart) {
       metadata.textContent = "Publication details not specified";
-    }
-    const openAlexDescriptor = globalThis.SmartCitationsOpenAlex.descriptor(record, openAlexLookupKey);
-    if (openAlexDescriptor.identity) {
-      const citation = document.createElement("span");
-      citation.className = "ctca-openalex-citation";
-      citation.dataset.openalexLookupKey = openAlexDescriptor.lookupKey;
-      citation.textContent = "Citations: …";
-      metadata.append(document.createTextNode(" "), citation);
     }
     return metadata;
   }
@@ -14002,15 +13986,23 @@
     return `${authorLabel}${journal ? `, ${journal}` : ""}${year ? ` (${year})` : ""}`;
   }
 
-  function createCitationChipGroup(label, className, values, formatValue = (value) => String(value)) {
+  function createCitationChipGroup(
+    label,
+    className,
+    values,
+    formatValue = (value) => String(value),
+    { showLabel = true } = {}
+  ) {
     if (!values.length) return null;
     const group = document.createElement("div");
     group.className = `ctca-citation-chip-group ${className}`;
     group.setAttribute("aria-label", label);
-    const heading = document.createElement("span");
-    heading.className = "ctca-citation-chip-label";
-    heading.textContent = label;
-    group.appendChild(heading);
+    if (showLabel) {
+      const heading = document.createElement("span");
+      heading.className = "ctca-citation-chip-label";
+      heading.textContent = label;
+      group.appendChild(heading);
+    }
     for (const value of values) {
       const chip = document.createElement("span");
       chip.className = "ctca-citation-chip";
@@ -14025,48 +14017,137 @@
     return group;
   }
 
+  function citationRecordHasNotesComments(record) {
+    return Boolean(
+      stripOneBibDelimiter(record?.fields?.note || "").trim()
+      || citationRecordComments(record).some((comment) => comment.text)
+    );
+  }
+
+  function createCitationDetailToggle(kind, hasContent) {
+    if (!hasContent) return null;
+    const isCrosslinks = kind === "crosslinks";
+    const setting = isCrosslinks ? "showCrosslinks" : "showNotesComments";
+    const label = isCrosslinks ? "crosslinks" : "notes and comments";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ctca-citation-detail-toggle";
+    button.innerHTML = isCrosslinks
+      ? managerListDisplayChainIconHtml()
+      : managerListDisplayNoteIconHtml();
+    const update = () => {
+      const visible = settings.citationDetails[setting] === true;
+      button.classList.toggle("ctca-citation-detail-toggle-active", visible);
+      button.setAttribute("aria-pressed", visible ? "true" : "false");
+      button.title = `${visible ? "Hide" : "Show"} ${label} for all citation results`;
+      button.setAttribute("aria-label", button.title);
+    };
+    update();
+    button.addEventListener("mousedown", stopActionPointer);
+    button.addEventListener("click", (event) => {
+      stopActionPointer(event);
+      settings.citationDetails[setting] = settings.citationDetails[setting] !== true;
+      applySettingsToPopup();
+      renderSuggestions();
+      positionPopup();
+      saveCachedState(cachedFiles).catch(() => {});
+    });
+    return button;
+  }
+
+  function createCitationPublicationRow(record) {
+    const row = document.createElement("div");
+    row.className = "ctca-publication-row";
+    row.appendChild(createMetadataElement(record));
+
+    const toggles = document.createElement("span");
+    toggles.className = "ctca-citation-detail-toggles";
+    const crosslinkToggle = createCitationDetailToggle(
+      "crosslinks",
+      citationRecordCrosslinks(record).length > 0
+    );
+    const notesToggle = createCitationDetailToggle(
+      "notesComments",
+      citationRecordHasNotesComments(record)
+    );
+    if (crosslinkToggle) toggles.appendChild(crosslinkToggle);
+    if (notesToggle) toggles.appendChild(notesToggle);
+    if (toggles.childElementCount) row.appendChild(toggles);
+
+    const tagGroup = createCitationChipGroup(
+      "Tags",
+      "ctca-citation-tags",
+      citationRecordTags(record),
+      (tag) => ({ text: tag, title: `Tag: ${tag}` }),
+      { showLabel: false }
+    );
+    if (tagGroup) row.appendChild(tagGroup);
+    return row;
+  }
+
   function createCitationSupplementalElement(record) {
     const root = document.createElement("div");
     root.className = "ctca-citation-supplemental";
-    const tags = citationRecordTags(record);
-    const tagGroup = createCitationChipGroup("Tags", "ctca-citation-tags", tags, (tag) => ({
-      text: tag,
-      title: `Tag: ${tag}`
-    }));
-    if (tagGroup) root.appendChild(tagGroup);
 
     if (settings.citationDetails.showCrosslinks) {
-      const crosslinkGroup = createCitationChipGroup(
-        "Cross-references",
-        "ctca-citation-crosslinks",
-        citationRecordCrosslinks(record),
-        (key) => {
+      const crosslinks = citationRecordCrosslinks(record);
+      if (crosslinks.length) {
+        const crosslinkGroup = document.createElement("div");
+        crosslinkGroup.className = "ctca-citation-chip-group ctca-citation-crosslinks";
+        crosslinkGroup.setAttribute("aria-label", "Crosslinks");
+        const heading = document.createElement("span");
+        heading.className = "ctca-citation-chip-label";
+        heading.textContent = "Crosslinks";
+        const items = document.createElement("div");
+        items.className = "ctca-citation-chip-items";
+        for (const key of crosslinks) {
           const target = findCitationCrosslinkRecord(key);
-          return {
-            text: `↔ ${citationCrosslinkChipText(target, key)}`,
-            title: target?.title || target?.key || key
-          };
+          const title = target?.title
+            || stripOneBibDelimiter(target?.fields?.title || "")
+            || target?.key
+            || key;
+          const chip = document.createElement("span");
+          chip.className = "ctca-citation-chip ctca-citation-crosslink-card";
+          chip.title = title;
+          const titleElement = document.createElement("strong");
+          titleElement.textContent = title;
+          const citation = document.createElement("small");
+          citation.textContent = citationCrosslinkChipText(target, key);
+          chip.append(titleElement, citation);
+          items.appendChild(chip);
         }
-      );
-      if (crosslinkGroup) root.appendChild(crosslinkGroup);
+        crosslinkGroup.append(heading, items);
+        root.appendChild(crosslinkGroup);
+      }
     }
 
     if (settings.citationDetails.showNotesComments) {
       const note = stripOneBibDelimiter(record?.fields?.note || "").trim();
       const notesAndComments = [
-        ...(note ? [{ text: note, label: "Note" }] : []),
-        ...citationRecordComments(record).map((comment) => ({ text: comment.text, label: "Comment" }))
+        ...(note ? [{ text: note, html: "", style: {}, label: "Note" }] : []),
+        ...citationRecordComments(record).map((comment) => ({ ...comment, label: "Comment" }))
       ];
-      const notesGroup = createCitationChipGroup(
-        "Notes/comments",
-        "ctca-citation-notes-comments",
-        notesAndComments,
-        (item) => ({
-          text: item.text,
-          title: `${item.label}: ${item.text}`
-        })
-      );
-      if (notesGroup) root.appendChild(notesGroup);
+      if (notesAndComments.length) {
+        const notesGroup = document.createElement("div");
+        notesGroup.className = "ctca-citation-chip-group ctca-citation-notes-comments";
+        notesGroup.setAttribute("aria-label", "Notes and comments");
+        const heading = document.createElement("span");
+        heading.className = "ctca-citation-chip-label";
+        heading.textContent = "Notes/comments";
+        const items = document.createElement("div");
+        items.className = "ctca-citation-chip-items";
+        for (const item of notesAndComments) {
+          const chip = document.createElement("span");
+          chip.className = "ctca-citation-chip ctca-citation-note-card";
+          chip.title = `${item.label}: ${item.text}`;
+          if (item.html) chip.innerHTML = managerSanitizeRichTextHtml(item.html);
+          else chip.textContent = item.text;
+          chip.style.cssText = managerRichTextItemStyle(item);
+          items.appendChild(chip);
+        }
+        notesGroup.append(heading, items);
+        root.appendChild(notesGroup);
+      }
     }
 
     return root.childElementCount ? root : null;
@@ -14267,8 +14348,6 @@
     }
     list.replaceChildren();
     list.classList.remove("ctca-single-result");
-    const openAlexDescriptors = [];
-
     const doi = isDoiQuery(query) ? normalizeDoiInput(query) : "";
     const doiIsMissing = Boolean(doi) && !findRecordByDoi(doi);
 
@@ -14323,10 +14402,7 @@
       key.textContent = record.key;
       key.title = record.key;
 
-      const openAlexLookupKey = `suggestion:${index}:${record.key}`;
-      const openAlexDescriptor = globalThis.SmartCitationsOpenAlex.descriptor(record, openAlexLookupKey);
-      if (openAlexDescriptor.identity) openAlexDescriptors.push(openAlexDescriptor);
-      const metadata = createMetadataElement(record, openAlexLookupKey);
+      const publicationRow = createCitationPublicationRow(record);
       const authors = document.createElement("div");
       authors.className = "ctca-authors";
       authors.textContent = formatAuthors(record.authors);
@@ -14337,10 +14413,10 @@
         if (settings.appearance.showTitleInCompact) {
           item.appendChild(title);
         }
-        item.appendChild(metadata);
+        item.appendChild(publicationRow);
       } else {
         heading.append(title, key);
-        item.append(heading, metadata, authors);
+        item.append(heading, authors, publicationRow);
       }
 
       const supplemental = createCitationSupplementalElement(record);
@@ -14366,7 +14442,6 @@
 
       list.appendChild(item);
     });
-    globalThis.SmartCitationsOpenAlex.hydrateCitations(list, openAlexDescriptors).catch(() => {});
     updateSuggestionListOverflow();
     restoreScrollPosition();
   }
@@ -15976,7 +16051,9 @@
         const response = await bridgeRequest("getState", {}, 1000);
         currentState = response.state;
         updateFromEditorState();
-        window.setTimeout(() => checkGlobalDatabasePrompts(), 700);
+        if (settings.syncGlobalDatabase) {
+          window.setTimeout(() => checkGlobalDatabasePrompts(), 700);
+        }
         window.setTimeout(() => managerScheduleNextcloudSync(50), 1000);
         window.setTimeout(() => {
           if (projectNextcloudLinks.length || startupAssistantCheckInProgress || projectBibliographySetupInProgress) return;
