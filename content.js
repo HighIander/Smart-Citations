@@ -9730,13 +9730,20 @@
     if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false });
   }
 
-  async function openBibManager({ bibFileName = "" } = {}) {
+  async function openBibManager({ bibFileName = "", citationKey = "" } = {}) {
     await globalThis.SmartCitationsPrivacy.ensureAccepted();
     if (managerBusy) return;
     cancelScheduledPopup();
     hidePopup();
     managerNewEntryKeys = new Set();
     const requestedBibFile = normalizeBibFileName(bibFileName);
+    const requestedCitationKey = String(citationKey || "").trim();
+    if (requestedCitationKey) {
+      managerQuery = `citekey:"${requestedCitationKey.replace(/"/g, "")}"`;
+      managerSelectedCategoryId = "all";
+      settings.managerFilters = globalThis.CollabTeXSearchTools.normalizeFilterState();
+      applyManagerSearchSettings();
+    }
     const activeFile = getSelectedFileName() || currentState?.fileName || "";
     managerReturnTexFile = captureSelectedTexFile(activeFile);
     managerOriginalFile = managerReturnTexFile || (
@@ -9787,6 +9794,31 @@
           filesOverride: requestedBibFile ? [requestedBibFile] : null
         });
         setManagerBusy(false);
+      }
+
+      if (requestedCitationKey) {
+        const visibleRecords = sortedFilteredManagerRecords();
+        const normalizedKey = requestedCitationKey.toLocaleLowerCase();
+        const selectedRecord = visibleRecords.find((record) =>
+          String(managerGetDraft(record)?.key || "").toLocaleLowerCase() === normalizedKey
+        ) || visibleRecords[0] || null;
+        const selectedDraft = selectedRecord ? managerGetDraft(selectedRecord) : null;
+        managerCrosslinkNavigationStack = [];
+        managerDetailOnlyId = "";
+        managerSelectedId = selectedDraft?.id || "";
+        managerSelectedIds = selectedDraft ? new Set([selectedDraft.id]) : new Set();
+        managerLastSelectionAnchorId = selectedDraft?.id || "";
+        managerDetailsCollapsedManually = false;
+        renderManagerCategories();
+        renderManagerList();
+        renderManagerDetails();
+        if (selectedDraft) {
+          requestAnimationFrame(() => {
+            bibManager.querySelector(
+              `.ctca-manager-row[data-manager-record-id="${CSS.escape(selectedDraft.id)}"]`
+            )?.scrollIntoView({ block: "nearest" });
+          });
+        }
       }
 
       managerUpdateCloudIconState().catch(() => {});
@@ -14065,14 +14097,9 @@
   }
 
   async function showRecordInDatabase(record) {
-    const response = await extensionApi.runtime.sendMessage({
-      type: "ctca-open-standalone-manager-entry",
-      key: record?.key || ""
-    });
-    if (!response?.ok) {
-      throw new Error(response?.error || `Could not show ${record?.key || "the entry"} in the database.`);
-    }
-    hidePopup();
+    const key = String(record?.key || "").trim();
+    if (!key) throw new Error("Could not determine the citation key to show in the database.");
+    await openBibManager({ citationKey: key });
   }
 
   function createRecordActions(record) {
@@ -14220,6 +14247,17 @@
     const filter = popup.querySelector(".ctca-filter");
     const list = popup.querySelector(".ctca-list");
     const query = currentContext?.fragment || "";
+    const previousScrollTop = list.scrollTop;
+    const preserveScroll = popup.classList.contains("ctca-visible") && list.dataset.renderedQuery === query;
+    const restoreScrollPosition = () => {
+      list.dataset.renderedQuery = query;
+      if (!preserveScroll) {
+        list.scrollTop = 0;
+        return;
+      }
+      const maximumScrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
+      list.scrollTop = Math.min(previousScrollTop, maximumScrollTop);
+    };
     filter.textContent = query || "Type a citation key, author, keyword, abstract text, or DOI…";
     applySettingsToPopup();
 
@@ -14240,6 +14278,7 @@
       empty.textContent = "No bibliography has been parsed yet. Open Config and select “Update bibliography”.";
       list.appendChild(empty);
       updateSuggestionListOverflow();
+      restoreScrollPosition();
       return;
     }
 
@@ -14250,6 +14289,7 @@
     if (!renderedRecords.length) {
       if (doiIsMissing) {
         updateSuggestionListOverflow();
+        restoreScrollPosition();
         return;
       }
 
@@ -14260,6 +14300,7 @@
         : "No enabled search field matches the current text.";
       list.appendChild(empty);
       updateSuggestionListOverflow();
+      restoreScrollPosition();
       return;
     }
 
@@ -14327,6 +14368,7 @@
     });
     globalThis.SmartCitationsOpenAlex.hydrateCitations(list, openAlexDescriptors).catch(() => {});
     updateSuggestionListOverflow();
+    restoreScrollPosition();
   }
 
   function updateSelectedItem() {
@@ -15909,7 +15951,10 @@
   });
 
   window.addEventListener("resize", positionPopup);
-  window.addEventListener("scroll", positionPopup, true);
+  window.addEventListener("scroll", (event) => {
+    if (event.target instanceof Node && popup.contains(event.target)) return;
+    positionPopup();
+  }, true);
   window.addEventListener("focus", () => {
     managerScheduleNextcloudSync(100);
   });
