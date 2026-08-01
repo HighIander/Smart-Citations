@@ -48,8 +48,6 @@ body {
 .pv-toolbar button:hover:not(:disabled) { background: #eef2f6; border-color: #8c959f; }
 .pv-toolbar button:disabled { cursor: default; opacity: .45; }
 .pv-toolbar button.pv-mode-active { color: #fff; background: #0969da; border-color: #0969da; }
-.pv-toolbar button.pv-save { color: #fff; background: #1f883d; border-color: #1a7f37; }
-.pv-toolbar button.pv-save:hover:not(:disabled) { background: #1a7f37; }
 .pv-toolbar button.pv-icon-button {
   display: inline-grid;
   width: 32px;

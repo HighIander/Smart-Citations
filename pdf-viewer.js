@@ -40,7 +40,6 @@ const status = $('#pv-status');
 const pageInput = $('#pv-page');
 const pageCount = $('#pv-pages');
 const zoomLabel = $('#pv-zoom');
-const saveButton = $('#pv-save');
 const downloadButton = $('#pv-download');
 const fullscreenButton = $('#pv-fullscreen');
 const dirtyBadge = $('#pv-dirty');
@@ -200,12 +199,6 @@ function applyEditorParameters() {
 }
 
 function updateSaveUi() {
-  saveButton.disabled = !pdfDocument || (!dirty && !saveInProgress);
-  saveButton.textContent = saveInProgress
-    ? 'Saving…'
-    : persistenceMode === 'local-copy'
-      ? 'Save copy'
-      : 'Save PDF';
   dirtyBadge.hidden = !dirty;
   dirtyBadge.textContent = saveInProgress ? 'Saving…' : 'Unsaved';
 }
@@ -1023,7 +1016,6 @@ $('#pv-redo').addEventListener('click', () => runEditorHistoryAction('redo'));
 downloadButton.addEventListener('click', () => {
   postToParent({ type: 'ctca-pdf-download-request', attachmentId: attachmentId() });
 });
-saveButton.addEventListener('click', () => savePdf().catch((error) => setStatus(error?.message || String(error), { error: true })));
 fullscreenButton.addEventListener('click', () => {
   postToParent({ type: 'ctca-pdf-fullscreen-request', attachmentId: attachmentId() });
 });
