@@ -1,74 +1,6 @@
-## 2.2.19
+# SmartCitations
 
-- Exact Citation Key matches in the CollabTeX citation popup remain fully highlighted in light blue even when mouse or keyboard navigation selects another result.
-- Mouse hover and keyboard selection continue to use light gray for all non-matching entries.
-
-## 2.2.18
-
-- Changed citation-popup mouse hover and keyboard selection backgrounds from blue to light gray.
-- Exact citation-key matches remain persistently identifiable through the blue left-edge accent, including when another row is hovered or selected.
-
-## 2.2.15
-
-- Restored true three-way local/central/snapshot classification.
-- Local-only and conflict dialogs now offer keep local, overwrite with central, or keep local and update central.
-- A conflict is reported only when both sides changed since the last successful synchronization.
-
-## 2.2.14
-
-- Made central-add and later conflict detection use the same semantic comparison.
-- Local citation-key renames and generated `ids` aliases no longer create false conflicts for DOI-identified entries.
-- Central alias metadata is no longer written as a new explicit `ids` field unless required by a local key collision.
-- Synchronization commits now use the just-merged manager state even when the full-window view is hidden.
-
-## 2.2.13
-
-- Fixed synchronization getting stuck after the final central/local conflict dialog by removing the dependency on throttled `requestAnimationFrame` callbacks.
-- Large CollabTeX OT writes now complete on the server acknowledgement instead of waiting for a second synchronous full-document read that could be throttled for minutes after a successful write.
-- The final dialog and backdrop are now removed synchronously, and background work starts after a microtask only.
-- On every fresh CollabTeX page load, citation lists, manager menus, dialogs, and overlays start hidden. Citation autocomplete remains suppressed until the first real keyboard or pointer interaction.
-
-## 2.2.12
-
-- Made the compact toolbar spinner hollow by removing its white center fill.
-- Moved **Find duplicates** into a three-dot overflow menu immediately to the right of **Update Bib** / **Export as bib file** in both manager views.
-- Forced the final synchronization dialog and backdrop to leave the rendering tree before any background parse, write, or central-database operation starts.
-
-## 2.2.10
-
-- Restored the CollabTeX selected-file helpers that were accidentally removed in 2.2.9.
-- Fixed the page-load background parse failure `captureSelectedTexFile is not defined`.
-- Restored active BibTeX filename display in the full-window Update Bib control.
-- Ensured toolbar background-activity tokens are released after parse success or failure.
-- Restored robust visible bibliography discovery while excluding backup files.
-
-
-- Fixed a bridge-timeout mismatch that could abort the background bibliography read while the page-world reader was still using its fallback path.
-- Added a background project-source ZIP fallback that can read the configured `.bib` file without a document ID and without changing the visible editor file.
-- Background parse diagnostics now record the main document, configured bibliography filenames, selected target file, file-tree candidates, document-ID resolution, read methods, timeouts, text lengths, and parser counts.
-- Parse-failure banners now include a **Details** button with a copyable diagnostic report and remain visible until acknowledged.
-- The project ZIP fallback matches the bibliography declared by the TeX document and refuses ambiguous duplicate paths.
-
-# Smart Citations
-
-## 2.2.7
-
-- Fixed a toolbar MutationObserver feedback loop introduced in 2.2.5 that could keep CollabTeX permanently on its loading screen.
-- Toolbar labels are now changed only when their text actually differs.
-- Toolbar attachment no longer schedules a state rewrite for every DOM mutation.
-- Existing bibliography synchronization, background writing, spinner, and error-reporting behavior is retained.
-
-## 2.2.6
-
-- The isolated bibliography writer now opens CollabTeX as a completely normal inactive project tab.
-- Removed PDF/output request blocking and all CSS that hides CollabTeX preview panes.
-- Existing CollabTeX tabs are no longer navigated or rewritten during extension startup.
-- Stale session-level worker blocking rules from 2.2.5 are removed automatically.
-
-
-**Current version: 2.2.19**
-
-Smart Citations is a browser extension for building a personal BibTeX library, reusing it in CollabTeX and Overleaf, and keeping the papers behind those citations close at hand. It combines citation autocomplete, bibliography management, ORCID-based publication discovery, author-impact statistics, PDF capture, a built-in reader, annotations, notes, and optional Nextcloud synchronization.
+SmartCitations is a browser extension for building a personal BibTeX library, reusing it in CollabTeX and Overleaf, and keeping the papers behind those citations close at hand. It combines citation autocomplete, bibliography management, ORCID-based publication discovery, author-impact statistics, PDF capture, a built-in reader, annotations, notes, and optional Nextcloud synchronization.
 
 ## Highlights
 
@@ -86,6 +18,10 @@ Smart Citations is a browser extension for building a personal BibTeX library, r
 - **Optional synchronization.** Keep a project bibliography synchronized with the central database, and optionally synchronize the central database, PDFs, and notes through Nextcloud.
 
 ## Getting started
+
+### Installation
+
+Install the extension for [Chrome/Edge/Chromium](https://chromewebstore.google.com/detail/lbakdnpnbfgdmjmcgkloplepgfppgigj?utm_source=item-share-cb) or [Firefox](https://addons.mozilla.org/en-US/firefox/addon/smart-citations/) from their respective extension stores. 
 
 ### Start with a new CollabTeX or Overleaf document
 
