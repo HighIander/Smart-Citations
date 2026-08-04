@@ -1,6 +1,72 @@
+## 2.2.19
+
+- Exact Citation Key matches in the CollabTeX citation popup remain fully highlighted in light blue even when mouse or keyboard navigation selects another result.
+- Mouse hover and keyboard selection continue to use light gray for all non-matching entries.
+
+## 2.2.18
+
+- Changed citation-popup mouse hover and keyboard selection backgrounds from blue to light gray.
+- Exact citation-key matches remain persistently identifiable through the blue left-edge accent, including when another row is hovered or selected.
+
+## 2.2.15
+
+- Restored true three-way local/central/snapshot classification.
+- Local-only and conflict dialogs now offer keep local, overwrite with central, or keep local and update central.
+- A conflict is reported only when both sides changed since the last successful synchronization.
+
+## 2.2.14
+
+- Made central-add and later conflict detection use the same semantic comparison.
+- Local citation-key renames and generated `ids` aliases no longer create false conflicts for DOI-identified entries.
+- Central alias metadata is no longer written as a new explicit `ids` field unless required by a local key collision.
+- Synchronization commits now use the just-merged manager state even when the full-window view is hidden.
+
+## 2.2.13
+
+- Fixed synchronization getting stuck after the final central/local conflict dialog by removing the dependency on throttled `requestAnimationFrame` callbacks.
+- Large CollabTeX OT writes now complete on the server acknowledgement instead of waiting for a second synchronous full-document read that could be throttled for minutes after a successful write.
+- The final dialog and backdrop are now removed synchronously, and background work starts after a microtask only.
+- On every fresh CollabTeX page load, citation lists, manager menus, dialogs, and overlays start hidden. Citation autocomplete remains suppressed until the first real keyboard or pointer interaction.
+
+## 2.2.12
+
+- Made the compact toolbar spinner hollow by removing its white center fill.
+- Moved **Find duplicates** into a three-dot overflow menu immediately to the right of **Update Bib** / **Export as bib file** in both manager views.
+- Forced the final synchronization dialog and backdrop to leave the rendering tree before any background parse, write, or central-database operation starts.
+
+## 2.2.10
+
+- Restored the CollabTeX selected-file helpers that were accidentally removed in 2.2.9.
+- Fixed the page-load background parse failure `captureSelectedTexFile is not defined`.
+- Restored active BibTeX filename display in the full-window Update Bib control.
+- Ensured toolbar background-activity tokens are released after parse success or failure.
+- Restored robust visible bibliography discovery while excluding backup files.
+
+
+- Fixed a bridge-timeout mismatch that could abort the background bibliography read while the page-world reader was still using its fallback path.
+- Added a background project-source ZIP fallback that can read the configured `.bib` file without a document ID and without changing the visible editor file.
+- Background parse diagnostics now record the main document, configured bibliography filenames, selected target file, file-tree candidates, document-ID resolution, read methods, timeouts, text lengths, and parser counts.
+- Parse-failure banners now include a **Details** button with a copyable diagnostic report and remain visible until acknowledged.
+- The project ZIP fallback matches the bibliography declared by the TeX document and refuses ambiguous duplicate paths.
+
 # Smart Citations
 
-**Current version: 2.0**
+## 2.2.7
+
+- Fixed a toolbar MutationObserver feedback loop introduced in 2.2.5 that could keep CollabTeX permanently on its loading screen.
+- Toolbar labels are now changed only when their text actually differs.
+- Toolbar attachment no longer schedules a state rewrite for every DOM mutation.
+- Existing bibliography synchronization, background writing, spinner, and error-reporting behavior is retained.
+
+## 2.2.6
+
+- The isolated bibliography writer now opens CollabTeX as a completely normal inactive project tab.
+- Removed PDF/output request blocking and all CSS that hides CollabTeX preview panes.
+- Existing CollabTeX tabs are no longer navigated or rewritten during extension startup.
+- Stale session-level worker blocking rules from 2.2.5 are removed automatically.
+
+
+**Current version: 2.2.19**
 
 Smart Citations is a browser extension for building a personal BibTeX library, reusing it in CollabTeX and Overleaf, and keeping the papers behind those citations close at hand. It combines citation autocomplete, bibliography management, ORCID-based publication discovery, author-impact statistics, PDF capture, a built-in reader, annotations, notes, and optional Nextcloud synchronization.
 
@@ -37,7 +103,7 @@ Smart Citations is a browser extension for building a personal BibTeX library, r
 6. Open the bibliography manager with the **bib** button to add or edit entries, import another `.bib` file, update metadata from DOI records, or attach PDFs.
 7. Open an attached PDF inside the manager to read and annotate it without leaving the project.
 
-Project synchronization is optional. You can keep a project bibliography independent, or let changes move between the project and the central library. Existing bibliography content is merged carefully, and automatic safety backups are created before substantial project bibliography rewrites.
+Project synchronization is optional. You can keep a project bibliography independent, or let changes move between the project and the central library. Synchronization identifies an entry by normalized DOI, falling back to its citation key only when no DOI exists. Entries found only centrally or only in the project are offered in the corresponding add dialog; differing entries found on both sides are handled exclusively by the conflict dialog. Project bibliography updates are written directly through the background document channel without creating backup files or switching the visible editor document. If that channel cannot write reliably, Smart Citations can open an inactive copy of the same project normally, write through the source editor, and close the temporary tab. While parsing, synchronizing, or writing, a spinner is shown directly over the disabled **[S] bib** button; no full-window update spinner is displayed. Synchronization choices remain provisional until the local write and central commit succeed, so failed writes leave differences unresolved. When differences are detected after the background parse, the page banner offers to resolve them immediately by opening the add and conflict dialogs directly. Choosing Later leaves the difference count on the bib-button badge. Successful local bibliography writes show a six-second banner by default; this success banner can be disabled in the extension options. Write-error banners remain visible until acknowledged and provide a Details link with diagnostic information.
 
 ### Start with the standalone library and PDF viewer
 
@@ -180,8 +246,7 @@ After connecting a Nextcloud account, Smart Citations can:
 - synchronize the central bibliography through a BibTeX file;
 - synchronize PDFs and their separate notes;
 - resolve bibliography conflicts entry by entry, with local, remote, and last-synchronized details;
-- restore an empty central library from an existing Nextcloud backup; and
-- in CollabTeX, import personal Nextcloud files through the native project upload flow and refresh linked project files individually or in bulk.
+- restore an empty central library from an existing Nextcloud backup.
 
 Nextcloud synchronization is optional. Existing attachments keep their selected storage type when the default is changed.
 
@@ -225,3 +290,8 @@ See the [data-protection statement](https://www.smartioz.com/smartcitations/data
 Except for bundled third-party components, the first-party source code is licensed under the [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](https://creativecommons.org/licenses/by-nc-sa/4.0/) (`CC-BY-NC-SA-4.0`). You may share and adapt it for non-commercial purposes with attribution, an indication of changes, and distribution of adaptations under the same license. See [LICENSE](LICENSE) for the project notice and the upstream license files under `pdfjs/` and `pdf-lib/` for third-party terms.
 
 The name **Smart Citations** and its associated branding are not part of this license. They belong exclusively to the owner identified in the [Impressum](https://www.smartioz.com/smartcitations/impressum.php).
+
+
+## Duplicate detection
+
+The standalone central-database manager and the CollabTeX full-window bibliography manager can find duplicate entries by normalized DOI or by matching title, journal, number, pages, and year. The review dialog defaults to the entry with the most filled fields and allows the retained citation key to be chosen before duplicate entries are removed.

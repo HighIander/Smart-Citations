@@ -124,6 +124,12 @@
               <span class="ctca-manager-update-main">Export as bib file</span>
               <span class="ctca-manager-update-files">global-bibliography.bib</span>
             </button>
+            <div class="ctca-manager-more-wrap">
+              <button type="button" class="ctca-manager-more-button" title="More bibliography actions" aria-label="More bibliography actions" aria-haspopup="menu" aria-expanded="false">⋮</button>
+              <div class="ctca-manager-more-menu" role="menu" hidden>
+                <button type="button" class="ctca-manager-find-duplicates" role="menuitem" title="Find duplicate bibliography entries">Find duplicates</button>
+              </div>
+            </div>
             <button type="button" class="ctca-manager-collapse-details" title="Collapse detail pane" aria-label="Collapse detail pane">▶</button>
           </div>
           </div>
@@ -238,6 +244,7 @@
 
   <script src="latex-renderer.js"></script>
   <script src="bibtex-parser.js"></script>
+  <script src="duplicates.js"></script>
   <script src="search-tools.js"></script>
   <script src="attachments.js"></script>
   <script src="pdf-import.js"></script>

@@ -17,6 +17,7 @@
   const humanCheckReturnTimers = new Map();
   const standaloneManagerPorts = new Map();
   const pendingWebPdfAutoContinue = new Map();
+  const pendingBibEditorWriteJobs = new Map();
   let standalonePendingCreationCommand = null;
   const DEFAULT_ACTION_TITLE = "Open Smart Citations bibliography manager";
   const HUMAN_CHECK_ACTION_TITLE = "Complete the human check. Smart Citations will return you automatically when the page changes.";
@@ -24,9 +25,11 @@
   const HUMAN_CHECK_NOTIFICATION_PREFIX = "ctca-human-check:";
   const WEB_PAGE_LOAD_TIMEOUT_MS = 45000;
   const WEB_PAGE_SETTLE_MS = 1200;
+  const BIB_EDITOR_WRITE_TAB_TIMEOUT_MS = 180000;
   const MAX_WEB_PDF_CANDIDATES = 4;
   const AUTHOR_OPTIONS_KEY = "collabtex-citation-assistant:manuscript-links:v1";
   const EDITOR_SITES_KEY = "collabtex-citation-assistant:editor-sites:v1";
+  const EDITOR_BOOTSTRAP_SCRIPT_ID = "smart-citations-configured-editor-bootstrap";
   const EDITOR_BRIDGE_SCRIPT_ID = "smart-citations-configured-editor-bridge";
   const EDITOR_CONTENT_SCRIPT_ID = "smart-citations-configured-editor-content";
   const BUILTIN_EDITOR_DOMAINS = new Set([
@@ -93,10 +96,18 @@
     const domains = await configuredEditorDomains();
     const matches = domains
       .map(editorSiteMatchPattern);
-    const ids = [EDITOR_BRIDGE_SCRIPT_ID, EDITOR_CONTENT_SCRIPT_ID];
-    await extensionApi.scripting.unregisterContentScripts({ ids }).catch(() => {});
+    const ids = [EDITOR_BOOTSTRAP_SCRIPT_ID, EDITOR_BRIDGE_SCRIPT_ID, EDITOR_CONTENT_SCRIPT_ID];
+    // Unregister one ID at a time. Some browser versions reject a batch when
+    // one requested ID is absent, which could otherwise leave the legacy
+    // document_start recovery script persisted across an extension update.
+    for (const id of ids) {
+      await extensionApi.scripting.unregisterContentScripts({ ids: [id] }).catch(() => {});
+    }
     if (!matches.length) return { supported: true, matches };
 
+    // Always unregister the legacy document_start recovery script, but do not
+    // register it again. Running navigation code before the editor mounts can
+    // leave some CollabTeX deployments with a permanently blank application.
     await extensionApi.scripting.registerContentScripts([
       {
         id: EDITOR_BRIDGE_SCRIPT_ID,
@@ -114,6 +125,7 @@
         js: [
           "latex-renderer.js",
           "bibtex-parser.js",
+          "duplicates.js",
           "search-tools.js",
           "attachments.js",
           "pdf-import.js",
@@ -2618,7 +2630,218 @@
     throw new Error("The webpage did not resolve to a downloadable PDF.");
   }
 
+  function bibliographyWorkerUrl(inputUrl) {
+    const url = new URL(String(inputUrl || ""));
+    if (!/^https?:$/.test(url.protocol)) throw new Error("The CollabTeX project URL is invalid.");
+    // Never alter the project URL for an isolated write tab. Some CollabTeX
+    // deployments do not finish booting when an unknown query parameter is
+    // present. The background script identifies worker tabs solely by tab ID.
+    url.searchParams.delete("ctcaSmartCitationsBibWorker");
+    return url.href;
+  }
+
+  async function cleanupLegacyBibliographyWorkerTabs() {
+    const tabs = await extensionApi.tabs.query({}).catch(() => []);
+    await Promise.all(tabs.map(async (tab) => {
+      if (!Number.isInteger(tab?.id) || !tab?.url) return;
+      let url;
+      try {
+        url = new URL(tab.url);
+      } catch (_error) {
+        return;
+      }
+      if (!url.searchParams.has("ctcaSmartCitationsBibWorker")) return;
+      if (!(await isSupportedEditorUrl(url.href))) return;
+      url.searchParams.delete("ctcaSmartCitationsBibWorker");
+      await extensionApi.tabs.update(tab.id, { url: url.href }).catch(() => {});
+    }));
+  }
+
+  async function signalBibliographyWorkerTab(tabId, jobId, timeoutMs = 60000) {
+    const deadline = Date.now() + Math.max(10000, Number(timeoutMs) || 60000);
+    let lastError = null;
+    while (Date.now() < deadline) {
+      try {
+        const response = await extensionApi.tabs.sendMessage(tabId, {
+          type: "ctca-bib-write-worker-start",
+          jobId
+        });
+        if (response?.ok) return true;
+        lastError = new Error(response?.error || "The isolated editor content script did not accept the write job.");
+      } catch (error) {
+        lastError = error;
+      }
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 500));
+    }
+    throw lastError || new Error("The isolated editor content script did not become available.");
+  }
+
+  async function cleanupLegacyBibliographyWorkerNetworkGuards() {
+    if (
+      !extensionApi.declarativeNetRequest?.getSessionRules
+      || !extensionApi.declarativeNetRequest?.updateSessionRules
+    ) return;
+    try {
+      const rules = await extensionApi.declarativeNetRequest.getSessionRules();
+      const ids = (Array.isArray(rules) ? rules : [])
+        .map((rule) => Number(rule?.id))
+        .filter((id) => Number.isInteger(id) && id >= 1500000000 && id < 1503000000);
+      if (ids.length) {
+        await extensionApi.declarativeNetRequest.updateSessionRules({ removeRuleIds: ids });
+      }
+    } catch (_error) {
+      // Stale worker rules are best-effort cleanup only. The normal project tab
+      // must never be delayed or navigated because cleanup is unavailable.
+    }
+  }
+
+  async function runBibliographyEditorWriteFallback(message, sender) {
+    const sourceUrl = String(message.pageUrl || sender?.tab?.url || "");
+    const fileName = String(message.fileName || "").trim();
+    if (!sourceUrl || !fileName) throw new Error("The isolated bibliography-write request is incomplete.");
+
+    const jobId = `ctca-bib-write-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const timeoutMs = Math.max(60000, Math.min(300000, Number(message.timeoutMs) || BIB_EDITOR_WRITE_TAB_TIMEOUT_MS));
+    const job = {
+      jobId,
+      fileName,
+      expectedText: String(message.expectedText ?? ""),
+      text: String(message.text ?? ""),
+      sourceTabId: Number.isInteger(sender?.tab?.id) ? sender.tab.id : null,
+      tabId: null,
+      createdAt: new Date().toISOString(),
+      resolve: null,
+      reject: null
+    };
+
+    let timeout = null;
+    let tab = null;
+    let onTabRemoved = null;
+    const completion = new Promise((resolve, reject) => {
+      job.resolve = resolve;
+      job.reject = reject;
+    });
+    pendingBibEditorWriteJobs.set(jobId, job);
+
+    try {
+      // Load CollabTeX exactly as a normal project tab. Do not block PDF/output
+      // requests and do not hide host-application panes: both approaches have
+      // caused deployment-specific startup failures. The tab remains inactive.
+      tab = await extensionApi.tabs.create({
+        url: bibliographyWorkerUrl(sourceUrl),
+        active: false
+      });
+      if (!Number.isInteger(tab?.id)) throw new Error("The isolated CollabTeX editor tab could not be created.");
+      job.tabId = tab.id;
+      signalBibliographyWorkerTab(tab.id, jobId, 120000).catch((error) => {
+        if (!pendingBibEditorWriteJobs.has(jobId)) return;
+        error.ctcaRemoteDiagnostics = {
+          method: "isolated-background-editor-tab",
+          jobId,
+          tabId: job.tabId,
+          fileName,
+          phase: "content-script-start",
+          errorStack: error?.stack || ""
+        };
+        job.reject(error);
+      });
+      onTabRemoved = (tabId) => {
+        if (tabId !== job.tabId) return;
+        const error = new Error("The isolated CollabTeX editor tab was closed before the bibliography write completed.");
+        error.ctcaRemoteDiagnostics = {
+          method: "isolated-background-editor-tab",
+          jobId,
+          tabId: job.tabId,
+          fileName,
+          createdAt: job.createdAt
+        };
+        job.reject(error);
+      };
+      extensionApi.tabs.onRemoved.addListener(onTabRemoved);
+
+      timeout = globalThis.setTimeout(() => {
+        const error = new Error(`The isolated bibliography editor did not finish within ${Math.round(timeoutMs / 1000)} seconds.`);
+        error.ctcaRemoteDiagnostics = {
+          method: "isolated-background-editor-tab",
+          jobId,
+          tabId: job.tabId,
+          fileName,
+          timeoutMs,
+          createdAt: job.createdAt
+        };
+        job.reject(error);
+      }, timeoutMs);
+
+      const result = await completion;
+      return {
+        ok: true,
+        changed: result?.changed === true,
+        method: "isolated-background-editor-tab",
+        diagnostics: result?.diagnostics || null
+      };
+    } finally {
+      if (timeout) globalThis.clearTimeout(timeout);
+      if (onTabRemoved) extensionApi.tabs.onRemoved.removeListener(onTabRemoved);
+      pendingBibEditorWriteJobs.delete(jobId);
+      if (Number.isInteger(tab?.id)) {
+        try { await extensionApi.tabs.remove(tab.id); } catch (_error) {}
+      }
+    }
+  }
+
   extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === "ctca-write-bib-via-background-tab") {
+      runBibliographyEditorWriteFallback(message, sender)
+        .then(sendResponse)
+        .catch((error) => sendResponse({
+          ok: false,
+          error: error?.message || String(error),
+          diagnostics: error?.ctcaRemoteDiagnostics || {
+            method: "isolated-background-editor-tab",
+            errorName: error?.name || "Error",
+            errorStack: error?.stack || ""
+          }
+        }));
+      return true;
+    }
+
+
+    if (message?.type === "ctca-bib-write-worker-get") {
+      const job = pendingBibEditorWriteJobs.get(String(message.jobId || ""));
+      if (!job || (Number.isInteger(job.tabId) && sender?.tab?.id !== job.tabId)) {
+        sendResponse({ ok: false, error: "The isolated bibliography-write job is no longer available." });
+        return false;
+      }
+      sendResponse({
+        ok: true,
+        job: {
+          jobId: job.jobId,
+          fileName: job.fileName,
+          expectedText: job.expectedText,
+          text: job.text,
+          createdAt: job.createdAt
+        }
+      });
+      return false;
+    }
+
+    if (message?.type === "ctca-bib-write-worker-result") {
+      const job = pendingBibEditorWriteJobs.get(String(message.jobId || ""));
+      if (!job || (Number.isInteger(job.tabId) && sender?.tab?.id !== job.tabId)) {
+        sendResponse({ ok: false, error: "The isolated bibliography-write job is no longer available." });
+        return false;
+      }
+      if (message.ok === true) {
+        job.resolve({ changed: message.changed === true, diagnostics: message.diagnostics || null });
+      } else {
+        const error = new Error(message.error || "The isolated background editor could not write the bibliography.");
+        error.ctcaRemoteDiagnostics = message.diagnostics || null;
+        job.reject(error);
+      }
+      sendResponse({ ok: true });
+      return false;
+    }
+
     if (message?.type === "ctca-sync-editor-sites") {
       queueConfiguredEditorContentScriptSync()
         .then((result) => sendResponse({
@@ -3101,30 +3324,6 @@
     await openOrReuseStandaloneManager();
   }
 
-  async function openManagerFromAction(clickedTab) {
-    const activeEditorTab = clickedTab?.active && await isSupportedEditorUrl(clickedTab.url)
-      ? clickedTab
-      : null;
-
-    if (!activeEditorTab?.id) {
-      await openStandaloneManager();
-      return;
-    }
-
-    try {
-      const response = await extensionApi.tabs.sendMessage(
-        activeEditorTab.id,
-        { type: "ctca-open-bib-manager" }
-      );
-      if (response?.ok === false) {
-        throw new Error(response.error || "Could not open bibliography manager.");
-      }
-    } catch (_error) {
-      // Never activate, reload, or switch to another editor tab. If the
-      // active tab cannot open the in-page manager, use the standalone one.
-      await openStandaloneManager();
-    }
-  }
 
   extensionApi.tabs.onRemoved?.addListener((tabId) => {
     standaloneManagerPorts.delete(tabId);
@@ -3189,12 +3388,14 @@
   extensionApi.runtime.onInstalled?.addListener((details) => {
     refreshActiveJournalSiteBadges().catch(() => {});
     queueConfiguredEditorContentScriptSync().catch(() => {});
+    cleanupLegacyBibliographyWorkerNetworkGuards().catch(() => {});
     if (details?.reason === "install") showInstallWelcome().catch(() => {});
   });
 
   extensionApi.runtime.onStartup?.addListener(() => {
     refreshActiveJournalSiteBadges().catch(() => {});
     queueConfiguredEditorContentScriptSync().catch(() => {});
+    cleanupLegacyBibliographyWorkerNetworkGuards().catch(() => {});
   });
 
   extensionApi.notifications?.onClicked?.addListener((notificationId) => {
@@ -3209,16 +3410,12 @@
     humanCheckNotificationTabs.delete(notificationId);
   });
 
-  extensionApi.action?.onClicked?.addListener((tab) => {
-    const returnTabId = humanCheckReturnTabs.get(tab?.id);
-    if (Number.isInteger(returnTabId)) {
-      extensionApi.tabs.update(returnTabId, { active: true }).catch(() => openStandaloneManager());
-      return;
-    }
-    openManagerFromAction(tab).catch(() => openStandaloneManager());
+  extensionApi.action?.onClicked?.addListener(() => {
+    openStandaloneManager().catch(() => {});
   });
 
   refreshActiveJournalSiteBadges().catch(() => {});
+  cleanupLegacyBibliographyWorkerNetworkGuards().catch(() => {});
   queueConfiguredEditorContentScriptSync().catch((error) => {
     console.error("[Smart Citations] Could not activate configured document editor sites.", error);
   });

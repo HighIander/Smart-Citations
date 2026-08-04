@@ -30,6 +30,7 @@
   const patterns = document.querySelector("#ctca-page-patterns");
   const editorSites = document.querySelector("#ctca-editor-sites");
   const preferredAction = document.querySelector("#ctca-preferred-action");
+  const showBibWriteSuccessBanner = document.querySelector("#ctca-show-bib-write-success-banner");
   const status = document.querySelector("#ctca-options-status");
   const desktopLauncherContent = document.querySelector("#ctca-desktop-launcher-content");
   let loadedSettings = {};
@@ -95,6 +96,7 @@
       authorInstitutions: institutionLines(),
       openAlexApiKey: openAlexApiKey.value.trim(),
       openAlexAuthorId: openAlexAuthorId.value.trim(),
+      showBibWriteSuccessBanner: showBibWriteSuccessBanner.checked,
       identitySetupSeen: true
     };
   }
@@ -153,6 +155,7 @@
     preferredAction.value = ["ask", "journal", "smart-citations"].includes(stored.preferredAction)
       ? stored.preferredAction
       : defaults.preferredAction;
+    showBibWriteSuccessBanner.checked = stored.showBibWriteSuccessBanner !== false;
   }
 
   form.addEventListener("submit", async (event) => {

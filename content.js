@@ -14,6 +14,10 @@
   }
 
   document.documentElement.classList.add(IS_OVERLEAF ? "ctca-platform-overleaf" : "ctca-platform-collabtex");
+  // Worker mode is enabled only after the background script confirms that this
+  // exact browser tab owns an explicit bibliography-write job. URL parameters
+  // are not trusted because a stranded worker URL must still load normally.
+  document.documentElement.classList.remove("ctca-bib-write-worker-mode");
 
   const REQUEST_EVENT = "collabtex-cite-assistant:request";
   const RESPONSE_EVENT = "collabtex-cite-assistant:response";
@@ -21,7 +25,7 @@
   const STORAGE_PREFIX = "collabtex-citation-assistant:";
   const CACHE_VERSION = 5;
   const MAX_RESULTS = 30;
-  const FILE_OPEN_TIMEOUT_MS = 30000;
+  const FILE_OPEN_TIMEOUT_MS = 90000;
   const FILE_CONTENT_STABLE_MS = 650;
   const FILE_POLL_INTERVAL_MS = 125;
   const POPUP_OPEN_DELAY_MS = 500;
@@ -35,10 +39,8 @@
   const AUTHOR_OPTIONS_KEY = `${STORAGE_PREFIX}manuscript-links:v1`;
   const GLOBAL_DOCUMENT_PUSH_STATE_KEY = `${STORAGE_PREFIX}global-document-push-state:v1`;
   const GLOBAL_SYNC_SNAPSHOT_SUFFIX = ":global-sync-snapshot:v1";
-  const PROJECT_NEXTCLOUD_LINKS_SUFFIX = ":nextcloud-file-links:v1";
-  const PROJECT_NEXTCLOUD_LINKS_FILE = ".collabtex-nextcloud-links.json";
+  const GLOBAL_SYNC_DECISIONS_SUFFIX = ":global-sync-decisions:v1";
   const GLOBAL_SETUP_BIB_FILE = "bibliography.bib";
-  const GLOBAL_DELETION_CONFIRM_THRESHOLD = 5;
   const GLOBAL_CHANGE_CHECK_INTERVAL_MS = 30 * 1000;
   const GLOBAL_DOCUMENT_SYNC_VERSION = 1;
   const CATEGORY_STATE_VERSION = 1;
@@ -64,6 +66,11 @@
     CTCA_ADDED_ON_FIELD,
     CTCA_STARRED_FIELD
   ]);
+  // These fields affect local citation lookup or serialization, but not the
+  // bibliographic content used to decide whether two synchronized records conflict.
+  // In particular, `ids` can be generated while importing a central entry to keep
+  // an old or colliding citation key usable locally.
+  const GLOBAL_SYNC_COMPARISON_IGNORED_FIELDS = new Set(["ids"]);
   const MANAGER_LIST_COLUMNS = [
     { id: "title", label: "Title / authors", min: 140, defaultWidth: 360, defaultVisible: true },
     { id: "year", label: "Year", min: 58, defaultWidth: 72, defaultVisible: true },
@@ -221,6 +228,7 @@
   let projectBibliographySetupInProgress = false;
   let globalBanner = null;
   let globalBannerTimer = null;
+  let globalBannerPersistentError = false;
   let documentBibliographyUpdateOverlay = null;
   let managerSort = { field: "author", direction: "asc" };
   let managerFiles = [];
@@ -228,6 +236,14 @@
   let managerReturnTexFile = "";
   let managerBusy = false;
   let managerSessionChanged = false;
+  let managerInitialOpenParsed = false;
+  let managerInitialParseState = "pending";
+  let managerInitialParseError = "";
+  let managerInitialParseDiagnostics = null;
+  let managerOpenFallbackParseAttempted = false;
+  let managerGlobalSyncSession = null;
+  let pageLoadBibliographyParsePromise = null;
+  let backgroundBibWriteWorkerPromise = null;
   let managerCloseCommitRequested = false;
   let managerListRenderTimer = null;
   let managerSearchRenderTimer = null;
@@ -274,10 +290,11 @@
   let globalDatabaseSyncTimer = null;
   let globalDatabaseSyncInProgress = false;
   let globalDatabaseSyncQueued = false;
-  let blockedGlobalDeletionSignature = "";
   let suppressGlobalDatabaseStorageSync = false;
   let globalDocumentFlagCheckInProgress = false;
   let globalDocumentPendingCount = 0;
+  let globalDocumentFlagPendingCount = 0;
+  let globalComparisonPendingCount = 0;
   let globalDocumentPendingRevision = 0;
   let globalDocumentWasPending = false;
   let globalSuggestionRecords = [];
@@ -289,13 +306,12 @@
   let legacyCachedManagerState = null;
   let legacyCachedDoiSyncLedger = null;
   let doiSuccessToastTimer = null;
-  let projectNextcloudLinks = [];
-  let projectNextcloudUiObserver = null;
-  let projectNextcloudUiTimer = null;
-  let projectNextcloudUpdateInProgress = false;
-  let projectCloudToastTimer = null;
-  let projectNextcloudMetadataTimer = null;
-  let projectNextcloudMetadataWriteInProgress = false;
+  let toolbarBackgroundActivityCount = 0;
+  let toolbarBackgroundActivitySequence = 0;
+  const toolbarBackgroundActivityLabels = new Map();
+  let suppressTransientListsUntilInteraction = true;
+  let managerBusyLabel = "Working on bibliography…";
+  let showBibWriteSuccessBanner = true;
 
   const pendingRequests = new Map();
   const popup = createPopup();
@@ -304,6 +320,31 @@
   const appDialog = createAppDialog();
   const bibManager = createBibManagerOverlay();
   const toolbarButton = createToolbarButton();
+
+  function hideTransientUiForFreshPageLoad() {
+    // A browser refresh must always start with the editor unobstructed. In
+    // particular, an existing cursor position inside a citation must not cause
+    // the autocomplete list or a manager menu to reappear until the user
+    // interacts with the freshly loaded page.
+    cancelScheduledPopup();
+    activeMenu = null;
+    popup.classList.remove("ctca-visible");
+    popup.setAttribute("aria-hidden", "true");
+    abstractOverlay.classList.remove("ctca-abstract-overlay-visible");
+    abstractOverlay.setAttribute("aria-hidden", "true");
+    appDialog.classList.remove("ctca-app-dialog-visible");
+    appDialog.setAttribute("aria-hidden", "true");
+    bibManager.classList.remove("ctca-manager-visible");
+    bibManager.setAttribute("aria-hidden", "true");
+    hideDocumentBibliographyUpdateOverlay();
+    hideGlobalBanner();
+    bibManager.querySelectorAll(
+      ".ctca-manager-more-menu, .ctca-manager-search-menu, .ctca-manager-add-menu, " +
+      ".ctca-manager-tag-search-suggestions, .ctca-crosslink-picker, .ctca-manager-category-menu"
+    ).forEach((element) => { element.hidden = true; });
+  }
+
+  hideTransientUiForFreshPageLoad();
 
   function cloneDefaultSettings() {
     return {
@@ -494,6 +535,23 @@
         focusTarget?.focus();
       }, 0);
     });
+  }
+
+  async function releaseAppDialogBeforeBackgroundWork() {
+    // The synchronization choices are complete at this point. Remove the
+    // dialog and backdrop synchronously before starting background work. Do
+    // not wait for requestAnimationFrame here: browsers may indefinitely
+    // throttle animation frames while a tab or embedded editor is considered
+    // occluded, which previously left synchronization stuck after the final
+    // conflict dialog.
+    appDialog?.classList.remove("ctca-app-dialog-visible");
+    appDialog?.setAttribute("aria-hidden", "true");
+    const active = document.activeElement;
+    if (active && appDialog?.contains(active) && typeof active.blur === "function") active.blur();
+    // Force style invalidation now, then yield only a microtask. This frees the
+    // editor immediately without depending on paint scheduling.
+    void appDialog?.offsetHeight;
+    await Promise.resolve();
   }
 
   async function showBatchDoiConfirmation(total, previouslySynchronized) {
@@ -1119,6 +1177,12 @@
                 <span class="ctca-manager-update-main">↻ Update Bib</span>
                 <span class="ctca-manager-update-files"></span>
               </button>
+              <div class="ctca-manager-more-wrap">
+                <button type="button" class="ctca-manager-more-button" title="More bibliography actions" aria-label="More bibliography actions" aria-haspopup="menu" aria-expanded="false">⋮</button>
+                <div class="ctca-manager-more-menu" role="menu" hidden>
+                  <button type="button" class="ctca-manager-find-duplicates" role="menuitem" title="Find duplicate bibliography entries">Find duplicates</button>
+                </div>
+              </div>
               <button type="button" class="ctca-manager-collapse-details" title="Collapse detail pane" aria-label="Collapse detail pane">▶</button>
             </div>
             </div>
@@ -1227,6 +1291,29 @@
     });
     root.querySelector(".ctca-manager-update").addEventListener("click", () => managerSaveAndReload());
     root.querySelector(".ctca-manager-update-all-doi").addEventListener("click", () => managerUpdateAllEntriesFromDoi());
+    const managerMoreWrap = root.querySelector(".ctca-manager-more-wrap");
+    const managerMoreButton = root.querySelector(".ctca-manager-more-button");
+    const managerMoreMenu = root.querySelector(".ctca-manager-more-menu");
+    const closeManagerMoreMenu = () => {
+      if (managerMoreMenu) managerMoreMenu.hidden = true;
+      managerMoreButton?.setAttribute("aria-expanded", "false");
+    };
+    managerMoreButton?.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const willOpen = Boolean(managerMoreMenu?.hidden);
+      if (managerMoreMenu) managerMoreMenu.hidden = !willOpen;
+      managerMoreButton.setAttribute("aria-expanded", willOpen ? "true" : "false");
+    });
+    managerMoreWrap?.addEventListener("click", (event) => event.stopPropagation());
+    document.addEventListener("click", closeManagerMoreMenu);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeManagerMoreMenu();
+    }, true);
+    root.querySelector(".ctca-manager-find-duplicates").addEventListener("click", () => {
+      closeManagerMoreMenu();
+      managerFindAndDeleteDuplicates().catch((error) => managerSetStatus(error?.message || String(error), true));
+    });
     root.querySelector(".ctca-manager-collapse-details").addEventListener("click", () => {
       managerDetailsCollapsedManually = !managerDetailsCollapsedManually;
       managerUpdateDetailsVisibility();
@@ -2367,7 +2454,7 @@
     });
     if (!permission) return;
     try {
-      await saveManagerEntriesToGlobalDatabase({ source: "shared-category", skipPrompt: true });
+      await saveManagerEntriesToGlobalDatabase({ source: "shared-category", skipPrompt: true, promptEntrySelection: false });
       setManagerBusy(true, "Creating Nextcloud share…");
       const database = await loadGlobalDatabaseState();
       let sharePassword = "";
@@ -2459,7 +2546,7 @@
     });
     if (!confirmed) return;
     try {
-      await saveManagerEntriesToGlobalDatabase({ source: "shared-category-stop", skipPrompt: true });
+      await saveManagerEntriesToGlobalDatabase({ source: "shared-category-stop", skipPrompt: true, promptEntrySelection: false });
       setManagerBusy(true, owner ? "Stopping sharing…" : "Stopping remote sync…");
       const database = await loadGlobalDatabaseState();
       await globalThis.CollabTeXAttachmentStore.stopSharedCategory(database, categoryId);
@@ -2797,11 +2884,9 @@
   }
 
   function stripOneBibDelimiter(value) {
-    const text = String(value ?? "").trim();
-    if (text.length >= 2 && ((text.startsWith("{") && text.endsWith("}")) || (text.startsWith('"') && text.endsWith('"')))) {
-      return text.slice(1, -1).trim();
-    }
-    return text;
+    const helper = globalThis.CollabTeXBibTeX?.stripSingleBalancedOuterDelimiter;
+    if (typeof helper === "function") return helper(value);
+    return String(value ?? "").trim();
   }
 
   function normalizeFieldMapForEditing(fields = {}) {
@@ -2930,17 +3015,17 @@
 
   function setManagerBusy(busy, label = "Working…") {
     managerBusy = busy;
+    managerBusyLabel = busy ? String(label || "Working on bibliography…") : "Working on bibliography…";
     bibManager.classList.toggle("ctca-manager-busy", busy);
     bibManager.querySelectorAll(
-      ".ctca-manager-update, .ctca-manager-update-all-doi, .ctca-manager-update-selected, .ctca-manager-remove-selected, .ctca-manager-add-entry, .ctca-manager-add-menu button, .ctca-manager-global-sync-checkbox, .ctca-manager-nextcloud-sync-checkbox, .ctca-manager-cloud-settings, .ctca-manager-options, .ctca-manager-add-category, .ctca-manager-select-visible-checkbox, .ctca-manager-star-sort, .ctca-manager-column-eye, [data-manager-sort]"
+      ".ctca-manager-update, .ctca-manager-update-all-doi, .ctca-manager-more-button, .ctca-manager-find-duplicates, .ctca-manager-update-selected, .ctca-manager-remove-selected, .ctca-manager-add-entry, .ctca-manager-add-menu button, .ctca-manager-global-sync-checkbox, .ctca-manager-nextcloud-sync-checkbox, .ctca-manager-cloud-settings, .ctca-manager-options, .ctca-manager-add-category, .ctca-manager-select-visible-checkbox, .ctca-manager-star-sort, .ctca-manager-column-eye, [data-manager-sort]"
     ).forEach((element) => {
       element.disabled = busy;
     });
     const nextcloudToggle = bibManager.querySelector(".ctca-manager-nextcloud-sync-checkbox");
     if (nextcloudToggle) nextcloudToggle.disabled = Boolean(busy || !managerNextcloudConnected);
     updateManagerBibButton(busy, label);
-    toolbarButton.disabled = busy || refreshInProgress || jumpInProgress || doiOperationInProgress;
-    toolbarButton.textContent = busy ? "bib…" : "bib";
+    updateToolbarButtonState();
     updateManagerSelectionControls(sortedFilteredManagerRecords().map((record) => managerRecordId(record)));
     if (!busy && managerCloseCommitRequested && !bibManager.classList.contains("ctca-manager-visible")) {
       managerCloseCommitRequested = false;
@@ -3444,6 +3529,133 @@
         .map(([, draft]) => globalSyncIdentity(globalItemFromDraft(draft)))
         .filter((identity) => identity !== "key:")
     ]);
+  }
+
+
+  function managerDuplicateEntryTitle(draft) {
+    return stripOneBibDelimiter(draft?.fields?.title || "") || "Untitled entry";
+  }
+
+  async function managerFindAndDeleteDuplicates() {
+    if (managerBusy) return;
+    const writableDrafts = [...managerDrafts.values()].filter((draft) =>
+      draft?.centralPreview !== true && !managerDeletedDrafts.has(draft.id) && !managerEntryIsReadOnly(draft.id)
+    );
+    const groups = globalThis.SmartCitationsDuplicates.findGroups(writableDrafts, {
+      getId: (draft) => draft.id,
+      getKey: (draft) => draft.key,
+      latexToText: globalThis.CollabTeXBibTeX?.latexToText,
+      internalFields: CTCA_INTERNAL_FIELDS
+    });
+    if (!groups.length) {
+      managerSetStatus("No duplicate bibliography entries were found.");
+      return;
+    }
+
+    const review = globalThis.SmartCitationsDuplicates.createReviewControl(groups, {
+      document,
+      getTitle: managerDuplicateEntryTitle,
+      getSource: (draft) => draft.sourceFile || "document bibliography"
+    });
+    const selectedGroups = await showAppDialog({
+      title: `Review ${groups.length} duplicate group${groups.length === 1 ? "" : "s"}`,
+      message:
+        "Duplicates are entries with the same DOI or the same normalized title, journal, number, pages and year. " +
+        "The entry with the most filled fields is selected by default. Choose which entry and citation key to keep.",
+      controls: review.element,
+      buttons: [
+        { label: "Cancel", value: null },
+        {
+          label: "Delete selected duplicates",
+          primary: true,
+          danger: true,
+          getValue: () => review.getSelection()
+        }
+      ],
+      closeValue: null,
+      danger: true,
+      dialogClass: "ctca-duplicate-dialog"
+    });
+    if (!selectedGroups) return;
+    if (!selectedGroups.length) {
+      managerSetStatus("No duplicate groups were selected for deletion.");
+      return;
+    }
+
+    const plans = selectedGroups.map((selection) => {
+      const keeperCandidate = selection.group.items.find((candidate) => candidate.id === selection.keeperId)
+        || selection.group.items[0];
+      const groupDrafts = selection.group.items.map((candidate) => candidate.item);
+      return {
+        keeper: keeperCandidate.item,
+        groupDrafts,
+        remove: groupDrafts.filter((draft) => draft !== keeperCandidate.item),
+        desiredKey: String(selection.citationKey || keeperCandidate.item.key || "Reference").trim()
+      };
+    });
+    const removedDrafts = plans.flatMap((plan) => plan.remove);
+    if (!removedDrafts.length) {
+      managerSetStatus("Every duplicate group already retained all entries; nothing was deleted.");
+      return;
+    }
+
+    const removedIds = new Set(removedDrafts.map((draft) => draft.id));
+    const replacementByKey = new Map();
+    for (const plan of plans) {
+      const categoryIds = new Set();
+      for (const draft of plan.groupDrafts) {
+        replacementByKey.set(String(draft.key || "").toLocaleLowerCase(), plan.desiredKey);
+        for (const categoryId of managerEntryCategoryIds(draft.id)) categoryIds.add(categoryId);
+      }
+
+      const aliases = new Set([
+        ...splitAliasKeys(plan.keeper.fields?.ids || ""),
+        ...plan.groupDrafts.flatMap((draft) => [draft.key, draft.originalKey, ...splitAliasKeys(draft.fields?.ids || "")])
+      ].filter(Boolean));
+      aliases.delete(plan.desiredKey);
+      if (aliases.size) plan.keeper.fields.ids = [...aliases].join(", ");
+      else delete plan.keeper.fields.ids;
+
+      const oldKeeperKey = plan.keeper.key;
+      plan.keeper.key = plan.desiredKey;
+      if (oldKeeperKey !== plan.desiredKey) managerUpdateSharedLocalKeyOverride(oldKeeperKey, plan.desiredKey);
+      managerSetEntryCategoryIds(plan.keeper.id, [...categoryIds]);
+      managerMarkDirty(plan.keeper, false);
+    }
+
+    for (const draft of removedDrafts) {
+      managerDeletedDrafts.set(draft.id, draft);
+      managerCentralDeletionChoices.set(draft.id, false);
+      managerDirtyIds.delete(draft.id);
+      managerDrafts.delete(draft.id);
+      delete managerCategoryState.memberships[draft.id];
+    }
+
+    for (const draft of managerDrafts.values()) {
+      if (draft.centralPreview === true) continue;
+      const current = managerCrosslinkKeys(draft);
+      const next = current.map((key) => replacementByKey.get(String(key).toLocaleLowerCase()) || key);
+      if (next.some((key, index) => key !== current[index])) managerSetCrosslinkKeys(draft, next);
+    }
+
+    managerCrosslinkNavigationStack = managerCrosslinkNavigationStack
+      .filter((id) => !removedIds.has(id));
+    managerRecords = managerRecords.filter((record) => !removedIds.has(managerRecordId(record)));
+    managerSelectedIds = new Set([...managerSelectedIds].filter((id) => !removedIds.has(id)));
+    if (!managerDrafts.has(managerSelectedId) || removedIds.has(managerSelectedId)) {
+      managerSelectedId = plans[0]?.keeper?.id || managerDrafts.keys().next().value || "";
+    }
+    managerLastSelectionAnchorId = "";
+    managerSessionChanged = true;
+    deferredProjectGlobalPush = settings.syncGlobalDatabase;
+    renderManagerCategories();
+    renderManagerList();
+    renderManagerDetails();
+    updateManagerCount();
+    managerSetStatus(
+      `${removedDrafts.length} duplicate entr${removedDrafts.length === 1 ? "y is" : "ies are"} marked for removal. ` +
+      "Click Update Bib or close the window to write the combined bibliography."
+    );
   }
 
   async function managerRemoveSelectedEntries() {
@@ -6746,7 +6958,7 @@
             type: metadata.entryType || "misc",
             sourceFile: targetFile,
             fields: Object.fromEntries(
-              Object.entries(fields).map(([name, value]) => [name, managerWrapBibValue(value)])
+              Object.entries(fields).map(([name, value]) => [name, managerWrapBibValue(value, name)])
             )
           };
           const draft = draftFromRecord(syntheticRecord);
@@ -7149,7 +7361,7 @@
       type: metadata.entryType || "misc",
       sourceFile: targetFile,
       fields: Object.fromEntries(
-        Object.entries(fields).map(([name, value]) => [name, managerWrapBibValue(value)])
+        Object.entries(fields).map(([name, value]) => [name, managerWrapBibValue(value, name)])
       )
     };
     const draft = draftFromRecord(syntheticRecord);
@@ -8285,7 +8497,7 @@
       managerSetStatus(`The citation key ${key} already exists.`, true);
       return;
     }
-    const syntheticRecord = { key, type: result.type || "misc", sourceFile: targetFile, fields: Object.fromEntries(Object.entries(result.fields).map(([name, value]) => [name, managerWrapBibValue(value)])) };
+    const syntheticRecord = { key, type: result.type || "misc", sourceFile: targetFile, fields: Object.fromEntries(Object.entries(result.fields).map(([name, value]) => [name, managerWrapBibValue(value, name)])) };
     const draft = draftFromRecord(syntheticRecord);
     draft.originalKey = "";
     draft.key = key;
@@ -8412,10 +8624,11 @@
     }
   }
 
-  function managerWrapBibValue(value) {
+  function managerWrapBibValue(value, fieldName = "") {
+    const serializer = globalThis.CollabTeXBibTeX?.serializeBibFieldValue;
+    if (typeof serializer === "function") return serializer(fieldName, value);
     const text = String(value ?? "").trim();
-    if (!text) return "";
-    return `{${text}}`;
+    return text ? `{${text}}` : "";
   }
 
   function encodeCtcaMetadata(value) {
@@ -8528,7 +8741,7 @@
   function managerSerializedFields(draft) {
     const result = {};
     for (const [name, value] of Object.entries(managerFieldsWithEmbeddedState(draft))) {
-      const wrapped = managerWrapBibValue(value);
+      const wrapped = managerWrapBibValue(value, name);
       if (wrapped) result[name] = wrapped;
     }
     return result;
@@ -8607,8 +8820,27 @@
     );
   }
 
-  async function getManagerTexState() {
-    return waitForMainDocumentState();
+  async function getManagerTexState({ background = true } = {}) {
+    if (!background) return waitForMainDocumentState();
+
+    const mainName = getMainDocumentName();
+    try {
+      const state = (await bridgeRequest("getState", {}, 2000)).state;
+      if (state && (!mainName || bibSourceMatches(state.fileName, mainName))) return state;
+    } catch (_error) {
+      // The direct project-document reader below does not depend on ACE.
+    }
+
+    if (!mainName) throw new Error("The main TeX document could not be identified in the ColLabTeX file tree.");
+    const value = await readProjectTextFileInBackground(mainName);
+    return {
+      value,
+      cursorIndex: 0,
+      cursor: { row: 0, column: 0 },
+      fileName: mainName,
+      readOnly: true,
+      editorKind: "background"
+    };
   }
 
   function normalizeBibFileName(value) {
@@ -8616,6 +8848,34 @@
     if (!name) return "";
     if (!/\.bib$/i.test(name)) name += ".bib";
     return name;
+  }
+
+  function isIgnoredBibliographyFileName(value) {
+    const normalized = String(value || "").trim().replace(/\\/g, "/");
+    const base = normalized.split("/").pop() || "";
+    if (!base) return true;
+    const lower = base.toLowerCase();
+    return (
+      !/\.bib$/i.test(base) ||
+      /_\.bib$/i.test(base) ||
+      /\.smart-citations-backup-.*\.bib\.bak$/i.test(lower) ||
+      /\.bib\.(?:bak|backup|old)$/i.test(lower) ||
+      /(?:^|[._ -])(?:backup|bak|copy|old|archive)(?:[._ -]|\d|$)/i.test(lower) ||
+      /(?:^|[._-])\d{8}t?\d{6}z?(?:[._-]|$)/i.test(lower)
+    );
+  }
+
+  function activeBibliographyFileName(value = "") {
+    const requested = normalizeBibFileName(value);
+    const configured = managerFiles
+      .map(normalizeBibFileName)
+      .filter((name) => name && !isIgnoredBibliographyFileName(name));
+    if (requested) {
+      const exact = configured.find((name) => bibSourceMatches(name, requested));
+      if (exact) return exact;
+    }
+    if (configured.length) return configured[0];
+    return uniqueBibliographyFileCandidates(requested ? [requested] : [], cachedFiles)[0] || "";
   }
 
   function buildBibliographyDeclaration(tex, fileName) {
@@ -8847,9 +9107,6 @@
     const parsed = window.CollabTeXBibTeX.parseBibTeX(finalText, target);
     if (!parsed.length) throw new Error("The selected bibliography contains no parseable BibTeX entries.");
     if (existingText === finalText) return { fileName: target, text: finalText, records: parsed, changed: false };
-    if (existingText.trim()) {
-      await saveAutomaticBibBackup(target, existingText, window.CollabTeXBibTeX.parseBibTeX(existingText, target).length, "Before project bibliography setup");
-    }
     await replaceEditorRangeAndVerify({
       fileName: target,
       start: 0,
@@ -9077,20 +9334,60 @@
     return { files: [], declarationAdded: "", created: false, texFileName: texState.fileName };
   }
 
-  async function managerReadBibliographyFiles(files) {
+  async function managerReadBibliographyFiles(files, { reader = openAndReadFile } = {}) {
     const parsed = [];
     const failures = [];
+    const fileResults = [];
     for (let index = 0; index < files.length; index += 1) {
       const fileName = files[index];
+      const startedAt = Date.now();
       managerSetStatus(`Reading ${fileName} (${index + 1}/${files.length})…`);
       try {
-        const text = await openAndReadFile(fileName);
-        parsed.push(...window.CollabTeXBibTeX.parseBibTeX(text, fileName));
+        const readValue = await reader(fileName);
+        const readResult = readValue && typeof readValue === "object" && typeof readValue.text === "string"
+          ? readValue
+          : { text: String(readValue ?? "") };
+        const text = String(readResult.text ?? "");
+        const parsedFile = window.CollabTeXBibTeX.parseBibTeX(text, fileName);
+        // A non-empty file containing BibTeX entry markers must not silently
+        // turn into an empty manager. Treat that as a parse failure so the
+        // normal-editor compatibility path can retry it when the manager opens.
+        const entryMarkerCount = (text.match(/@[A-Za-z]+\s*[({]/g) || []).length;
+        if (entryMarkerCount > 0 && parsedFile.length === 0) {
+          const parseError = new Error("The file contains BibTeX entries, but none could be parsed.");
+          parseError.ctcaDiagnostics = {
+            textLength: text.length,
+            entryMarkerCount
+          };
+          throw parseError;
+        }
+        parsed.push(...parsedFile);
+        fileResults.push({
+          fileName,
+          ok: true,
+          resolvedFileName: String(readResult.fileName || fileName),
+          method: String(readResult.method || "unknown"),
+          documentId: String(readResult.documentId || ""),
+          textLength: text.length,
+          entryMarkerCount,
+          parsedCount: parsedFile.length,
+          durationMs: Date.now() - startedAt,
+          readerDiagnostics: readResult.diagnostics || null
+        });
       } catch (error) {
-        failures.push(`${fileName}: ${error.message}`);
+        failures.push(`${fileName}: ${error?.message || String(error)}`);
+        fileResults.push({
+          fileName,
+          ok: false,
+          durationMs: Date.now() - startedAt,
+          message: error?.message || String(error),
+          name: error?.name || "Error",
+          stack: error?.stack || "",
+          readerDiagnostics: error?.ctcaDiagnostics || null
+        });
       }
     }
-    return { parsed, failures };
+    return { parsed, failures, fileResults };
   }
 
   function resetManagerDrafts(preserveSelectionKey = "") {
@@ -9121,22 +9418,35 @@
     saveDirty = true,
     preserveSelectionKey = "",
     scheduleSync = false,
-    filesOverride = null
+    filesOverride = null,
+    requireReadable = false,
+    reader = openAndReadFile
   } = {}) {
+    const finishToolbarActivity = beginToolbarBackgroundActivity("Parsing bibliography…");
+    try {
     if (saveDirty && (managerDirtyIds.size || managerDeletedDrafts.size)) {
       await managerWriteDirtyEntries({ scheduleSync });
     }
     const originalFile = captureSelectedTexFile(managerOriginalFile) || managerOriginalFile || getSelectedFileName();
+    let nextFiles = [];
     if (Array.isArray(filesOverride) && filesOverride.length) {
-      managerFiles = [...new Set(filesOverride.map(normalizeBibFileName).filter(Boolean))];
+      nextFiles = uniqueBibliographyFileCandidates(filesOverride);
     } else {
       const texState = await getManagerTexState();
       const setup = await ensureBibliographyConfigured(texState);
-      managerFiles = setup.files;
+      nextFiles = uniqueBibliographyFileCandidates(setup.files);
     }
-    updateManagerBibButton(false);
-    const { parsed, failures } = await managerReadBibliographyFiles(managerFiles);
 
+    const { parsed, failures, fileResults } = await managerReadBibliographyFiles(nextFiles, { reader });
+    if (requireReadable && nextFiles.length && failures.length === nextFiles.length) {
+      if (originalFile) await restoreFile(originalFile, { waitForStable: false }).catch(() => null);
+      const error = new Error(`Could not read any configured BibTeX file. ${failures.join("; ")}`);
+      error.ctcaDiagnostics = { configuredFiles: [...nextFiles], fileResults };
+      throw error;
+    }
+
+    managerFiles = nextFiles;
+    updateManagerBibButton(false);
     const unique = new Map();
     for (const record of parsed) unique.set(managerRecordId(record), record);
     managerRecords = [...unique.values()];
@@ -9146,12 +9456,21 @@
     resetManagerDrafts(preserveSelectionKey);
     await Promise.all([
       saveCachedState(managerFiles),
-      originalFile ? restoreFile(originalFile) : Promise.resolve()
+      originalFile ? restoreFile(originalFile, { waitForStable: false }) : Promise.resolve()
     ]);
     managerSetStatus(
       `Loaded ${managerRecords.length} entries from ${managerFiles.length} BibTeX file${managerFiles.length === 1 ? "" : "s"}.${failures.length ? ` ${failures.join("; ")}` : ""}`,
       failures.length > 0 && managerRecords.length === 0
     );
+    return {
+      files: managerFiles.slice(),
+      parsedCount: managerRecords.length,
+      failures: failures.slice(),
+      fileResults: fileResults.slice()
+    };
+    } finally {
+      finishToolbarActivity();
+    }
   }
 
   function normalizeBibSourceName(value) {
@@ -9173,26 +9492,6 @@
     return new Set((items || []).map((record) => String(record?.key || "")).filter(Boolean));
   }
 
-  async function saveAutomaticBibBackup(fileName, text, entryCount, reason) {
-    try {
-      const backupKey = `${storageKey()}:bib-backup:${encodeURIComponent(fileName)}`;
-      await extensionApi.storage.local.set({
-        [backupKey]: {
-          version: 1,
-          fileName,
-          text,
-          entryCount,
-          reason,
-          createdAt: new Date().toISOString()
-        }
-      });
-      return true;
-    } catch (error) {
-      console.warn("[Smart Citations] Could not create BibTeX safety backup:", error);
-      return false;
-    }
-  }
-
   function validateManagerCandidate({
     fileName,
     originalRecords,
@@ -9212,269 +9511,446 @@
     const candidateKeys = bibRecordKeySet(candidateRecords);
     const missing = [...expectedKeys].filter((key) => !candidateKeys.has(key));
     if (missing.length) {
+      console.warn(
+        `[Smart Citations] The proposed write to ${fileName} does not contain ${missing.length} expected BibTeX ` +
+        `entr${missing.length === 1 ? "y" : "ies"} (${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ", …" : ""}).`
+      );
+    }
+    return { missing };
+  }
+
+  function authoritativeManagerDraftsForFile(fileName) {
+    const deletedIds = new Set(managerDeletedDrafts.keys());
+    return [...managerDrafts.values()].filter((draft) =>
+      draft?.centralPreview !== true &&
+      !deletedIds.has(draft.id) &&
+      bibSourceMatches(activeBibliographyFileName(draft.sourceFile), fileName)
+    );
+  }
+
+  function fullManagerBibliographyText(fileName, drafts = authoritativeManagerDraftsForFile(fileName)) {
+    const serialized = drafts.map(serializeManagerDraft).filter(Boolean);
+    return serialized.length ? `${serialized.join("\n\n")}\n` : "";
+  }
+
+  function validateCandidateAgainstManagerState(fileName, candidateText, drafts) {
+    const expectedKeys = drafts.map((draft) => String(draft.key || "")).filter(Boolean);
+    const expectedLower = new Set(expectedKeys.map((key) => key.toLowerCase()));
+    const candidateRecords = window.CollabTeXBibTeX.parseBibTeX(String(candidateText || ""), fileName);
+    const candidateLower = new Set(candidateRecords.map((record) => String(record?.key || "").toLowerCase()).filter(Boolean));
+    const missing = expectedKeys.filter((key) => !candidateLower.has(key.toLowerCase()));
+    const unexpected = candidateRecords
+      .map((record) => String(record?.key || ""))
+      .filter((key) => key && !expectedLower.has(key.toLowerCase()));
+    const duplicateKeys = [];
+    const seen = new Set();
+    for (const record of candidateRecords) {
+      const key = String(record?.key || "").toLowerCase();
+      if (!key) continue;
+      if (seen.has(key)) duplicateKeys.push(record.key);
+      seen.add(key);
+    }
+    return { candidateRecords, missing, unexpected, duplicateKeys };
+  }
+
+  function assertPreparedCentralSelectionsPresent() {
+    const session = managerGlobalSyncSession;
+    if (!session) return;
+    const missing = [];
+    for (const [identity, action] of session.actions || []) {
+      if (action !== "pull" && action !== "central") continue;
+      const diff = session.diffsByIdentity?.get(identity);
+      if (!diff?.global) continue;
+      let local = [...managerDrafts.values()].find((draft) =>
+        draft?.centralPreview !== true && globalSyncIdentity(globalItemFromDraft(draft)) === identity
+      );
+      if (!local) {
+        applyCentralItemToManagerDraft(diff.global);
+        local = [...managerDrafts.values()].find((draft) =>
+          draft?.centralPreview !== true && globalSyncIdentity(globalItemFromDraft(draft)) === identity
+        );
+      }
+      if (!local) missing.push(String(diff.global?.key || identity));
+    }
+    if (missing.length) {
       throw new Error(
-        `Safety stop: the proposed write to ${fileName} would lose ${missing.length} BibTeX ` +
-        `entr${missing.length === 1 ? "y" : "ies"} (${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ", …" : ""}). No changes were written.`
+        `Could not prepare ${missing.length} selected central entr${missing.length === 1 ? "y" : "ies"} for the local bibliography: ` +
+        `${missing.slice(0, 8).join(", ")}${missing.length > 8 ? ", …" : ""}`
       );
     }
   }
 
-  async function managerWriteDirtyEntries({ scheduleSync = false, fastRestore = false } = {}) {
-    if (!managerDirtyIds.size && !managerDeletedDrafts.size) return;
-    removeManagerCentralPreviewEntries();
-    managerSessionChanged = true;
-
-    const seenKeys = new Set();
-    for (const draft of managerDrafts.values()) {
-      if (!draft.key || !/^[^\s,{}]+$/.test(draft.key)) {
-        throw new Error(`Invalid citation key: ${draft.key || "(empty)"}`);
-      }
-      const identity = `${draft.sourceFile || managerFiles[0] || ""}\u0000${draft.key.toLowerCase()}`;
-      if (seenKeys.has(identity)) {
-        throw new Error(`Duplicate citation key in ${draft.sourceFile || managerFiles[0]}: ${draft.key}`);
-      }
-      seenKeys.add(identity);
+  function planManagerFileWrite(fileName, text, group) {
+    const sourceText = String(text ?? "");
+    const currentRecords = window.CollabTeXBibTeX.parseBibTeX(sourceText, fileName);
+    const pendingNewKeys = new Set(group.edits.filter((draft) => !draft.originalKey).map((draft) => draft.key));
+    const baselineRecords = managerRecords.filter(
+      (record) => bibSourceMatches(record.sourceFile, fileName) && !pendingNewKeys.has(record.key)
+    );
+    const currentKeys = bibRecordKeySet(currentRecords);
+    const missingBaseline = baselineRecords
+      .map((record) => record.key)
+      .filter((key) => key && !currentKeys.has(key));
+    const emergencyReasons = [];
+    if (missingBaseline.length) {
+      emergencyReasons.push(
+        `${missingBaseline.length} manager-loaded entr${missingBaseline.length === 1 ? "y is" : "ies are"} absent from the current file`
+      );
     }
 
-    const originalFile = captureSelectedTexFile(managerOriginalFile) || getSelectedFileName() || managerOriginalFile;
-    const groups = new Map();
-    const ensureGroup = (fileName) => {
-      if (!groups.has(fileName)) groups.set(fileName, { edits: [], deletions: [] });
-      return groups.get(fileName);
-    };
+    const replacements = [];
+    const additions = [];
+    const alreadyAbsentDeletions = [];
 
-    for (const id of managerDirtyIds) {
-      const draft = managerDrafts.get(id);
-      if (!draft) continue;
-      const fileName = draft.sourceFile || managerFiles[0];
-      if (!fileName) throw new Error(`No target BibTeX file is available for ${draft.key}.`);
-      draft.sourceFile = fileName;
-      ensureGroup(fileName).edits.push(draft);
+    for (const draft of group.deletions) {
+      const lookupKey = draft.originalKey || draft.key;
+      if (!lookupKey) continue;
+      const range = findBibEntryRange(sourceText, lookupKey);
+      if (!range) {
+        emergencyReasons.push(`the removal target ${lookupKey} could not be located`);
+        alreadyAbsentDeletions.push({ draft, lookupKey });
+        continue;
+      }
+      replacements.push({
+        start: range.start,
+        end: range.end,
+        text: "",
+        draft,
+        lookupKey,
+        deletion: true
+      });
     }
 
-    for (const draft of managerDeletedDrafts.values()) {
-      const fileName = draft.sourceFile || managerFiles[0];
-      if (!fileName) throw new Error(`No target BibTeX file is available for ${draft.key}.`);
-      draft.sourceFile = fileName;
-      ensureGroup(fileName).deletions.push(draft);
-    }
-
-    for (const [fileName, group] of groups) {
-      const actionParts = [];
-      if (group.edits.length) actionParts.push(`${group.edits.length} edited`);
-      if (group.deletions.length) actionParts.push(`${group.deletions.length} removed`);
-      managerSetStatus(`Safety-checking ${actionParts.join(" and ")} entries in ${fileName}…`);
-
-      const state = await openFileAndWait(fileName);
-      const stateFileName = String(state.fileName || "");
-      if (!bibSourceMatches(stateFileName, fileName)) {
-        throw new Error(
-          `Safety stop: ColLabTeX still exposed ${stateFileName || "another document"} while ${fileName} was selected. No changes were written.`
-        );
-      }
-
-      const text = String(state.value ?? "");
-      const currentRecords = window.CollabTeXBibTeX.parseBibTeX(text, fileName);
-      const pendingNewKeys = new Set(group.edits.filter((draft) => !draft.originalKey).map((draft) => draft.key));
-      const baselineRecords = managerRecords.filter((record) => bibSourceMatches(record.sourceFile, fileName) && !pendingNewKeys.has(record.key));
-      const currentKeys = bibRecordKeySet(currentRecords);
-      const missingBaseline = baselineRecords
-        .map((record) => record.key)
-        .filter((key) => key && !currentKeys.has(key));
-
-      // This is the critical guard against a still-loading or stale ACE session.
-      // A write is refused when the live file does not contain every entry that
-      // was present when the bibliography manager loaded it.
-      if (missingBaseline.length) {
-        throw new Error(
-          `Safety stop: ${fileName} currently exposes only ${currentRecords.length} of at least ${baselineRecords.length} expected entries. ` +
-          `${missingBaseline.length} expected key${missingBaseline.length === 1 ? " is" : "s are"} missing ` +
-          `(${missingBaseline.slice(0, 5).join(", ")}${missingBaseline.length > 5 ? ", …" : ""}). ` +
-          `The file may still be loading; no changes were written.`
-        );
-      }
-
-      const replacements = [];
-      const additions = [];
-
-      for (const draft of group.deletions) {
-        const lookupKey = draft.originalKey || draft.key;
-        if (!lookupKey) continue;
-        const range = findBibEntryRange(text, lookupKey);
+    for (const draft of group.edits) {
+      const serialized = serializeManagerDraft(draft);
+      if (draft.originalKey) {
+        const range = findBibEntryRange(sourceText, draft.originalKey);
         if (!range) {
-          throw new Error(`Safety stop: could not locate ${lookupKey} in ${fileName} for removal. No changes were written to this file.`);
+          emergencyReasons.push(`the existing entry ${draft.originalKey} could not be located`);
+          additions.push({ text: serialized, draft, recoveredMissingEntry: true });
+          continue;
         }
         replacements.push({
           start: range.start,
           end: range.end,
-          text: "",
+          text: serialized,
           draft,
-          lookupKey,
-          deletion: true
+          lookupKey: draft.originalKey,
+          deletion: false
         });
+      } else {
+        additions.push({ text: serialized, draft, recoveredMissingEntry: false });
       }
-
-      for (const draft of group.edits) {
-        const serialized = serializeManagerDraft(draft);
-        if (draft.originalKey) {
-          const range = findBibEntryRange(text, draft.originalKey);
-          if (!range) {
-            throw new Error(
-              `Safety stop: could not locate the existing entry ${draft.originalKey} in ${fileName}. ` +
-              `It will not be mistaken for a new entry, and no changes were written to this file.`
-            );
-          }
-          replacements.push({
-            start: range.start,
-            end: range.end,
-            text: serialized,
-            draft,
-            lookupKey: draft.originalKey,
-            deletion: false
-          });
-        } else {
-          additions.push({ text: serialized, draft });
-        }
-      }
-
-      replacements.sort((left, right) => right.start - left.start);
-      let candidateText = text;
-      for (const replacement of replacements) {
-        candidateText =
-          candidateText.slice(0, replacement.start) +
-          replacement.text +
-          candidateText.slice(replacement.end);
-      }
-      if (additions.length) {
-        const additionText = additions.map((addition) => addition.text).join("\n\n");
-        candidateText = `${candidateText.trimEnd()}${candidateText.trim() ? "\n\n" : ""}${additionText}\n`;
-      }
-
-      const candidateRecords = window.CollabTeXBibTeX.parseBibTeX(candidateText, fileName);
-      validateManagerCandidate({
-        fileName,
-        originalRecords: currentRecords,
-        candidateRecords,
-        replacements,
-        additions
-      });
-
-      // Ensure no collaborator or delayed ColLabTeX session swap changed the
-      // document between planning and writing.
-      const latest = (await bridgeRequest("getState", {}, 3000)).state;
-      if (!bibSourceMatches(latest?.fileName, fileName) || String(latest?.value ?? "") !== text) {
-        throw new Error(
-          `Safety stop: ${fileName} changed while the update was being prepared. Reload the bibliography and try again; no changes were written.`
-        );
-      }
-
-      const backupCreated = await saveAutomaticBibBackup(
-        fileName,
-        text,
-        currentRecords.length,
-        `Before writing ${actionParts.join(" and ")} bibliography entries`
-      );
-      managerSetStatus(
-        `Writing ${actionParts.join(" and ")} entries to ${fileName}${backupCreated ? " (safety backup created)" : ""}…`
-      );
-
-      // Apply only the planned entry ranges, from the end of the document to
-      // the beginning. Untouched bibliography text is never replaced wholesale.
-      let workingText = text;
-      for (const replacement of replacements) {
-        if (replacement.deletion) {
-          managerSetStatus(`Removing attachments for ${replacement.lookupKey}…`);
-          await globalThis.CollabTeXAttachmentStore.removeForEntries([replacement.draft]);
-        }
-        const response = await bridgeRequest(
-          "replaceRange",
-          { start: replacement.start, end: replacement.end, text: replacement.text },
-          10000
-        );
-        workingText =
-          workingText.slice(0, replacement.start) +
-          replacement.text +
-          workingText.slice(replacement.end);
-        if (String(response?.state?.value ?? workingText) !== workingText) {
-          throw new Error(
-            `Writing ${replacement.lookupKey} to ${fileName} did not produce the expected ACE document state. ` +
-            `Further writes were stopped; untouched entries were not replaced.`
-          );
-        }
-        // The editor bridge emits the resulting collaboration state on the
-        // next animation frame. Record our acknowledged value now so that
-        // event is not mistaken for a new collaborator edit.
-        observedBibTextByFile.set(fileName, workingText);
-        if (replacement.deletion) {
-          delete managerCategoryState.memberships[replacement.draft.id];
-          managerSelectedIds.delete(replacement.draft.id);
-          managerDeletedDrafts.delete(replacement.draft.id);
-        } else {
-          const newId = `${replacement.draft.sourceFile || fileName}␟${replacement.draft.key}`;
-          managerMigrateCategoryMembership(replacement.draft.id, newId);
-          replacement.draft.originalKey = replacement.draft.key;
-          managerDirtyIds.delete(replacement.draft.id);
-        }
-      }
-
-      if (additions.length) {
-        const additionText = additions.map((addition) => addition.text).join("\n\n");
-        const separator = !workingText.trim()
-          ? ""
-          : workingText.endsWith("\n\n")
-            ? ""
-            : workingText.endsWith("\n")
-              ? "\n"
-              : "\n\n";
-        const appendText = `${separator}${additionText}\n`;
-        const appendStart = workingText.length;
-
-        const response = await bridgeRequest(
-          "replaceRange",
-          { start: appendStart, end: appendStart, text: appendText },
-          10000
-        );
-        workingText += appendText;
-        if (String(response?.state?.value ?? workingText) !== workingText) {
-          throw new Error(`Could not append new entries to ${fileName}; further writes were stopped.`);
-        }
-        observedBibTextByFile.set(fileName, workingText);
-        for (const addition of additions) {
-          const newId = `${addition.draft.sourceFile || fileName}␟${addition.draft.key}`;
-          managerMigrateCategoryMembership(addition.draft.id, newId);
-          addition.draft.originalKey = addition.draft.key;
-          managerDirtyIds.delete(addition.draft.id);
-        }
-      }
-
-      const finalState = (await bridgeRequest("getState", {}, 3000)).state;
-      const finalText = String(finalState?.value ?? "");
-      const finalRecords = window.CollabTeXBibTeX.parseBibTeX(finalText, fileName);
-      validateManagerCandidate({
-        fileName,
-        originalRecords: currentRecords,
-        candidateRecords: finalRecords,
-        replacements,
-        additions
-      });
     }
 
-    legacyCachedManagerState = null;
-    legacyCachedDoiSyncLedger = null;
-    // Keep the verified in-memory state and persistent cache aligned with the
-    // completed writes. Central sync can then reuse this populated list without
-    // reopening and reparsing every BibTeX file.
-    const selectedKey = managerDrafts.get(managerSelectedId)?.key || "";
-    managerRecords = [...managerDrafts.values()].map(managerDraftToRecord);
-    records = managerRecords.slice();
-    cachedFiles = managerFiles.slice();
-    resetManagerDrafts(selectedKey);
-    await Promise.all([
-      saveCachedState(managerFiles),
-      originalFile ? restoreFile(originalFile, { waitForStable: !fastRestore }) : Promise.resolve()
-    ]);
-    if (scheduleSync && settings.syncGlobalDatabase && !globalDatabaseSyncInProgress) {
-      scheduleGlobalDatabaseSync(120, "project bibliography changed", true);
+    replacements.sort((left, right) => right.start - left.start);
+    let candidateText = sourceText;
+    for (const replacement of replacements) {
+      candidateText =
+        candidateText.slice(0, replacement.start) +
+        replacement.text +
+        candidateText.slice(replacement.end);
+    }
+    if (additions.length) {
+      const additionText = additions.map((addition) => addition.text).join("\n\n");
+      candidateText = `${candidateText.trimEnd()}${candidateText.trim() ? "\n\n" : ""}${additionText}\n`;
+    }
+
+    const authoritativeDrafts = authoritativeManagerDraftsForFile(fileName);
+    let authoritativeValidation = validateCandidateAgainstManagerState(fileName, candidateText, authoritativeDrafts);
+
+    // Incremental replacement preserves formatting, but malformed legacy fields
+    // can make a range scan consume later entries. If the calculated text does
+    // not contain every entry shown in the manager, rebuild the complete file
+    // from the authoritative in-memory list rather than writing a partial file.
+    if (authoritativeValidation.missing.length || authoritativeValidation.duplicateKeys.length) {
+      candidateText = fullManagerBibliographyText(fileName, authoritativeDrafts);
+      authoritativeValidation = validateCandidateAgainstManagerState(fileName, candidateText, authoritativeDrafts);
+    }
+
+    let syntaxValidation = globalThis.CollabTeXBibTeX?.validateBibTeXFormatting?.(candidateText);
+    if (syntaxValidation && !syntaxValidation.valid) {
+      // A pre-existing malformed field may survive an incremental edit. Rewrite
+      // the complete bibliography through the canonical serializer so every
+      // field becomes one balanced BibTeX value.
+      candidateText = fullManagerBibliographyText(fileName, authoritativeDrafts);
+      authoritativeValidation = validateCandidateAgainstManagerState(fileName, candidateText, authoritativeDrafts);
+      syntaxValidation = globalThis.CollabTeXBibTeX?.validateBibTeXFormatting?.(candidateText);
+    }
+    if (syntaxValidation && !syntaxValidation.valid) {
+      throw new Error(
+        `Refusing to write malformed BibTeX to ${fileName}: ${syntaxValidation.errors.slice(0, 5).join(" ")}`
+      );
+    }
+
+    const candidateRecords = authoritativeValidation.candidateRecords;
+    const validation = validateManagerCandidate({
+      fileName,
+      originalRecords: currentRecords,
+      candidateRecords,
+      replacements,
+      additions
+    });
+    if (validation.missing.length) {
+      emergencyReasons.push(
+        `the calculated result omits ${validation.missing.length} previously parsed entr${validation.missing.length === 1 ? "y" : "ies"}`
+      );
+    }
+    if (authoritativeValidation.missing.length || authoritativeValidation.duplicateKeys.length) {
+      const details = [];
+      if (authoritativeValidation.missing.length) details.push(`${authoritativeValidation.missing.length} manager entries are missing`);
+      if (authoritativeValidation.duplicateKeys.length) details.push(`${authoritativeValidation.duplicateKeys.length} duplicate citation keys remain`);
+      throw new Error(`Refusing to write an incomplete bibliography to ${fileName}: ${details.join("; ")}.`);
+    }
+
+    return {
+      fileName,
+      sourceText,
+      candidateText,
+      currentRecords,
+      candidateRecords,
+      authoritativeEntryCount: authoritativeDrafts.length,
+      candidateEntryCount: candidateRecords.length,
+      replacements,
+      additions,
+      alreadyAbsentDeletions,
+      emergencyReasons: [...new Set(emergencyReasons)]
+    };
+  }
+
+  async function finalizeManagerFileWrite(plan, finalText) {
+    for (const replacement of plan.replacements) {
+      if (replacement.deletion) {
+        await globalThis.CollabTeXAttachmentStore.removeForEntries([replacement.draft]);
+        delete managerCategoryState.memberships[replacement.draft.id];
+        managerSelectedIds.delete(replacement.draft.id);
+        managerDeletedDrafts.delete(replacement.draft.id);
+      } else {
+        const newId = `${replacement.draft.sourceFile || plan.fileName}␟${replacement.draft.key}`;
+        managerMigrateCategoryMembership(replacement.draft.id, newId);
+        replacement.draft.originalKey = replacement.draft.key;
+        managerDirtyIds.delete(replacement.draft.id);
+      }
+    }
+    for (const absent of plan.alreadyAbsentDeletions) {
+      await globalThis.CollabTeXAttachmentStore.removeForEntries([absent.draft]);
+      delete managerCategoryState.memberships[absent.draft.id];
+      managerSelectedIds.delete(absent.draft.id);
+      managerDeletedDrafts.delete(absent.draft.id);
+    }
+    for (const addition of plan.additions) {
+      const newId = `${addition.draft.sourceFile || plan.fileName}␟${addition.draft.key}`;
+      managerMigrateCategoryMembership(addition.draft.id, newId);
+      addition.draft.originalKey = addition.draft.key;
+      managerDirtyIds.delete(addition.draft.id);
+    }
+    observedBibTextByFile.set(plan.fileName, finalText);
+  }
+
+  async function managerWriteDirtyEntries({ scheduleSync = false, fastRestore = false } = {}) {
+    assertPreparedCentralSelectionsPresent();
+    if (!managerDirtyIds.size && !managerDeletedDrafts.size) return { changedFiles: [], unchangedFiles: [] };
+    const finishToolbarActivity = beginToolbarBackgroundActivity("Writing local bibliography…");
+    removeManagerCentralPreviewEntries();
+    managerSessionChanged = true;
+
+    try {
+      const seenKeys = new Set();
+      for (const draft of managerDrafts.values()) {
+        if (!draft.key || !/^[^\s,{}]+$/.test(draft.key)) {
+          throw new Error(`Invalid citation key: ${draft.key || "(empty)"}`);
+        }
+        const identity = `${draft.sourceFile || managerFiles[0] || ""}\u0000${draft.key.toLowerCase()}`;
+        if (seenKeys.has(identity)) {
+          throw new Error(`Duplicate citation key in ${draft.sourceFile || managerFiles[0]}: ${draft.key}`);
+        }
+        seenKeys.add(identity);
+      }
+
+      const groups = new Map();
+      const ensureGroup = (fileName) => {
+        if (!groups.has(fileName)) groups.set(fileName, { edits: [], deletions: [] });
+        return groups.get(fileName);
+      };
+
+      for (const id of managerDirtyIds) {
+        const draft = managerDrafts.get(id);
+        if (!draft) continue;
+        const fileName = activeBibliographyFileName(draft.sourceFile);
+        if (!fileName) throw new Error(`No target BibTeX file is available for ${draft.key}.`);
+        draft.sourceFile = fileName;
+        ensureGroup(fileName).edits.push(draft);
+      }
+      for (const draft of managerDeletedDrafts.values()) {
+        const fileName = activeBibliographyFileName(draft.sourceFile);
+        if (!fileName) throw new Error(`No target BibTeX file is available for ${draft.key}.`);
+        draft.sourceFile = fileName;
+        ensureGroup(fileName).deletions.push(draft);
+      }
+
+      const changedFiles = [];
+      const unchangedFiles = [];
+
+      for (const [fileName, group] of groups) {
+        const actionParts = [];
+        if (group.edits.length) actionParts.push(`${group.edits.length} edited`);
+        if (group.deletions.length) actionParts.push(`${group.deletions.length} removed`);
+        managerSetStatus(`Preparing ${actionParts.join(" and ")} entries in ${fileName}…`);
+
+        let sourceText = "";
+        let initialReadError = null;
+        try {
+          sourceText = await openAndReadFile(fileName);
+        } catch (error) {
+          initialReadError = error;
+          const observedText = observedBibTextByFile.get(fileName);
+          if (typeof observedText !== "string") throw error;
+          sourceText = observedText;
+          managerSetStatus(`Background reading timed out; preparing ${fileName} from the last parsed state…`);
+        }
+        let plan = planManagerFileWrite(fileName, sourceText, group);
+        let writeCompleted = false;
+        let lastError = initialReadError;
+
+        if (plan.emergencyReasons.length) {
+          console.warn(
+            `[Smart Citations] Writing ${fileName} despite validation warnings: ${plan.emergencyReasons.join("; ")}`
+          );
+        }
+
+        const writeDiagnostics = {
+          fileName,
+          initialReadError: initialReadError ? {
+            message: initialReadError?.message || String(initialReadError),
+            stack: initialReadError?.stack || ""
+          } : null,
+          directAttempts: [],
+          sourceLength: plan.sourceText.length,
+          targetLength: plan.candidateText.length,
+          sourceFingerprint: contentFingerprint(plan.sourceText),
+          targetFingerprint: contentFingerprint(plan.candidateText),
+          authoritativeEntryCount: plan.authoritativeEntryCount,
+          candidateEntryCount: plan.candidateEntryCount
+        };
+
+        for (let attempt = 0; !initialReadError && attempt < 2; attempt += 1) {
+          if (plan.candidateText === plan.sourceText) break;
+          managerSetStatus(`Updating ${fileName} in the background…`);
+          try {
+            await writeProjectTextFileInBackground(fileName, plan.sourceText, plan.candidateText, 180000);
+            writeCompleted = true;
+            lastError = null;
+            break;
+          } catch (error) {
+            lastError = error;
+            writeDiagnostics.directAttempts.push({
+              attempt: attempt + 1,
+              message: error?.message || String(error),
+              stack: error?.stack || ""
+            });
+            if (attempt + 1 >= 2) break;
+            let latestText = null;
+            try {
+              latestText = await openAndReadFile(fileName);
+            } catch (readError) {
+              writeDiagnostics.rebaseReadError = {
+                message: readError?.message || String(readError),
+                stack: readError?.stack || ""
+              };
+              break;
+            }
+            if (latestText === plan.candidateText) {
+              writeCompleted = true;
+              lastError = null;
+              break;
+            }
+            if (latestText === plan.sourceText) break;
+            sourceText = latestText;
+            plan = planManagerFileWrite(fileName, sourceText, group);
+            writeDiagnostics.sourceLength = plan.sourceText.length;
+            writeDiagnostics.targetLength = plan.candidateText.length;
+            writeDiagnostics.sourceFingerprint = contentFingerprint(plan.sourceText);
+            writeDiagnostics.targetFingerprint = contentFingerprint(plan.candidateText);
+            if (plan.emergencyReasons.length) {
+              console.warn(
+                `[Smart Citations] Rebased write for ${fileName} has validation warnings: ${plan.emergencyReasons.join("; ")}`
+              );
+            }
+          }
+        }
+
+        if (plan.candidateText !== plan.sourceText && !writeCompleted) {
+          managerSetStatus(`Direct background writing failed; updating ${fileName} in an isolated background editor tab…`);
+          const fallbackResponse = await extensionApi.runtime.sendMessage({
+            type: "ctca-write-bib-via-background-tab",
+            pageUrl: window.location.href,
+            fileName,
+            expectedText: plan.sourceText,
+            text: plan.candidateText,
+            timeoutMs: 300000
+          }).catch((error) => ({ ok: false, error: error?.message || String(error), diagnostics: { runtimeStack: error?.stack || "" } }));
+          writeDiagnostics.fallback = fallbackResponse?.diagnostics || {
+            ok: fallbackResponse?.ok === true,
+            method: fallbackResponse?.method || "isolated-background-editor-tab"
+          };
+          if (fallbackResponse?.ok) {
+            writeCompleted = true;
+            lastError = null;
+          } else {
+            const fallbackError = new Error(
+              fallbackResponse?.error || lastError?.message || `The background update of ${fileName} failed.`
+            );
+            fallbackError.ctcaRemoteDiagnostics = writeDiagnostics;
+            throw fallbackError;
+          }
+        }
+
+        if (writeCompleted) {
+          changedFiles.push(fileName);
+          managerSetStatus(`Updated ${fileName} in the background.`);
+        } else {
+          unchangedFiles.push(fileName);
+          managerSetStatus(`No textual changes were required in ${fileName}.`);
+        }
+
+        await finalizeManagerFileWrite(plan, writeCompleted ? plan.candidateText : plan.sourceText);
+      }
+
+      legacyCachedManagerState = null;
+      legacyCachedDoiSyncLedger = null;
+      const selectedKey = managerDrafts.get(managerSelectedId)?.key || "";
+      managerRecords = [...managerDrafts.values()].map(managerDraftToRecord);
+      records = managerRecords.slice();
+      cachedFiles = managerFiles.slice();
+      resetManagerDrafts(selectedKey);
+      await saveCachedState(managerFiles);
+
+      if (scheduleSync && settings.syncGlobalDatabase && !globalDatabaseSyncInProgress) {
+        scheduleGlobalDatabaseSync(120, "project bibliography changed", true);
+      }
+      if (changedFiles.length) {
+        showBibWriteResultBanner(
+          `Successfully updated ${changedFiles.length === 1 ? changedFiles[0] : `${changedFiles.length} bibliography files`}.`
+        );
+      }
+      return { changedFiles, unchangedFiles };
+    } catch (error) {
+      rollbackProvisionalGlobalSyncAfterWriteFailure();
+      showBibWriteResultBanner(
+        `Could not write the local bibliography: ${error?.message || String(error)}`,
+        true,
+        error,
+        {
+          operation: "write local bibliography",
+          managerFiles: [...managerFiles],
+          dirtyEntryIds: [...managerDirtyIds],
+          deletedEntryKeys: [...managerDeletedDrafts.values()].map((draft) => draft.key)
+        }
+      );
+      try { error.ctcaBibWriteBannerShown = true; } catch (_error) {}
+      throw error;
+    } finally {
+      finishToolbarActivity();
     }
   }
 
@@ -9518,25 +9994,8 @@
 
   function pendingGlobalImportCandidates(globalItems, localItems, snapshotItems, documentFlag) {
     const changedItems = pendingGlobalChangeCandidates(globalItems, localItems, snapshotItems, documentFlag);
-    const localKeys = new Set();
-    const localDoiCounts = new Map();
-    for (const item of localItems || []) {
-      for (const key of globalItemLookupKeys(item)) localKeys.add(key);
-      const doi = normalizeDoiInput(item?.fields?.doi || "").toLowerCase();
-      if (doi) localDoiCounts.set(doi, (localDoiCounts.get(doi) || 0) + 1);
-    }
-    const globalDoiCounts = new Map();
-    for (const item of globalItems || []) {
-      const doi = normalizeDoiInput(item?.fields?.doi || "").toLowerCase();
-      if (doi) globalDoiCounts.set(doi, (globalDoiCounts.get(doi) || 0) + 1);
-    }
-
-    return changedItems
-      .filter((item) => {
-        if ([...globalItemLookupKeys(item)].some((key) => localKeys.has(key))) return false;
-        const doi = normalizeDoiInput(item?.fields?.doi || "").toLowerCase();
-        return !doi || localDoiCounts.get(doi) !== 1 || globalDoiCounts.get(doi) !== 1;
-      });
+    const localIdentities = new Set((localItems || []).map(globalSyncIdentity));
+    return changedItems.filter((item) => !localIdentities.has(globalSyncIdentity(item)));
   }
 
   async function loadPendingGlobalImportCandidates() {
@@ -9546,7 +10005,7 @@
       loadGlobalSyncSnapshot()
     ]);
     const documentFlag = normalizeGlobalDocumentSync(globalState.documentSync).documents[currentDocumentSyncId()];
-    return pendingGlobalChangeCandidates(
+    return pendingGlobalImportCandidates(
       Array.isArray(globalState.entries) ? globalState.entries : [],
       globalItemsFromCurrentDocument(),
       snapshotItems,
@@ -9558,8 +10017,8 @@
     if (!candidates.length) return new Set();
     const selected = new Set(candidates.map(globalSyncIdentity));
     const result = await showAppDialog({
-      title: `Apply ${candidates.length} new or modified central database entr${candidates.length === 1 ? "y" : "ies"}?`,
-      message: "Select the central entries to incorporate into this document's BibTeX file. All entries are selected by default.",
+      title: `Add ${candidates.length} central database entr${candidates.length === 1 ? "y" : "ies"} missing locally?`,
+      message: "Only entries whose DOI—or citation key when no DOI exists—is absent from the document bibliography are shown. All entries are selected by default.",
       controls: (container) => {
         const toolbar = document.createElement("div");
         toolbar.className = "ctca-global-import-toolbar";
@@ -9640,105 +10099,1084 @@
     return result;
   }
 
-  async function managerSaveAndReload() {
-    if (managerBusy) return;
-    const returnTexFile = managerReturnTexFile || captureSelectedTexFile(managerOriginalFile);
-    showDocumentBibliographyUpdateOverlay();
-    await pauseFastManagerCentralSync();
-    const hasPendingBibWrites = Boolean(managerDirtyIds.size || managerDeletedDrafts.size);
-    setManagerBusy(true, hasPendingBibWrites ? "Saving…" : "Reading…");
-    const selectedKey = managerDrafts.get(managerSelectedId)?.key || "";
-    const localDeletedGlobalIdentities = managerChosenCentralDeletionIdentities();
-    const applyPendingGlobalChanges = Boolean(settings.syncGlobalDatabase);
-    let reloadSucceeded = false;
-    try {
-      if (hasPendingBibWrites) {
-        // The write path already validates the final editor contents and
-        // rebuilds the in-memory records/cache, so rereading every .bib file
-        // here would only repeat the slow file-navigation cycle.
-        await managerWriteDirtyEntries({ scheduleSync: false, fastRestore: true });
+  async function choosePendingLocalPushes(candidates) {
+    if (!candidates.length) return new Set();
+    const selected = new Set(candidates.map(globalSyncIdentity));
+    const result = await showAppDialog({
+      title: `Add ${candidates.length} document entr${candidates.length === 1 ? "y" : "ies"} missing centrally?`,
+      message: "Only entries whose DOI—or citation key when no DOI exists—is absent from the central database are shown. All entries are selected by default.",
+      controls: (container) => {
+        const toolbar = document.createElement("div");
+        toolbar.className = "ctca-global-import-toolbar";
+        const selectAll = document.createElement("button");
+        selectAll.type = "button";
+        selectAll.textContent = "Select all";
+        const clearAll = document.createElement("button");
+        clearAll.type = "button";
+        clearAll.textContent = "Clear all";
+        const count = document.createElement("span");
+        count.className = "ctca-global-import-count";
+
+        const list = document.createElement("div");
+        list.className = "ctca-global-import-list";
+        const checkboxes = [];
+        const updateCount = () => {
+          count.textContent = `${selected.size} of ${candidates.length} selected`;
+        };
+
+        for (const item of candidates) {
+          const identity = globalSyncIdentity(item);
+          const fields = item?.fields || {};
+          const label = document.createElement("label");
+          label.className = "ctca-global-import-entry";
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.checked = true;
+          checkbox.value = identity;
+          checkbox.addEventListener("change", () => {
+            if (checkbox.checked) selected.add(identity);
+            else selected.delete(identity);
+            updateCount();
+          });
+          const details = document.createElement("span");
+          details.className = "ctca-global-import-entry-details";
+          const heading = document.createElement("span");
+          heading.className = "ctca-global-import-entry-title";
+          heading.innerHTML = managerLatexHtml(stripOneBibDelimiter(fields.title || item?.key || "Untitled reference"));
+          const meta = document.createElement("span");
+          meta.className = "ctca-global-import-entry-meta";
+          const authors = window.CollabTeXBibTeX
+            .splitAuthors(stripOneBibDelimiter(fields.author || fields.editor || ""))
+            .join("; ");
+          const year = stripOneBibDelimiter(fields.year || fields.date || "");
+          meta.textContent = [item?.key || "Reference", authors, year].filter(Boolean).join(" · ");
+          details.append(heading, meta);
+          label.append(checkbox, details);
+          list.appendChild(label);
+          checkboxes.push(checkbox);
+        }
+
+        selectAll.addEventListener("click", () => {
+          for (const checkbox of checkboxes) checkbox.checked = true;
+          selected.clear();
+          for (const item of candidates) selected.add(globalSyncIdentity(item));
+          updateCount();
+        });
+        clearAll.addEventListener("click", () => {
+          for (const checkbox of checkboxes) checkbox.checked = false;
+          selected.clear();
+          updateCount();
+        });
+        updateCount();
+        toolbar.append(selectAll, clearAll, count);
+        container.append(toolbar, list);
+      },
+      buttons: [
+        { label: "Cancel synchronization", value: null },
+        {
+          label: "Send selected",
+          primary: true,
+          getValue: () => new Set(selected)
+        }
+      ],
+      closeValue: null,
+      dialogClass: "ctca-global-import-dialog-card"
+    });
+    return result;
+  }
+
+
+  function managerGlobalDiffDisplayItem(diff) {
+    return diff?.local || diff?.global || diff?.base || {};
+  }
+
+  function managerGlobalDiffMeta(diff) {
+    const item = managerGlobalDiffDisplayItem(diff);
+    const fields = item?.fields || {};
+    const authors = window.CollabTeXBibTeX
+      .splitAuthors(stripOneBibDelimiter(fields.author || fields.editor || ""))
+      .join("; ");
+    const year = stripOneBibDelimiter(fields.year || fields.date || "");
+    return [item?.key || "Reference", authors, year].filter(Boolean).join(" · ");
+  }
+
+  async function chooseManagerCentralChanges(diffs) {
+    if (!diffs.length) return new Set();
+    const selected = new Set(diffs.map((diff) => diff.identity));
+    const result = await showAppDialog({
+      title: `Apply ${diffs.length} central database change${diffs.length === 1 ? "" : "s"} locally?`,
+      message: "This list contains entries that are new in the central database or were modified only there. Selected entries overwrite or add the central version locally; unselected entries keep the current local state.",
+      controls: (container) => {
+        const toolbar = document.createElement("div");
+        toolbar.className = "ctca-global-import-toolbar";
+        const selectAll = document.createElement("button");
+        selectAll.type = "button";
+        selectAll.textContent = "Select all";
+        const clearAll = document.createElement("button");
+        clearAll.type = "button";
+        clearAll.textContent = "Clear all";
+        const count = document.createElement("span");
+        count.className = "ctca-global-import-count";
+        const list = document.createElement("div");
+        list.className = "ctca-global-import-list";
+        const checkboxes = [];
+        const updateCount = () => {
+          count.textContent = `${selected.size} of ${diffs.length} selected`;
+        };
+
+        for (const diff of diffs) {
+          const item = diff.global || diff.base || {};
+          const fields = item.fields || {};
+          const label = document.createElement("label");
+          label.className = "ctca-global-import-entry";
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.checked = true;
+          checkbox.value = diff.identity;
+          checkbox.addEventListener("change", () => {
+            if (checkbox.checked) selected.add(diff.identity);
+            else selected.delete(diff.identity);
+            updateCount();
+          });
+          const details = document.createElement("span");
+          details.className = "ctca-global-import-entry-details";
+          const heading = document.createElement("span");
+          heading.className = "ctca-global-import-entry-title";
+          heading.innerHTML = managerLatexHtml(stripOneBibDelimiter(fields.title || item.key || "Untitled reference"));
+          const meta = document.createElement("span");
+          meta.className = "ctca-global-import-entry-meta";
+          const kind = diff.globalChangeKind === "new" ? "new centrally" : "modified centrally";
+          meta.textContent = `${kind} · ${managerGlobalDiffMeta(diff)}`;
+          details.append(heading, meta);
+          label.append(checkbox, details);
+          list.appendChild(label);
+          checkboxes.push(checkbox);
+        }
+
+        selectAll.addEventListener("click", () => {
+          selected.clear();
+          for (const diff of diffs) selected.add(diff.identity);
+          for (const checkbox of checkboxes) checkbox.checked = true;
+          updateCount();
+        });
+        clearAll.addEventListener("click", () => {
+          selected.clear();
+          for (const checkbox of checkboxes) checkbox.checked = false;
+          updateCount();
+        });
+        updateCount();
+        toolbar.append(selectAll, clearAll, count);
+        container.append(toolbar, list);
+      },
+      buttons: [
+        { label: "Cancel synchronization", value: null },
+        { label: "Apply selected", primary: true, getValue: () => new Set(selected) }
+      ],
+      closeValue: null,
+      dialogClass: "ctca-global-import-dialog-card"
+    });
+    return result;
+  }
+
+  async function chooseManagerLocalOrConflictActions(diffs, { conflict = false } = {}) {
+    if (!diffs.length) return new Map();
+    const choices = new Map();
+    for (const diff of diffs) choices.set(diff.identity, conflict ? "keep-local" : "push");
+
+    const result = await showAppDialog({
+      title: conflict
+        ? `Resolve ${diffs.length} true synchronization conflict${diffs.length === 1 ? "" : "s"}`
+        : `Resolve ${diffs.length} local bibliography change${diffs.length === 1 ? "" : "s"}`,
+      message: conflict
+        ? "Both the local and central versions changed since the last successful synchronization. Choose the outcome separately for each entry."
+        : "These entries are new locally or were modified only locally. Choose whether to keep the local version only, replace it with the central version, or keep it and update the central database.",
+      controls: (container) => {
+        const toolbar = document.createElement("div");
+        toolbar.className = "ctca-global-import-toolbar";
+        const keepAll = document.createElement("button");
+        keepAll.type = "button";
+        keepAll.textContent = "Keep local for all";
+        const centralAll = document.createElement("button");
+        centralAll.type = "button";
+        centralAll.textContent = "Use central for all";
+        const pushAll = document.createElement("button");
+        pushAll.type = "button";
+        pushAll.textContent = "Update central for all";
+        const list = document.createElement("div");
+        list.className = "ctca-global-import-list ctca-global-three-way-list";
+        const radiosByIdentity = new Map();
+
+        const setAll = (action) => {
+          for (const diff of diffs) {
+            if (action === "central" && !diff.global) continue;
+            choices.set(diff.identity, action);
+            const radios = radiosByIdentity.get(diff.identity) || [];
+            for (const radio of radios) radio.checked = radio.value === action;
+          }
+        };
+
+        keepAll.addEventListener("click", () => setAll("keep-local"));
+        centralAll.addEventListener("click", () => setAll("central"));
+        pushAll.addEventListener("click", () => setAll("push"));
+        toolbar.append(keepAll, centralAll, pushAll);
+
+        for (const diff of diffs) {
+          const item = managerGlobalDiffDisplayItem(diff);
+          const fields = item.fields || {};
+          const card = document.createElement("fieldset");
+          card.className = "ctca-global-three-way-entry";
+          const legend = document.createElement("legend");
+          legend.innerHTML = managerLatexHtml(stripOneBibDelimiter(fields.title || item.key || "Untitled reference"));
+          const meta = document.createElement("div");
+          meta.className = "ctca-global-import-entry-meta";
+          const kind = conflict ? "modified locally and centrally" : (diff.localChangeKind === "new" ? "new locally" : "modified locally");
+          meta.textContent = `${kind} · ${managerGlobalDiffMeta(diff)}`;
+          card.append(legend, meta);
+
+          const radioName = `ctca-global-choice-${Math.random().toString(36).slice(2)}`;
+          const options = [
+            ["keep-local", "Keep local", "Leave the central database unchanged."],
+            ["central", "Overwrite local with central", diff.global ? "Use the current central version locally." : "No central version exists for this new local entry."],
+            ["push", "Keep local + update central", "Keep the local version and write it to the central database."]
+          ];
+          const radios = [];
+          for (const [value, labelText, helpText] of options) {
+            const label = document.createElement("label");
+            label.className = "ctca-global-three-way-option";
+            const radio = document.createElement("input");
+            radio.type = "radio";
+            radio.name = radioName;
+            radio.value = value;
+            radio.disabled = value === "central" && !diff.global;
+            radio.checked = choices.get(diff.identity) === value;
+            radio.addEventListener("change", () => {
+              if (radio.checked) choices.set(diff.identity, value);
+            });
+            const text = document.createElement("span");
+            const strong = document.createElement("strong");
+            strong.textContent = labelText;
+            const small = document.createElement("small");
+            small.textContent = helpText;
+            text.append(strong, small);
+            label.append(radio, text);
+            card.appendChild(label);
+            radios.push(radio);
+          }
+          radiosByIdentity.set(diff.identity, radios);
+          list.appendChild(card);
+        }
+        container.append(toolbar, list);
+      },
+      buttons: [
+        { label: "Cancel synchronization", value: null },
+        { label: "Apply choices", primary: true, getValue: () => new Map(choices) }
+      ],
+      closeValue: null,
+      dialogClass: "ctca-global-import-dialog-card"
+    });
+    return result;
+  }
+
+
+  function managerGlobalSyncDecisionKey() {
+    return `${storageKey()}${GLOBAL_SYNC_DECISIONS_SUFFIX}`;
+  }
+
+  async function loadManagerGlobalSyncDecisionLedger() {
+    const key = managerGlobalSyncDecisionKey();
+    const data = await extensionApi.storage.local.get(key);
+    const value = data?.[key];
+    return value && typeof value === "object" && value.decisions && typeof value.decisions === "object"
+      ? { version: 1, decisions: { ...value.decisions } }
+      : { version: 1, decisions: {} };
+  }
+
+  async function saveManagerGlobalSyncDecisionLedger(ledger) {
+    await extensionApi.storage.local.set({
+      [managerGlobalSyncDecisionKey()]: {
+        version: 1,
+        decisions: { ...(ledger?.decisions || {}) },
+        updatedAt: new Date().toISOString()
+      }
+    });
+  }
+
+  function managerGlobalDiffSignature(localItem, globalItem, baseItem) {
+    return JSON.stringify([
+      globalItemFingerprint(localItem),
+      globalItemFingerprint(globalItem),
+      globalItemFingerprint(baseItem)
+    ]);
+  }
+
+  function classifyManagerGlobalDiffs(localItems, globalItems, snapshotItems) {
+    // Compare both current sides against the last successfully synchronized
+    // version. A conflict exists only when both sides changed independently.
+    // Entries that exist on only one side and were not in the snapshot are new
+    // on that side.
+    const localByIdentity = new Map((localItems || []).map((item) => [globalSyncIdentity(item), item]));
+    const globalByIdentity = new Map((globalItems || []).map((item) => [globalSyncIdentity(item), item]));
+    const identities = new Set([...localByIdentity.keys(), ...globalByIdentity.keys(), ...snapshotItems.keys()]);
+    const central = [];
+    const local = [];
+    const conflicts = [];
+
+    for (const identity of identities) {
+      const localItem = localByIdentity.get(identity) || null;
+      const globalItem = globalByIdentity.get(identity) || null;
+      const baseItem = snapshotItems.get(identity) || null;
+      const localFingerprint = globalItemFingerprint(localItem);
+      const globalFingerprint = globalItemFingerprint(globalItem);
+      const baseFingerprint = globalItemFingerprint(baseItem);
+
+      // Equal current versions need no decision, even when no snapshot exists.
+      if (localFingerprint === globalFingerprint) continue;
+
+      let localChanged = false;
+      let globalChanged = false;
+      if (baseItem) {
+        localChanged = localFingerprint !== baseFingerprint;
+        globalChanged = globalFingerprint !== baseFingerprint;
       } else {
-        await managerLoadBibliography({
-          saveDirty: false,
-          preserveSelectionKey: selectedKey,
-          scheduleSync: false
+        localChanged = Boolean(localItem);
+        globalChanged = Boolean(globalItem);
+      }
+
+      // A one-sided entry with no base is new. For conservative compatibility,
+      // a one-sided entry with a base remains a change on the side that exists;
+      // explicit central deletion tombstones are handled by the deletion path.
+      if (!localItem && globalItem) {
+        localChanged = false;
+        globalChanged = true;
+      } else if (localItem && !globalItem) {
+        localChanged = true;
+        globalChanged = false;
+      }
+
+      if (!localChanged && !globalChanged) continue;
+
+      const signature = managerGlobalDiffSignature(localItem, globalItem, baseItem);
+      const common = {
+        identity,
+        local: localItem,
+        global: globalItem,
+        base: baseItem,
+        signature,
+        localFingerprint,
+        globalFingerprint,
+        baseFingerprint,
+        localChanged,
+        globalChanged,
+        localChangeKind: !localItem ? "missing" : (!baseItem ? "new" : "modified"),
+        globalChangeKind: !globalItem ? "missing" : (!baseItem ? "new" : "modified")
+      };
+
+      if (localChanged && globalChanged) conflicts.push({ ...common, category: "conflict" });
+      else if (localChanged) local.push({ ...common, category: "local" });
+      else if (globalChanged) central.push({ ...common, category: "central" });
+    }
+
+    const byKey = (left, right) => String((left.local || left.global || left.base)?.key || "")
+      .localeCompare(String((right.local || right.global || right.base)?.key || ""));
+    central.sort(byKey);
+    local.sort(byKey);
+    conflicts.sort(byKey);
+    return { central, local, conflicts, localByIdentity, globalByIdentity };
+  }
+
+
+  const MANAGER_GLOBAL_VALID_ACTIONS = {
+    central: new Set(["pull", "keep-local"]),
+    local: new Set(["keep-local", "central", "push"]),
+    conflict: new Set(["keep-local", "central", "push"])
+  };
+
+  function unresolvedManagerGlobalDiffs(diffs, ledger, { forceAskAll = false } = {}) {
+    const filter = (items, kind) => (items || []).filter((diff) => {
+      if (forceAskAll) return true;
+      const prior = ledger?.decisions?.[diff.identity];
+      return !(prior?.signature === diff.signature && MANAGER_GLOBAL_VALID_ACTIONS[kind].has(prior.action));
+    });
+    return {
+      central: filter(diffs.central, "central"),
+      local: filter(diffs.local, "local"),
+      conflicts: filter(diffs.conflicts, "conflict")
+    };
+  }
+
+  async function notifyPageLoadGlobalDiffsImpl({ showBanner = true } = {}) {
+    if (!settings.syncGlobalDatabase) {
+      updateGlobalComparisonPendingUi(0);
+      if (showBanner && managerInitialParseState === "failed") {
+        showGlobalBanner("The local bibliography could not be parsed in the background.", {
+          variant: "error",
+          detailsText: backgroundParseDebugReport(),
+          detailsLabel: "Details",
+          replacePersistentError: true
         });
       }
-      reloadSucceeded = true;
-    } catch (error) {
-      managerSetStatus(error.message || String(error), true);
+      return null;
+    }
+
+    const [globalState, snapshotItems, ledger] = await Promise.all([
+      loadGlobalDatabaseState(),
+      loadGlobalSyncSnapshot(),
+      loadManagerGlobalSyncDecisionLedger()
+    ]);
+    const globalItems = globalState.entries || [];
+    // An entirely empty central database is handled by the existing initial
+    // import assistant; do not replace that prompt with a generic diff banner.
+    if (!globalItems.length && !snapshotItems.size) {
+      updateGlobalComparisonPendingUi(0);
+      if (showBanner && managerInitialParseState === "failed") {
+        showGlobalBanner("The local bibliography could not be parsed in the background.", {
+          variant: "error",
+          detailsText: backgroundParseDebugReport(),
+          detailsLabel: "Details",
+          replacePersistentError: true
+        });
+      }
+      return null;
+    }
+
+    const localItems = managerInitialOpenParsed ? globalItemsFromCurrentDocument() : [];
+    const allDiffs = classifyManagerGlobalDiffs(localItems, globalItems, snapshotItems);
+    const diffs = unresolvedManagerGlobalDiffs(allDiffs, ledger);
+    const total = diffs.central.length + diffs.local.length + diffs.conflicts.length;
+    updateGlobalComparisonPendingUi(total);
+    if (!total) {
+      if (showBanner && managerInitialParseState === "failed") {
+        showGlobalBanner("The local bibliography could not be parsed in the background.", {
+          variant: "error",
+          detailsText: backgroundParseDebugReport(),
+          detailsLabel: "Details",
+          replacePersistentError: true
+        });
+      }
+      return diffs;
+    }
+
+    const parts = [];
+    if (diffs.central.length) parts.push(`${diffs.central.length} central change${diffs.central.length === 1 ? "" : "s"}`);
+    if (diffs.local.length) parts.push(`${diffs.local.length} local change${diffs.local.length === 1 ? "" : "s"}`);
+    if (diffs.conflicts.length) parts.push(`${diffs.conflicts.length} true conflict${diffs.conflicts.length === 1 ? "" : "s"}`);
+
+    if (showBanner) {
+      const parsePrefix = managerInitialOpenParsed
+        ? "Bibliography differences detected"
+        : "The local bibliography could not be parsed in the background; central entries are available";
+      showGlobalBanner(
+        `${parsePrefix}: ${parts.join(", ")}. Resolve them now?`,
+        {
+          yesLabel: "Resolve now",
+          noLabel: managerInitialOpenParsed ? "Later" : "Acknowledge",
+          onYes: resolvePageLoadGlobalDiffsNow,
+          detailsText: managerInitialOpenParsed ? "" : backgroundParseDebugReport(),
+          detailsLabel: "Details",
+          variant: managerInitialOpenParsed ? "" : "error",
+          replacePersistentError: !managerInitialOpenParsed
+        }
+      );
+    }
+    return diffs;
+  }
+
+  async function notifyPageLoadGlobalDiffs(options = {}) {
+    const finishToolbarActivity = beginToolbarBackgroundActivity("Checking central database differences…");
+    try {
+      return await notifyPageLoadGlobalDiffsImpl(options);
     } finally {
+      finishToolbarActivity();
+    }
+  }
+
+  async function resolvePageLoadGlobalDiffsNow() {
+    if (managerBusy || globalDatabaseSyncInProgress) return null;
+    const returnTexFile = captureSelectedTexFile(
+      managerReturnTexFile,
+      managerOriginalFile,
+      getMainDocumentName()
+    );
+    hideGlobalBanner();
+
+    try {
+      if (pageLoadBibliographyParsePromise && managerInitialParseState === "pending") {
+        await Promise.race([
+          pageLoadBibliographyParsePromise.catch(() => null),
+          delay(5000)
+        ]);
+      }
+      await ensureBibliographyParsedForManagerOpen("");
+      if (!managerInitialOpenParsed || !managerFiles.length) {
+        throw new Error("The project bibliography could not be loaded for synchronization.");
+      }
+
+      await registerCurrentDocumentWithGlobalDatabase();
+      const session = await prepareManagerGlobalSyncDecisions({ forceAskAll: false });
+      if (!session) return null;
+
+      showDocumentBibliographyUpdateOverlay("Applying bibliography synchronization decisions…");
+      setManagerBusy(true, "Synchronizing bibliography…");
+      if (managerDirtyIds.size || managerDeletedDrafts.size) {
+        await managerWriteDirtyEntries({ scheduleSync: false, fastRestore: true });
+      }
+      const result = await commitManagerGlobalSyncDecisions({ source: "page-load difference resolution" });
+      managerSessionChanged = false;
+      managerSetStatus(
+        result
+          ? `Synchronization completed: ${result.synchronized} synchronized, ${result.skippedCentral + result.skippedLocal} kept local${result.unresolved ? `, ${result.unresolved} changed concurrently` : ""}.`
+          : "No synchronization changes were required."
+      );
+      return result;
+    } catch (error) {
+      const message = error?.message || String(error);
+      managerSetStatus(`Could not resolve bibliography differences: ${message}`, true);
+      if (!error?.ctcaBibWriteBannerShown) {
+        showGlobalBanner(`Could not resolve bibliography differences: ${message}`, {
+          yesLabel: "Try again",
+          noLabel: "Later",
+          onYes: resolvePageLoadGlobalDiffsNow,
+          variant: "error"
+        });
+      }
+      return null;
+    } finally {
+      if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false }).catch(() => null);
+      hideDocumentBibliographyUpdateOverlay();
       setManagerBusy(false);
     }
-    if (!reloadSucceeded) {
-      hideDocumentBibliographyUpdateOverlay();
-      if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false });
-      return;
-    }
+  }
 
-    let excludedGlobalImportIdentities = new Set();
-    if (applyPendingGlobalChanges) {
-      let candidates = [];
-      try {
-        candidates = await loadPendingGlobalImportCandidates();
-      } catch (error) {
-        hideDocumentBibliographyUpdateOverlay();
-        managerSetStatus(`Could not inspect new central database entries: ${error.message || String(error)}`, true);
-        if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false });
-        return;
-      }
-      if (candidates.length) {
-        hideDocumentBibliographyUpdateOverlay();
-        const selectedIdentities = await choosePendingGlobalImports(candidates);
-        if (selectedIdentities === null) {
-          if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false });
-          return;
+  async function chooseManagerGlobalConflicts(conflicts) {
+    if (!conflicts.length) return new Set();
+    const useCentral = new Set(conflicts.map((item) => item.identity));
+    const result = await showAppDialog({
+      title: `Resolve ${conflicts.length} central/document conflict${conflicts.length === 1 ? "" : "s"}`,
+      message: "These entries have the same DOI—or, when no DOI exists, the same citation key—but differ between the document and central database. Checked entries use the central version; unchecked entries keep the document version.",
+      controls: (container) => {
+        const toolbar = document.createElement("div");
+        toolbar.className = "ctca-global-import-toolbar";
+        const selectAll = document.createElement("button");
+        selectAll.type = "button";
+        selectAll.textContent = "Use central for all";
+        const clearAll = document.createElement("button");
+        clearAll.type = "button";
+        clearAll.textContent = "Keep document for all";
+        const count = document.createElement("span");
+        count.className = "ctca-global-import-count";
+        const list = document.createElement("div");
+        list.className = "ctca-global-import-list";
+        const checkboxes = [];
+        const updateCount = () => {
+          count.textContent = `${useCentral.size} of ${conflicts.length} use central`;
+        };
+
+        for (const conflict of conflicts) {
+          const localItem = conflict.local || {};
+          const globalItem = conflict.global || {};
+          const localFields = localItem.fields || {};
+          const globalFields = globalItem.fields || {};
+          const label = document.createElement("label");
+          label.className = "ctca-global-import-entry";
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.checked = true;
+          checkbox.value = conflict.identity;
+          checkbox.addEventListener("change", () => {
+            if (checkbox.checked) useCentral.add(conflict.identity);
+            else useCentral.delete(conflict.identity);
+            updateCount();
+          });
+          const details = document.createElement("span");
+          details.className = "ctca-global-import-entry-details";
+          const heading = document.createElement("span");
+          heading.className = "ctca-global-import-entry-title";
+          heading.innerHTML = managerLatexHtml(stripOneBibDelimiter(globalFields.title || localFields.title || globalItem.key || localItem.key || "Reference"));
+          const meta = document.createElement("span");
+          meta.className = "ctca-global-import-entry-meta";
+          const localYear = stripOneBibDelimiter(localFields.year || localFields.date || "");
+          const globalYear = stripOneBibDelimiter(globalFields.year || globalFields.date || "");
+          meta.textContent = `${globalItem.key || localItem.key || "Reference"} · document: ${localYear || "—"} · central: ${globalYear || "—"}`;
+          details.append(heading, meta);
+          label.append(checkbox, details);
+          list.appendChild(label);
+          checkboxes.push(checkbox);
         }
-        excludedGlobalImportIdentities = new Set(
-          candidates
-            .map(globalSyncIdentity)
-            .filter((identity) => !selectedIdentities.has(identity))
-        );
-        showDocumentBibliographyUpdateOverlay();
+
+        selectAll.addEventListener("click", () => {
+          useCentral.clear();
+          for (const conflict of conflicts) useCentral.add(conflict.identity);
+          for (const checkbox of checkboxes) checkbox.checked = true;
+          updateCount();
+        });
+        clearAll.addEventListener("click", () => {
+          useCentral.clear();
+          for (const checkbox of checkboxes) checkbox.checked = false;
+          updateCount();
+        });
+        updateCount();
+        toolbar.append(selectAll, clearAll, count);
+        container.append(toolbar, list);
+      },
+      buttons: [
+        { label: "Cancel", value: null },
+        { label: "Apply conflict choices", primary: true, getValue: () => new Set(useCentral) }
+      ],
+      closeValue: null,
+      dialogClass: "ctca-global-import-dialog-card"
+    });
+    return result;
+  }
+
+  function applyCentralItemToManagerDraft(item) {
+    if (!item) return false;
+    const identity = globalSyncIdentity(item);
+    let draft = [...managerDrafts.values()].find(
+      (candidate) => candidate.centralPreview !== true && globalSyncIdentity(globalItemFromDraft(candidate)) === identity
+    ) || null;
+    const targetFile = draft?.sourceFile || managerFiles[0];
+    if (!targetFile) return false;
+
+    const cleanFields = Object.fromEntries(
+      Object.entries(item.fields || {}).filter(([name]) => !CTCA_INTERNAL_FIELDS.has(name))
+    );
+    if (item.tags?.length) cleanFields[CTCA_TAGS_FIELD] = globalThis.CollabTeXSearchTools.splitTags(item.tags).join(", ");
+    if (Array.isArray(item.comments) && item.comments.length) cleanFields[CTCA_COMMENTS_FIELD] = managerEncodedCommentItems(item.comments);
+    if (Array.isArray(item.crosslinks) && item.crosslinks.length) cleanFields[CTCA_CROSSLINKS_FIELD] = item.crosslinks.join(", ");
+    if (item.addedOn) cleanFields[CTCA_ADDED_ON_FIELD] = item.addedOn;
+    cleanFields[CTCA_STARRED_FIELD] = item.starred === true ? "true" : "false";
+
+    if (!draft) {
+      // A central-only DOI identity can still use a citation key that already
+      // belongs to a different local DOI. Never overwrite that local draft in
+      // the Map: assign a unique local key and retain the requested central key
+      // as an alias instead.
+      const requestedKey = String(item.key || "Reference");
+      const reservedKeys = new Set(
+        [...managerDrafts.values()]
+          .filter((candidate) => candidate.centralPreview !== true)
+          .map((candidate) => String(candidate.key || "").toLowerCase())
+          .filter(Boolean)
+      );
+      const targetKey = uniquePulledKey(requestedKey, reservedKeys);
+      // `item.aliases` is synchronization metadata and commonly contains the
+      // central entry's own key or generated historical aliases. Do not convert
+      // that metadata into a new explicit BibTeX `ids` field. Preserve only an
+      // `ids` field that already exists in the central BibTeX data, plus the
+      // requested key when a local key collision forced a rename.
+      const aliases = new Set(splitAliasKeys(cleanFields.ids || "").filter(Boolean));
+      if (targetKey !== requestedKey) aliases.add(requestedKey);
+      aliases.delete(targetKey);
+      if (aliases.size) cleanFields.ids = [...aliases].join(", ");
+      else delete cleanFields.ids;
+
+      const syntheticRecord = {
+        key: targetKey,
+        type: item.type || "misc",
+        sourceFile: targetFile,
+        fields: Object.fromEntries(Object.entries(cleanFields).map(([name, value]) => [name, managerWrapBibValue(value, name)]))
+      };
+      draft = draftFromRecord(syntheticRecord);
+      draft.originalKey = "";
+      draft.key = targetKey;
+      draft.fields = cleanFields;
+      managerRecords.push(syntheticRecord);
+      managerDrafts.set(draft.id, draft);
+      managerDirtyIds.add(draft.id);
+      managerSessionChanged = true;
+      return true;
+    }
+
+    const aliases = new Set([
+      ...splitAliasKeys(draft.fields.ids || ""),
+      ...splitAliasKeys(cleanFields.ids || "")
+    ].filter(Boolean));
+    // Keep a differing central key usable as a local alias, but do not import
+    // generated alias metadata wholesale. Citation-key aliases are deliberately
+    // ignored by content-conflict comparison below.
+    if (item.key && item.key !== draft.key) aliases.add(item.key);
+    aliases.delete(draft.key);
+    if (aliases.size) cleanFields.ids = [...aliases].join(", ");
+    const before = draftSyncPayload(draft);
+    draft.type = item.type || "misc";
+    draft.fields = cleanFields;
+    if (before !== draftSyncPayload(draft)) {
+      managerMarkDirty(draft, false);
+      return true;
+    }
+    return false;
+  }
+
+  function cloneManagerSyncValue(value) {
+    if (typeof globalThis.structuredClone === "function") {
+      try { return globalThis.structuredClone(value); } catch (_error) {}
+    }
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function captureManagerProvisionalSyncState() {
+    return {
+      records: cloneManagerSyncValue(managerRecords),
+      drafts: [...managerDrafts.entries()].map(([id, draft]) => [id, cloneManagerSyncValue(draft)]),
+      dirtyIds: [...managerDirtyIds],
+      deletedDrafts: [...managerDeletedDrafts.entries()].map(([id, draft]) => [id, cloneManagerSyncValue(draft)]),
+      selectedId: managerSelectedId,
+      selectedIds: [...managerSelectedIds],
+      categoryState: cloneManagerSyncValue(managerCategoryState),
+      pendingCentralDeletionIdentities: [...managerPendingCentralDeletionIdentities],
+      sessionChanged: managerSessionChanged
+    };
+  }
+
+  function restoreManagerProvisionalSyncState(state) {
+    if (!state) return;
+    managerRecords = cloneManagerSyncValue(state.records || []);
+    managerDrafts = new Map((state.drafts || []).map(([id, draft]) => [id, cloneManagerSyncValue(draft)]));
+    managerDirtyIds = new Set(state.dirtyIds || []);
+    managerDeletedDrafts = new Map((state.deletedDrafts || []).map(([id, draft]) => [id, cloneManagerSyncValue(draft)]));
+    managerSelectedId = String(state.selectedId || "");
+    managerSelectedIds = new Set(state.selectedIds || []);
+    managerCategoryState = cloneManagerSyncValue(state.categoryState || { version: CATEGORY_STATE_VERSION, categories: [], memberships: {} });
+    managerPendingCentralDeletionIdentities = new Set(state.pendingCentralDeletionIdentities || []);
+    managerSessionChanged = state.sessionChanged === true;
+    records = managerRecords.slice();
+    renderManagerCategories();
+    renderManagerList();
+    renderManagerDetails();
+    updateManagerCount();
+  }
+
+  function rollbackProvisionalGlobalSyncAfterWriteFailure() {
+    const session = managerGlobalSyncSession;
+    if (!session) return;
+    const pendingCount = session.promptedIdentities?.size || 0;
+    restoreManagerProvisionalSyncState(session.rollbackState);
+    managerGlobalSyncSession = null;
+    deferredProjectGlobalPush = true;
+    updateGlobalComparisonPendingUi(Math.max(pendingCount, globalDocumentPendingCount || 0));
+  }
+
+  async function prepareManagerGlobalSyncDecisionsImpl({ forceAskAll = false } = {}) {
+    if (!settings.syncGlobalDatabase || !managerFiles.length) {
+      managerGlobalSyncSession = null;
+      return null;
+    }
+
+    const [globalState, snapshotItems, ledger] = await Promise.all([
+      loadGlobalDatabaseState(),
+      loadGlobalSyncSnapshot(),
+      loadManagerGlobalSyncDecisionLedger()
+    ]);
+    const localItems = globalItemsFromCurrentDocument();
+    const diffs = classifyManagerGlobalDiffs(localItems, globalState.entries || [], snapshotItems);
+    const actions = new Map();
+    const allDiffs = [...diffs.central, ...diffs.local, ...diffs.conflicts];
+
+    const unresolved = unresolvedManagerGlobalDiffs(diffs, ledger, { forceAskAll });
+    const unresolvedCentral = unresolved.central;
+    const unresolvedLocal = unresolved.local;
+    const unresolvedConflicts = unresolved.conflicts;
+
+    const collectPrior = (items, kind) => {
+      for (const diff of items) {
+        const prior = ledger.decisions[diff.identity];
+        if (!forceAskAll && prior?.signature === diff.signature && MANAGER_GLOBAL_VALID_ACTIONS[kind].has(prior.action)) {
+          actions.set(diff.identity, prior.action);
+        }
+      }
+    };
+    collectPrior(diffs.central, "central");
+    collectPrior(diffs.local, "local");
+    collectPrior(diffs.conflicts, "conflict");
+
+    if (unresolvedCentral.length) {
+      const selected = await chooseManagerCentralChanges(unresolvedCentral);
+      if (selected === null) return null;
+      for (const diff of unresolvedCentral) {
+        const action = selected.has(diff.identity) ? "pull" : "keep-local";
+        actions.set(diff.identity, action);
+        ledger.decisions[diff.identity] = { signature: diff.signature, action, updatedAt: new Date().toISOString() };
       }
     }
 
-    const shouldSynchronize = Boolean(
-      settings.syncGlobalDatabase &&
-      (applyPendingGlobalChanges || managerSessionChanged || deferredProjectGlobalPush)
-    );
-    if (!shouldSynchronize) {
-      hideDocumentBibliographyUpdateOverlay();
-      if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false });
-      return;
+    if (unresolvedLocal.length) {
+      const selectedActions = await chooseManagerLocalOrConflictActions(unresolvedLocal, { conflict: false });
+      if (selectedActions === null) return null;
+      for (const diff of unresolvedLocal) {
+        const action = selectedActions.get(diff.identity) || "keep-local";
+        actions.set(diff.identity, action);
+        ledger.decisions[diff.identity] = { signature: diff.signature, action, updatedAt: new Date().toISOString() };
+      }
     }
 
-    window.clearTimeout(globalDatabaseSyncTimer);
-    globalDatabaseSyncTimer = null;
+    if (unresolvedConflicts.length) {
+      const selectedActions = await chooseManagerLocalOrConflictActions(unresolvedConflicts, { conflict: true });
+      if (selectedActions === null) return null;
+      for (const diff of unresolvedConflicts) {
+        const action = selectedActions.get(diff.identity) || "keep-local";
+        actions.set(diff.identity, action);
+        ledger.decisions[diff.identity] = { signature: diff.signature, action, updatedAt: new Date().toISOString() };
+      }
+    }
+
+    if (unresolvedCentral.length || unresolvedLocal.length || unresolvedConflicts.length) {
+      await releaseAppDialogBeforeBackgroundWork();
+    }
+
+    // Newly answered synchronization choices remain provisional until the
+    // local bibliography write and the central-database commit both succeed.
+    // Persisting them here would incorrectly hide unresolved differences after
+    // a write timeout or rejected background update.
+
+    const rollbackState = captureManagerProvisionalSyncState();
+    let centralApplied = 0;
+    for (const diff of allDiffs) {
+      const action = actions.get(diff.identity);
+      if ((action === "pull" || action === "central") && diff.global) {
+        if (applyCentralItemToManagerDraft(diff.global)) centralApplied += 1;
+      }
+    }
+    if (centralApplied) {
+      renderManagerCategories();
+      renderManagerList();
+      renderManagerDetails();
+      updateManagerCount();
+    }
+
+    const postDecisionLocalItems = globalItemsFromCurrentDocument();
+    managerGlobalSyncSession = {
+      actions,
+      diffsByIdentity: new Map(allDiffs.map((diff) => [diff.identity, diff])),
+      openingGlobalFingerprints: new Map((globalState.entries || []).map((item) => [globalSyncIdentity(item), globalItemFingerprint(item)])),
+      postDecisionLocalFingerprints: new Map(postDecisionLocalItems.map((item) => [globalSyncIdentity(item), globalItemFingerprint(item)])),
+      snapshotItems,
+      decisionLedger: ledger,
+      promptedIdentities: new Set([
+        ...unresolvedCentral.map((diff) => diff.identity),
+        ...unresolvedLocal.map((diff) => diff.identity),
+        ...unresolvedConflicts.map((diff) => diff.identity)
+      ]),
+      rollbackState,
+      preparedAt: new Date().toISOString(),
+      forceAsked: forceAskAll
+    };
+    const promptedCount = unresolvedCentral.length + unresolvedLocal.length + unresolvedConflicts.length;
+    managerSetStatus(
+      promptedCount
+        ? `Synchronization choices collected for ${unresolvedCentral.length} central change${unresolvedCentral.length === 1 ? "" : "s"}, ${unresolvedLocal.length} local change${unresolvedLocal.length === 1 ? "" : "s"}, and ${unresolvedConflicts.length} true conflict${unresolvedConflicts.length === 1 ? "" : "s"}.`
+        : (allDiffs.length ? "All existing differences already have a saved decision." : "Central synchronization checked: no differences.")
+    );
+    return managerGlobalSyncSession;
+  }
+
+  async function prepareManagerGlobalSyncDecisions(options = {}) {
+    const finishToolbarActivity = beginToolbarBackgroundActivity("Collecting synchronization choices…");
     try {
-      await synchronizeProjectWithGlobalDatabase({
-        reason: "Update Bib",
-        announce: true,
-        force: true,
-        allowManagerSession: true,
-        localDeletedGlobalIdentities,
-        excludedGlobalImportIdentities
-      });
+      return await prepareManagerGlobalSyncDecisionsImpl(options);
     } finally {
+      finishToolbarActivity();
+    }
+  }
+
+  async function commitManagerGlobalSyncDecisions({ source = "bibliography manager closed" } = {}) {
+    if (!settings.syncGlobalDatabase || !managerFiles.length) return null;
+    const session = managerGlobalSyncSession || await prepareManagerGlobalSyncDecisions({ forceAskAll: false });
+    if (!session) return null;
+
+    const globalState = await loadGlobalDatabaseState();
+    const localItems = globalItemsFromCurrentDocument();
+    const localByIdentity = new Map(localItems.map((item) => [globalSyncIdentity(item), item]));
+    const globalByIdentity = new Map((globalState.entries || []).map((item) => [globalSyncIdentity(item), item]));
+    const keptCentralPending = new Set();
+    const keptLocalOnly = new Set();
+    const unresolved = new Set();
+    const synchronized = new Set();
+    let changedGlobal = false;
+
+    const identities = new Set([
+      ...localByIdentity.keys(),
+      ...globalByIdentity.keys(),
+      ...session.diffsByIdentity.keys()
+    ]);
+
+    for (const identity of identities) {
+      const action = session.actions.get(identity) || "";
+      const diff = session.diffsByIdentity.get(identity) || null;
+      const localItem = localByIdentity.get(identity) || null;
+      const globalItem = globalByIdentity.get(identity) || null;
+      const currentGlobalFingerprint = globalItemFingerprint(globalItem);
+      const openingGlobalFingerprint = session.openingGlobalFingerprints.get(identity) || "";
+      const centralChangedWhileOpen = currentGlobalFingerprint !== openingGlobalFingerprint;
+      const postDecisionFingerprint = session.postDecisionLocalFingerprints.get(identity) || "";
+      const localChangedInManager = globalItemFingerprint(localItem) !== postDecisionFingerprint;
+
+      // The user explicitly accepts the local state without changing central.
+      // The decision ledger suppresses the same exact difference until either
+      // side changes again, so this is acknowledged rather than unresolved.
+      if (action === "keep-local") {
+        if (diff?.category === "central") keptCentralPending.add(identity);
+        else keptLocalOnly.add(identity);
+        continue;
+      }
+
+      if (!action && diff) {
+        unresolved.add(identity);
+        continue;
+      }
+
+      const explicitlyPush = action === "push";
+      const shouldPushManagerEdit = !diff && localChangedInManager && Boolean(localItem);
+      if ((explicitlyPush || shouldPushManagerEdit) && localItem) {
+        if (centralChangedWhileOpen && currentGlobalFingerprint !== globalItemFingerprint(localItem)) {
+          unresolved.add(identity);
+          continue;
+        }
+        if (currentGlobalFingerprint !== globalItemFingerprint(localItem)) {
+          globalByIdentity.set(identity, { ...localItem, updatedAt: new Date().toISOString() });
+          changedGlobal = true;
+        }
+        synchronized.add(identity);
+        continue;
+      }
+
+      if ((action === "pull" || action === "central") && globalItem) {
+        if (localItem && globalItemFingerprint(localItem) === currentGlobalFingerprint) synchronized.add(identity);
+        else unresolved.add(identity);
+        continue;
+      }
+
+      if (action) unresolved.add(identity);
+    }
+
+    const deletedGlobalItems = [];
+    for (const identity of managerPendingCentralDeletionIdentities) {
+      const item = globalByIdentity.get(identity);
+      if (!item) continue;
+      deletedGlobalItems.push(item);
+      globalByIdentity.delete(identity);
+      changedGlobal = true;
+      synchronized.add(identity);
+    }
+
+    if (changedGlobal) {
+      const deletionTombstones = deletedGlobalItems.map((item) => ({
+        identity: globalIdentity(item),
+        doi: normalizeDoiInput(item?.fields?.doi || ""),
+        key: String(item?.key || ""),
+        title: stripOneBibDelimiter(item?.fields?.title || ""),
+        deletedAt: new Date().toISOString(),
+        source: "document"
+      }));
+      await saveGlobalDatabase([...globalByIdentity.values()], {
+        categoryState: globalCategoryStateFromCurrentDocument(),
+        replaceCategoryState: false,
+        deletedEntries: [...(globalState.deletedEntries || []), ...deletionTombstones],
+        sourceDocumentId: currentDocumentSyncId(),
+        changeCount: Math.max(1, synchronized.size)
+      });
+    }
+
+    const latestGlobalState = changedGlobal ? await loadGlobalDatabaseState() : globalState;
+    const latestGlobalByIdentity = new Map((latestGlobalState.entries || []).map((item) => [globalSyncIdentity(item), item]));
+    const nextSnapshot = new Map(session.snapshotItems);
+    const allLatestIdentities = new Set([...localByIdentity.keys(), ...latestGlobalByIdentity.keys()]);
+    for (const identity of allLatestIdentities) {
+      if (unresolved.has(identity)) continue;
+      const localItem = localByIdentity.get(identity) || null;
+      const globalItem = latestGlobalByIdentity.get(identity) || null;
+      if (localItem && globalItem && globalItemFingerprint(localItem) === globalItemFingerprint(globalItem)) {
+        nextSnapshot.set(identity, canonicalGlobalItem(localItem));
+      }
+    }
+    for (const identity of managerPendingCentralDeletionIdentities) nextSnapshot.delete(identity);
+
+    await Promise.all([
+      saveGlobalSyncSnapshot([...nextSnapshot.values()]),
+      saveManagerGlobalSyncDecisionLedger(session.decisionLedger || { version: 1, decisions: {} }),
+      markDocumentBibliographyPushed(source),
+      preserveCurrentDocumentPendingGlobalChanges(new Set([...unresolved]))
+    ]);
+    deferredProjectGlobalPush = unresolved.size > 0;
+    updateGlobalComparisonPendingUi(unresolved.size);
+    for (const identity of managerPendingCentralDeletionIdentities) {
+      managerPendingCentralDeletionIdentities.delete(identity);
+    }
+    return {
+      changedGlobal,
+      synchronized: synchronized.size,
+      skippedCentral: keptCentralPending.size,
+      skippedLocal: keptLocalOnly.size,
+      unresolved: unresolved.size
+    };
+  }
+
+
+  async function managerSaveAndReload() {
+    if (managerBusy) return;
+    const returnTexFile = captureSelectedTexFile(managerReturnTexFile, managerOriginalFile, getMainDocumentName());
+    showDocumentBibliographyUpdateOverlay("Updating bibliography in the background…");
+    await pauseFastManagerCentralSync();
+    const selectedKey = managerDrafts.get(managerSelectedId)?.key || "";
+    setManagerBusy(true, "Synchronizing…");
+    try {
+      // Preserve deliberate manager edits before the manual reparse. The write
+      // function is a no-op when serialization produces the existing file text.
+      if (managerDirtyIds.size || managerDeletedDrafts.size) {
+        await managerWriteDirtyEntries({ scheduleSync: false, fastRestore: true });
+      }
+
+      // A manual Update Bib explicitly reparses all configured BibTeX files and
+      // asks again for every currently existing central/local difference,
+      // regardless of decisions remembered from prior manager openings.
+      await managerLoadBibliography({
+        saveDirty: false,
+        preserveSelectionKey: selectedKey,
+        scheduleSync: false
+      });
+      await prepareManagerGlobalSyncDecisions({ forceAskAll: true });
+
+      // Selected central versions have now been merged into the in-memory
+      // manager data. Write the combined result once, then update the central
+      // database without another local-file write or another question.
+      if (managerDirtyIds.size || managerDeletedDrafts.size) {
+        await managerWriteDirtyEntries({ scheduleSync: false, fastRestore: true });
+      }
+      const result = await commitManagerGlobalSyncDecisions({ source: "manual Update Bib" });
+      managerSessionChanged = false;
+      managerSetStatus(
+        result
+          ? `Manual synchronization completed: ${result.synchronized} synchronized, ${result.skippedCentral + result.skippedLocal} kept local${result.unresolved ? `, ${result.unresolved} changed concurrently` : ""}.`
+          : "Bibliography reparsed; central synchronization is disabled."
+      );
+    } catch (error) {
+      managerSetStatus(error?.message || String(error), true);
+      if (!error?.ctcaBibWriteBannerShown) {
+        showGlobalBanner(`Could not synchronize the bibliography: ${error?.message || String(error)}`, { autoHideMs: 6000, variant: "error" });
+      }
+    } finally {
+      if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false });
       hideDocumentBibliographyUpdateOverlay();
+      setManagerBusy(false);
     }
-    if (globalDocumentPendingCount > 0 && bibManager.classList.contains("ctca-manager-visible")) {
-      showPendingGlobalSyncBanner();
-    }
-    if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false });
   }
 
   async function openBibManager({ bibFileName = "", citationKey = "" } = {}) {
     await globalThis.SmartCitationsPrivacy.ensureAccepted();
-    if (managerBusy) return;
+    if (managerBusy) {
+      throw new Error(managerBusyLabel || "Smart Citations is still completing another bibliography operation.");
+    }
     cancelScheduledPopup();
     hidePopup();
     managerNewEntryKeys = new Set();
+
+    // Open the full-window shell immediately. If the page-load reader failed,
+    // the user sees an explicit loading state while the compatibility parser
+    // runs instead of an apparently unresponsive toolbar button.
+    bibManager.classList.add("ctca-manager-visible");
+    bibManager.setAttribute("aria-hidden", "false");
+    setManagerListLoading(true);
+    managerSetStatus("Loading the project bibliography…");
+    await ensureBibliographyParsedForManagerOpen(bibFileName);
     const requestedBibFile = normalizeBibFileName(bibFileName);
     const requestedCitationKey = String(citationKey || "").trim();
     if (requestedCitationKey) {
@@ -9755,12 +11193,14 @@
         : activeFile
     );
     managerSessionChanged = false;
-    bibManager.classList.add("ctca-manager-visible");
-    bibManager.setAttribute("aria-hidden", "false");
-    // The in-page manager is session-resident. Reopening it must reuse its
-    // current drafts; BibTeX is reread only when no in-session list exists.
-    const shouldLoadBibliography = managerDrafts.size === 0;
-    setManagerListLoading(shouldLoadBibliography);
+    managerGlobalSyncSession = null;
+    // The page-load parse is authoritative for the manager session. A file-tree
+    // click may identify the requested bibliography, but it must not trigger a
+    // second parse or change the visible editor document.
+    const requestedFileAlreadyLoaded = requestedBibFile && managerFiles.some((fileName) =>
+      bibSourceMatches(fileName, requestedBibFile)
+    );
+    setManagerListLoading(false);
     managerBulkDoiAbortRequested = false;
     managerBulkDoiActiveRequestId = "";
     managerSetProgress(0, 1, "", false);
@@ -9769,23 +11209,24 @@
     bibManager.querySelector(".ctca-manager-search-clear").hidden = !managerQuery;
     applyManagerColumnWidths();
     try {
-      if (!shouldLoadBibliography) {
-        updateManagerBibButton(false);
-        renderManagerCategories();
-        renderManagerList();
-        renderManagerDetails();
-        updateManagerCount();
-        managerSetStatus(`Showing ${managerDrafts.size} in-session bibliography entries.`);
+      await managerEnsureAuthorshipUserName();
+      extensionApi.runtime.sendMessage({ type: "ctca-check-orcid-and-open" }).catch(() => {});
+      updateManagerBibButton(false);
+      renderManagerCategories();
+      renderManagerList();
+      renderManagerDetails();
+      updateManagerCount();
+      if (!managerInitialOpenParsed) {
+        managerSetStatus(
+          managerInitialParseError
+            ? `The bibliography could not be parsed: ${managerInitialParseError}`
+            : "The bibliography could not be parsed. Use Update Bib to retry.",
+          true
+        );
+      } else if (requestedBibFile && !requestedFileAlreadyLoaded) {
+        managerSetStatus(`${requestedBibFile} was not part of the bibliography parsed on document load. Use Update Bib to include it.`, true);
       } else {
-        await managerEnsureAuthorshipUserName();
-        extensionApi.runtime.sendMessage({ type: "ctca-check-orcid-and-open" }).catch(() => {});
-        setManagerBusy(true, "Loading…");
-        managerSetStatus("Detecting bibliography configuration…");
-        await managerLoadBibliography({
-          saveDirty: false,
-          filesOverride: requestedBibFile ? [requestedBibFile] : null
-        });
-        setManagerBusy(false);
+        managerSetStatus(`Showing ${managerDrafts.size} bibliography entries parsed on document load.`);
       }
 
       if (requestedCitationKey) {
@@ -9815,18 +11256,15 @@
 
       managerUpdateCloudIconState().catch(() => {});
       managerScheduleNextcloudSync(200);
+
+      // Every full-window opening checks the current document/central state.
+      // Previously answered decisions are reused only while the exact local,
+      // central and synchronization-snapshot fingerprints remain unchanged.
+      if (settings.syncGlobalDatabase) {
+        await registerCurrentDocumentWithGlobalDatabase();
+        await prepareManagerGlobalSyncDecisions({ forceAskAll: false });
+      }
       bibManager.querySelector(".ctca-manager-search")?.focus();
-      Promise.resolve().then(async () => {
-        if (!settings.syncGlobalDatabase) return;
-        if (!globalPromptChecked && !startupAssistantCheckInProgress) {
-          await checkGlobalDatabasePrompts({ allowAutomaticSync: false });
-        } else {
-          await checkCurrentDocumentGlobalFlag({ allowAutomaticSync: false });
-        }
-        await refreshManagerPendingHighlights();
-      }).catch((error) => {
-        console.warn("[Smart Citations] Could not load central bibliography previews:", error);
-      });
     } catch (error) {
       if (managerOriginalFile) await restoreFile(managerOriginalFile);
       managerSetStatus(error.message || String(error), true);
@@ -9838,7 +11276,7 @@
 
   async function closeBibManager(event, { skipSynchronization = false, continueAfterHidden = false } = {}) {
     event?.preventDefault?.();
-    const returnTexFile = managerReturnTexFile || captureSelectedTexFile(managerOriginalFile);
+    const returnTexFile = captureSelectedTexFile(managerReturnTexFile, managerOriginalFile, getMainDocumentName());
     const wasVisible = bibManager.classList.contains("ctca-manager-visible");
     if (wasVisible) {
       bibManager.classList.remove("ctca-manager-visible");
@@ -9847,117 +11285,68 @@
     if (!wasVisible && !continueAfterHidden) return;
 
     if (managerBusy) {
-      if (!globalDatabaseSyncInProgress && !documentBibliographyUpdateOverlay?.classList.contains("ctca-document-bibliography-update-visible")) {
+      if (!globalDatabaseSyncInProgress) {
         managerCloseCommitRequested = true;
       }
+      if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false });
       bridgeRequest("focus").catch(() => {});
       return;
     }
+
     await pauseFastManagerCentralSync();
     removeManagerCentralPreviewEntries();
-    const localDeletedGlobalIdentities = managerChosenCentralDeletionIdentities();
     if (managerWorkspaceTab !== "bibliography") {
       try {
         await managerRequestPdfFrameSave(managerWorkspaceTab);
+        await managerSaveActivePdfNotes().catch(() => {});
       } catch (error) {
         managerSetStatus(error?.message || String(error), true);
         showGlobalBanner(`Could not save the PDF workspace: ${error?.message || String(error)}`, { autoHideMs: 10000 });
         if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false });
         return;
       }
-      await managerSaveActivePdfNotes().catch(() => {});
     }
-    const hadChanges = Boolean(managerSessionChanged || managerDirtyIds.size || managerDeletedDrafts.size);
+
     const hasPendingBibWrites = Boolean(managerDirtyIds.size || managerDeletedDrafts.size);
-    if (hadChanges) showDocumentBibliographyUpdateOverlay();
-    let excludedGlobalImportIdentities = new Set();
-    let selectedExternalChanges = 0;
-    let externalCandidatesFound = false;
-    let pendingSelectionCancelled = false;
-    let synchronizationFailed = false;
-    try {
-      if (hasPendingBibWrites) {
-        setManagerBusy(true, "Saving…");
-        try {
-          await managerWriteDirtyEntries({ scheduleSync: false, fastRestore: true });
-        } catch (error) {
-          managerSetStatus(error.message || String(error), true);
-          showGlobalBanner(`Could not update the document bibliography: ${error.message || String(error)}`, { autoHideMs: 10000 });
-          if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false });
-          return;
-        } finally {
-          setManagerBusy(false);
-        }
-      }
-
-      if (!skipSynchronization && settings.syncGlobalDatabase) {
-        // Inspect pending central entries only after local drafts have been
-        // written. Entries produced by this manager session then match the
-        // document and fall out of the candidate list; what remains is truly
-        // new or modified outside the current ColLabTeX document.
-        let candidates;
-        try {
-          candidates = await loadPendingGlobalImportCandidates();
-        } catch (error) {
-          managerSetStatus(`Could not inspect central database changes: ${error.message || String(error)}`, true);
-          showGlobalBanner(`Could not inspect central database changes: ${error.message || String(error)}`, { autoHideMs: 10000 });
-          synchronizationFailed = true;
-          candidates = [];
-        }
-        if (!synchronizationFailed && candidates.length) {
-          externalCandidatesFound = true;
-          hideDocumentBibliographyUpdateOverlay();
-          const selectedIdentities = await choosePendingGlobalImports(candidates);
-          pendingSelectionCancelled = selectedIdentities === null;
-          const selected = selectedIdentities || new Set();
-          selectedExternalChanges = selected.size;
-          excludedGlobalImportIdentities = new Set(
-            candidates
-              .map(globalSyncIdentity)
-              .filter((identity) => !selected.has(identity))
-          );
-        }
-      }
-
-      const shouldSynchronize = Boolean(
-        !synchronizationFailed &&
-        !skipSynchronization &&
-        settings.syncGlobalDatabase &&
-        (hadChanges || selectedExternalChanges > 0)
+    const shouldCommitCentral = Boolean(!skipSynchronization && settings.syncGlobalDatabase && managerGlobalSyncSession);
+    if (hasPendingBibWrites || shouldCommitCentral) {
+      showDocumentBibliographyUpdateOverlay(
+        hasPendingBibWrites ? "Updating bibliography in the background…" : "Updating central database…"
       );
-      if (shouldSynchronize) {
-        showDocumentBibliographyUpdateOverlay();
-        window.clearTimeout(globalDatabaseSyncTimer);
-        globalDatabaseSyncTimer = null;
-        const result = await synchronizeProjectWithGlobalDatabase({
-          reason: "bibliography manager closed",
-          announce: false,
-          force: true,
-          localDeletedGlobalIdentities,
-          excludedGlobalImportIdentities
-        });
-        if (!result) {
-          showGlobalBanner("The document bibliography could not be synchronized.", { autoHideMs: 10000 });
-          synchronizationFailed = true;
-        }
+    }
+    setManagerBusy(true, hasPendingBibWrites ? "Writing bibliography…" : "Updating central database…");
+    try {
+      // The opening dialogs already established all transfer and conflict
+      // choices. Closing therefore performs one deterministic transaction. The
+      // project bibliography is updated only through the background document channel.
+      if (hasPendingBibWrites) {
+        await managerWriteDirtyEntries({ scheduleSync: false, fastRestore: true });
+      }
+      const result = shouldCommitCentral
+        ? await commitManagerGlobalSyncDecisions({ source: "bibliography manager closed" })
+        : null;
+
+      if (result && (result.skippedCentral || result.skippedLocal || result.unresolved)) {
+        showGlobalBanner(
+          `Synchronization completed with ${result.skippedCentral + result.skippedLocal} remembered exclusion${result.skippedCentral + result.skippedLocal === 1 ? "" : "s"}` +
+          `${result.unresolved ? ` and ${result.unresolved} concurrently changed entr${result.unresolved === 1 ? "y" : "ies"}` : ""}.`,
+          { autoHideMs: 10000 }
+        );
+      }
+      managerSessionChanged = false;
+      managerGlobalSyncSession = null;
+    } catch (error) {
+      managerSetStatus(error?.message || String(error), true);
+      if (!error?.ctcaBibWriteBannerShown) {
+        showGlobalBanner(`Could not update the document bibliography: ${error?.message || String(error)}`, { autoHideMs: 6000, variant: "error" });
       }
     } finally {
+      if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false });
+      managerReturnTexFile = "";
       hideDocumentBibliographyUpdateOverlay();
+      setManagerBusy(false);
+      bridgeRequest("focus").catch(() => {});
     }
-    if (
-      !synchronizationFailed &&
-      (
-        pendingSelectionCancelled ||
-        (externalCandidatesFound && selectedExternalChanges === 0) ||
-        globalDocumentPendingCount > 0
-      )
-    ) {
-      showPendingGlobalSyncBanner();
-    }
-    if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false });
-    bridgeRequest("focus").catch(() => {});
-    managerSessionChanged = false;
-    managerReturnTexFile = "";
   }
 
   function globalIdentity(item) {
@@ -10007,29 +11396,12 @@
     };
   }
 
-  function scheduleFastManagerCentralSync(draft, delayMs = 280) {
+  function scheduleFastManagerCentralSync(draft, _delayMs = 280) {
     if (!settings.syncGlobalDatabase || !draft || draft.centralPreview === true) return;
-    const identity = globalSyncIdentity(globalItemFromDraft(draft));
-    const originalIdentity = `key:${String(draft.originalKey || "").trim().toLowerCase()}`;
-    if (
-      managerPendingCentralIdentities.has(identity) ||
-      (originalIdentity !== "key:" && managerPendingCentralIdentities.has(originalIdentity))
-    ) {
-      return;
-    }
-    managerFastCentralSyncDraftIds.add(draft.id);
-    window.clearTimeout(managerFastCentralSyncTimer);
-    managerFastCentralSyncTimer = window.setTimeout(() => {
-      managerFastCentralSyncTimer = null;
-      managerFastCentralSyncPromise = managerFastCentralSyncPromise
-        .catch(() => {})
-        .then(() => flushFastManagerCentralSync())
-        .catch((error) => {
-          if (bibManager.classList.contains("ctca-manager-visible")) {
-            managerSetStatus(`Central database update failed: ${error?.message || String(error)}`, true);
-          }
-        });
-    }, Math.max(0, Number(delayMs) || 0));
+    // Manager edits remain local until Update Bib or the full-window manager is
+    // closed. This preserves the user's opening-time synchronization choices and
+    // prevents an entry from being pushed before the combined BibTeX file exists.
+    deferredProjectGlobalPush = true;
   }
 
   async function pauseFastManagerCentralSync() {
@@ -10300,6 +11672,7 @@
       suppressGlobalDatabaseStorageSync = false;
     }
     updateGlobalPendingUi(0, 0);
+    updateGlobalComparisonPendingUi(0);
   }
 
   async function preserveCurrentDocumentPendingGlobalChanges(identities) {
@@ -10375,13 +11748,12 @@
     return [...combined.values()];
   }
 
-  function updateGlobalPendingUi(count, revision = 0) {
-    globalDocumentPendingCount = Math.max(0, Number(count) || 0);
-    globalDocumentPendingRevision = Math.max(0, Number(revision) || 0);
+  function renderGlobalPendingUi() {
+    globalDocumentPendingCount = Math.max(globalDocumentFlagPendingCount, globalComparisonPendingCount);
     toolbarButton.classList.toggle("ctca-global-pending", globalDocumentPendingCount > 0);
     if (globalDocumentPendingCount > 0) {
       toolbarButton.dataset.globalPendingCount = globalDocumentPendingCount > 99 ? "99+" : String(globalDocumentPendingCount);
-      toolbarButton.title = `${globalDocumentPendingCount} global bibliography change${globalDocumentPendingCount === 1 ? "" : "s"} waiting to be synchronized`;
+      toolbarButton.title = `${globalDocumentPendingCount} bibliography difference${globalDocumentPendingCount === 1 ? "" : "s"} waiting to be reviewed`;
     } else {
       delete toolbarButton.dataset.globalPendingCount;
       toolbarButton.title = "Open bibliography manager";
@@ -10393,13 +11765,30 @@
     if (popup.classList.contains("ctca-visible")) renderSuggestions();
   }
 
+  function updateGlobalPendingUi(count, revision = 0) {
+    globalDocumentFlagPendingCount = Math.max(0, Number(count) || 0);
+    globalDocumentPendingRevision = Math.max(0, Number(revision) || 0);
+    renderGlobalPendingUi();
+  }
+
+  function updateGlobalComparisonPendingUi(count) {
+    globalComparisonPendingCount = Math.max(0, Number(count) || 0);
+    renderGlobalPendingUi();
+  }
+
+  function clearAllGlobalPendingUi() {
+    globalDocumentFlagPendingCount = 0;
+    globalComparisonPendingCount = 0;
+    globalDocumentPendingRevision = 0;
+    renderGlobalPendingUi();
+  }
+
   async function syncPendingGlobalChangesNow() {
     const returnTexFile = captureSelectedTexFile(managerOriginalFile);
     try {
-      const texState = await getManagerTexState();
+      const texState = await getManagerTexState({ background: true });
       const files = findBibliographyFiles(texState.value, texState.cursorIndex);
       if (!files.length) throw new Error("No bibliography file is configured in this document.");
-      await openFileAndWait(files[0]);
       window.clearTimeout(globalDatabaseSyncTimer);
       globalDatabaseSyncTimer = null;
       const result = await synchronizeProjectWithGlobalDatabase({ reason: "Sync now", announce: true, force: true });
@@ -10480,7 +11869,7 @@
     overlay.innerHTML = `
       <div class="ctca-document-bibliography-update-card">
         <span class="ctca-document-bibliography-update-spinner" aria-hidden="true"></span>
-        <span>Updating bib file</span>
+        <span class="ctca-document-bibliography-update-label">Updating bibliography…</span>
       </div>
     `;
     document.documentElement.appendChild(overlay);
@@ -10488,11 +11877,12 @@
     return overlay;
   }
 
-  function showDocumentBibliographyUpdateOverlay() {
-    hideGlobalBanner();
-    const overlay = ensureDocumentBibliographyUpdateOverlay();
-    overlay.classList.add("ctca-document-bibliography-update-visible");
-    overlay.setAttribute("aria-hidden", "false");
+  function showDocumentBibliographyUpdateOverlay(_message = "Updating bibliography…") {
+    // Long-running bibliography operations are indicated exclusively by the
+    // compact spinner on the [S] bib toolbar button. A full-window overlay
+    // blocks unrelated editor work and is intentionally no longer displayed.
+    hideDocumentBibliographyUpdateOverlay();
+    updateToolbarButtonState();
   }
 
   function hideDocumentBibliographyUpdateOverlay() {
@@ -10552,12 +11942,12 @@
         // same edit can look like an incoming global change. The close/update
         // transaction already applies it locally, so do not prompt for it.
         if (!globalDocumentWasPending && !managerIsApplyingChanges) {
-          showPendingGlobalSyncBanner();
+          // Pending central changes are surfaced when the full-window manager is
+          // opened. Normal editor work must not start synchronization dialogs.
           globalDocumentWasPending = true;
         }
-        if (allowAutomaticSync && (/\.bib$/i.test(String(currentState?.fileName || "")) || bibManager.classList.contains("ctca-manager-visible"))) {
-          scheduleGlobalDatabaseSync(0, "pending global changes became collectable", false, { force: true });
-        }
+        // Pending central changes are displayed, but never parsed/applied merely
+        // because the user is editing or has selected a BibTeX file.
       }
       return flag;
     } catch (error) {
@@ -10793,11 +12183,10 @@
       }
       const sharedResult = await globalThis.CollabTeXAttachmentStore.syncSharedCategories();
       if ((sharedResult.synchronized || sharedResult.errors.length) && settings.syncGlobalDatabase) {
-        await synchronizeProjectWithGlobalDatabase({
-          reason: "shared category synchronization",
-          force: true,
-          allowManagerSession: true
-        });
+        // Shared-category background refreshes never parse or synchronize the
+        // project bibliography. The next explicit bibliography sync includes
+        // the updated category metadata.
+        deferredProjectGlobalPush = true;
       }
       const recovered = managerNextcloudSyncFailureCount > 0;
       managerNextcloudSyncFailureCount = 0;
@@ -10864,14 +12253,6 @@
       }
     }
     managerNextcloudConnected = connected;
-    const projectCloudButton = document.querySelector("#ctca-project-cloud-button");
-    if (projectCloudButton) {
-      projectCloudButton.classList.toggle("ctca-nextcloud-connected", connected);
-      projectCloudButton.setAttribute("aria-pressed", connected ? "true" : "false");
-      projectCloudButton.title = connected
-        ? `Nextcloud connected as ${nc.loginName}; configure project-file access`
-        : "Configure Nextcloud for this Collabtex project";
-    }
     const active = Boolean(connected && nc.syncBibliography);
     managerNextcloudSyncEnabled = active;
     bibManager.querySelectorAll(".ctca-manager-nextcloud-sync-checkbox").forEach((checkbox) => {
@@ -11074,876 +12455,6 @@
   }
 
 
-  function projectNextcloudLinksKey() {
-    return `${storageKey()}${PROJECT_NEXTCLOUD_LINKS_SUFFIX}`;
-  }
-
-  function normalizeProjectNextcloudLink(value) {
-    if (!value || typeof value !== "object") return null;
-    const nextcloudPath = globalThis.CollabTeXAttachmentStore.normalizeNextcloudPath?.(value.nextcloudPath || "") || String(value.nextcloudPath || "");
-    const targetName = String(value.targetName || value.targetPath || "").split("/").pop().trim();
-    if (!nextcloudPath || !targetName) return null;
-    return {
-      id: String(value.id || globalThis.crypto?.randomUUID?.() || `nc-${Date.now()}-${Math.random().toString(36).slice(2)}`),
-      targetPath: String(value.targetPath || targetName),
-      targetName,
-      nextcloudPath,
-      nextcloudFileId: String(value.nextcloudFileId || ""),
-      etag: String(value.etag || ""),
-      size: Number(value.size) || 0,
-      lastModified: String(value.lastModified || ""),
-      syncedAt: String(value.syncedAt || ""),
-      pendingUpload: Boolean(value.pendingUpload)
-    };
-  }
-
-  async function loadProjectNextcloudLinks() {
-    const key = projectNextcloudLinksKey();
-    const value = (await extensionApi.storage.local.get(key))?.[key];
-    projectNextcloudLinks = (Array.isArray(value?.links) ? value.links : [])
-      .map(normalizeProjectNextcloudLink)
-      .filter(Boolean);
-    return projectNextcloudLinks;
-  }
-
-  function projectNextcloudMetadataDocument() {
-    return {
-      version: 1,
-      description: "Smart Citations Nextcloud project-file links. This file contains no credentials.",
-      updatedAt: new Date().toISOString(),
-      links: projectNextcloudLinks.map((link) => ({
-        id: link.id,
-        targetPath: link.targetPath,
-        targetName: link.targetName,
-        nextcloudPath: link.nextcloudPath,
-        nextcloudFileId: link.nextcloudFileId,
-        etag: link.etag,
-        size: link.size,
-        lastModified: link.lastModified,
-        syncedAt: link.syncedAt
-      }))
-    };
-  }
-
-  function scheduleProjectNextcloudMetadataWrite(delayMs = 2500) {
-    window.clearTimeout(projectNextcloudMetadataTimer);
-    projectNextcloudMetadataTimer = window.setTimeout(() => {
-      projectNextcloudMetadataTimer = null;
-      persistProjectNextcloudMetadataFile().catch((error) => {
-        console.warn("[Smart Citations] Could not persist Nextcloud project-file links:", error);
-      });
-    }, delayMs);
-  }
-
-  async function saveProjectNextcloudLinks({ persistProjectFile = true } = {}) {
-    await extensionApi.storage.local.set({
-      [projectNextcloudLinksKey()]: {
-        version: 1,
-        updatedAt: new Date().toISOString(),
-        links: projectNextcloudLinks
-      }
-    });
-    if (persistProjectFile) scheduleProjectNextcloudMetadataWrite();
-  }
-
-  async function persistProjectNextcloudMetadataFile() {
-    if (projectNextcloudMetadataWriteInProgress || !projectNextcloudLinks.length) return;
-    if (
-      findNativeProjectUploadDialogs().length ||
-      appDialog.classList.contains("ctca-app-dialog-visible") ||
-      startupAssistantCheckInProgress ||
-      projectBibliographySetupInProgress ||
-      refreshInProgress ||
-      jumpInProgress ||
-      managerBusy
-    ) {
-      scheduleProjectNextcloudMetadataWrite(3000);
-      return;
-    }
-    projectNextcloudMetadataWriteInProgress = true;
-    const originalFile = getSelectedFileName() || currentState?.fileName || "";
-    try {
-      if (!findFileButton(PROJECT_NEXTCLOUD_LINKS_FILE)) {
-        await createProjectFile(PROJECT_NEXTCLOUD_LINKS_FILE);
-      }
-      const state = await openFileAndWait(PROJECT_NEXTCLOUD_LINKS_FILE);
-      const serialized = `${JSON.stringify(projectNextcloudMetadataDocument(), null, 2)}\n`;
-      if (String(state.value || "") !== serialized) {
-        await replaceEditorRangeAndVerify({
-          fileName: PROJECT_NEXTCLOUD_LINKS_FILE,
-          start: 0,
-          end: String(state.value || "").length,
-          text: serialized,
-          expectedValue: serialized
-        });
-      }
-    } finally {
-      if (originalFile && originalFile !== PROJECT_NEXTCLOUD_LINKS_FILE) {
-        await restoreFile(originalFile).catch(() => {});
-      }
-      projectNextcloudMetadataWriteInProgress = false;
-    }
-  }
-
-  async function loadProjectNextcloudLinksFromMetadataFile() {
-    if (!findFileButton(PROJECT_NEXTCLOUD_LINKS_FILE)) return false;
-    const originalFile = getSelectedFileName() || currentState?.fileName || "";
-    try {
-      const text = await openAndReadFile(PROJECT_NEXTCLOUD_LINKS_FILE);
-      const value = JSON.parse(String(text || "{}"));
-      const fromProject = (Array.isArray(value?.links) ? value.links : [])
-        .map(normalizeProjectNextcloudLink)
-        .filter(Boolean);
-      if (!fromProject.length) return false;
-      const byIdentity = new Map(projectNextcloudLinks.map((link) => [link.id || `${link.targetPath}|${link.nextcloudPath}`, link]));
-      for (const link of fromProject) {
-        const key = link.id || `${link.targetPath}|${link.nextcloudPath}`;
-        byIdentity.set(key, { ...(byIdentity.get(key) || {}), ...link, pendingUpload: false });
-      }
-      projectNextcloudLinks = [...byIdentity.values()];
-      await saveProjectNextcloudLinks({ persistProjectFile: false });
-      scheduleProjectNextcloudUiRefresh();
-      return true;
-    } finally {
-      if (originalFile && originalFile !== PROJECT_NEXTCLOUD_LINKS_FILE) {
-        await restoreFile(originalFile).catch(() => {});
-      }
-    }
-  }
-
-  function showProjectCloudToast(message, isError = false) {
-    let toast = document.querySelector("#ctca-project-cloud-toast");
-    if (!toast) {
-      toast = document.createElement("div");
-      toast.id = "ctca-project-cloud-toast";
-      toast.setAttribute("role", "status");
-      toast.setAttribute("aria-live", "polite");
-      document.documentElement.appendChild(toast);
-    }
-    window.clearTimeout(projectCloudToastTimer);
-    toast.textContent = String(message || "");
-    toast.classList.toggle("ctca-project-cloud-toast-error", Boolean(isError));
-    toast.classList.add("ctca-project-cloud-toast-visible");
-    projectCloudToastTimer = window.setTimeout(() => {
-      toast.classList.remove("ctca-project-cloud-toast-visible");
-    }, isError ? 12000 : 7000);
-  }
-
-  function projectFileTreeItems() {
-    return [...document.querySelectorAll('.file-tree-list [role="treeitem"]')];
-  }
-
-  function projectFileTreeItemName(item) {
-    return String(
-      item?.getAttribute("data-path") ||
-      item?.getAttribute("data-file-path") ||
-      item?.getAttribute("aria-label") ||
-      item?.querySelector(".item-name-button span, .item-name span, .entity-name span")?.textContent ||
-      ""
-    ).trim();
-  }
-
-  function projectFileTreeItemBaseName(item) {
-    return projectFileTreeItemName(item).replace(/\\/g, "/").split("/").pop();
-  }
-
-  function findProjectFileTreeItem(linkOrName) {
-    const targetPath = typeof linkOrName === "string" ? linkOrName : linkOrName?.targetPath;
-    const targetName = (typeof linkOrName === "string" ? linkOrName : linkOrName?.targetName) || String(targetPath || "").split("/").pop();
-    const normalizedPath = String(targetPath || "").replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
-    return projectFileTreeItems().find((item) => {
-      const itemPath = projectFileTreeItemName(item).replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
-      return (normalizedPath && itemPath === normalizedPath) || projectFileTreeItemBaseName(item).toLowerCase() === String(targetName || "").toLowerCase();
-    }) || null;
-  }
-
-  function linkedRecordForTreeItem(item) {
-    const itemPath = projectFileTreeItemName(item).replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
-    const itemName = projectFileTreeItemBaseName(item).toLowerCase();
-    return projectNextcloudLinks.find((link) => {
-      const targetPath = String(link.targetPath || "").replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
-      return (targetPath && targetPath === itemPath) || String(link.targetName || "").toLowerCase() === itemName;
-    }) || null;
-  }
-
-  function clearProjectNextcloudTreeItemNameClasses(item) {
-    item.querySelectorAll(
-      ".ctca-nextcloud-linked-name-region, .ctca-nextcloud-linked-name-control, .ctca-nextcloud-linked-name-text"
-    ).forEach((element) => {
-      element.classList.remove(
-        "ctca-nextcloud-linked-name-region",
-        "ctca-nextcloud-linked-name-control",
-        "ctca-nextcloud-linked-name-text"
-      );
-    });
-  }
-
-  function decorateProjectNextcloudTreeItemName(item, link) {
-    clearProjectNextcloudTreeItemNameClasses(item);
-    const expectedName = String(link?.targetName || projectFileTreeItemBaseName(item)).trim();
-    if (!expectedName) return;
-    const candidates = [...item.querySelectorAll(
-      ".item-name-button span, .item-name, .entity-name span, [data-testid*='file-name'], [data-testid*='entity-name']"
-    )].filter((element) => String(element.textContent || "").trim() === expectedName);
-    const textElement = candidates.sort((left, right) =>
-      left.childElementCount - right.childElementCount
-    )[0];
-    if (!textElement) return;
-    textElement.classList.add("ctca-nextcloud-linked-name-text");
-    textElement.title = expectedName;
-    const control = textElement.closest(".item-name-button, button")
-      || textElement.closest(".item-name, [data-testid*='file-name'], [data-testid*='entity-name']");
-    control?.classList.add("ctca-nextcloud-linked-name-control");
-    textElement.closest(".entity-name")?.classList.add("ctca-nextcloud-linked-name-region");
-  }
-
-  function scheduleProjectNextcloudUiRefresh(delayMs = 80) {
-    window.clearTimeout(projectNextcloudUiTimer);
-    projectNextcloudUiTimer = window.setTimeout(() => {
-      projectNextcloudUiTimer = null;
-      refreshProjectNextcloudUi();
-    }, delayMs);
-  }
-
-  function injectProjectNextcloudFileButtons() {
-    for (const item of projectFileTreeItems()) {
-      const link = linkedRecordForTreeItem(item);
-      const existing = item.querySelector(":scope > .ctca-nextcloud-file-refresh, .ctca-nextcloud-file-refresh");
-      if (!link) {
-        existing?.remove();
-        item.classList.remove("ctca-nextcloud-linked-tree-item");
-        clearProjectNextcloudTreeItemNameClasses(item);
-        continue;
-      }
-      item.classList.add("ctca-nextcloud-linked-tree-item");
-      decorateProjectNextcloudTreeItemName(item, link);
-      if (existing) {
-        existing.dataset.linkId = link.id;
-        continue;
-      }
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "ctca-nextcloud-file-refresh";
-      button.dataset.linkId = link.id;
-      button.innerHTML = `
-        <svg viewBox="0 0 32 20" aria-hidden="true">
-          <path class="ctca-nextcloud-refresh-cloud" d="M2.5 14.5h11.2a3.3 3.3 0 0 0 .5-6.6A5.2 5.2 0 0 0 4.3 9.2a2.8 2.8 0 0 0-1.8 5.3Z"/>
-          <path class="ctca-nextcloud-refresh-arrow" d="M27.5 8.2A6 6 0 1 0 29 14M27.5 4.7v3.5H24"/>
-        </svg>`;
-      button.title = `Refresh ${link.targetName} from Nextcloud`;
-      button.setAttribute("aria-label", `Refresh ${link.targetName} from Nextcloud`);
-      button.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        refreshSingleProjectNextcloudFile(link.id).catch((error) => {
-          showProjectCloudToast(error.message || String(error), true);
-        });
-      });
-      item.appendChild(button);
-    }
-  }
-
-  function findProjectFileToolbar() {
-    return document.querySelector(".toolbar-filetree, .file-tree-toolbar-action-buttons, .file-tree-toolbar");
-  }
-
-  function injectProjectNextcloudUpdateAllButton() {
-    const toolbar = findProjectFileToolbar();
-    if (!toolbar) return;
-    let button = toolbar.querySelector(".ctca-nextcloud-update-all-files");
-    if (!button) {
-      button = document.createElement("button");
-      button.type = "button";
-      button.className = "ctca-nextcloud-update-all-files";
-      button.textContent = "☁↻";
-      button.title = "Update all linked project files from Nextcloud";
-      button.setAttribute("aria-label", "Update all linked project files from Nextcloud");
-      button.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        updateAllProjectNextcloudFiles().catch((error) => {
-          showProjectCloudToast(error.message || String(error), true);
-        });
-      });
-      toolbar.appendChild(button);
-    }
-    button.hidden = projectNextcloudLinks.length === 0;
-    button.disabled = projectNextcloudUpdateInProgress;
-  }
-
-  function findNativeProjectUploadDialogs() {
-    const result = new Map();
-    for (const input of document.querySelectorAll('input[type="file"]')) {
-      if (input.closest("#ctca-app-dialog, #ctca-bib-manager, #ctca-popup, .ctca-nextcloud-upload-source")) continue;
-      const dialog = input.closest('[role="dialog"], .modal, .modal-dialog, .modal-content') || input.parentElement;
-      if (!dialog || dialog.closest("#ctca-app-dialog, #ctca-bib-manager")) continue;
-      if (!isElementVisible(dialog) && !isElementVisible(input)) continue;
-      const contextText = [dialog.textContent, input.getAttribute("aria-label"), input.getAttribute("title")].filter(Boolean).join(" ");
-      if (!/upload|drop|browse|choose|select files?|hochladen|datei/i.test(contextText)) continue;
-      result.set(dialog, input);
-    }
-    return [...result.entries()];
-  }
-
-  async function closeNativeProjectUploadDialog(dialog) {
-    if (!dialog) return;
-    const directClose = dialog.querySelector(
-      '[data-bs-dismiss="modal"], [data-dismiss="modal"], .modal-header .btn-close, .modal-header .close, button[aria-label*="close" i], button[title*="close" i], button[aria-label*="schließ" i], button[title*="schließ" i]'
-    );
-    const closeButton = directClose || [...dialog.querySelectorAll("button")].find((candidate) => {
-      const labels = [
-        candidate.getAttribute("aria-label"),
-        candidate.getAttribute("title"),
-        candidate.textContent
-      ].filter(Boolean).map((value) => String(value).replace(/\s+/g, " ").trim());
-      return labels.some((label) =>
-        /^(close|cancel|dismiss|×|x|schließen|abbrechen)(?:\s+(?:modal|dialog|window|fenster))?$/i.test(label)
-      );
-    });
-    if (closeButton) closeButton.click();
-    else {
-      const escapeEvent = () => new KeyboardEvent("keydown", {
-        key: "Escape",
-        code: "Escape",
-        bubbles: true,
-        cancelable: true
-      });
-      dialog.dispatchEvent(escapeEvent());
-      document.dispatchEvent(escapeEvent());
-    }
-    await waitForCondition(() => !dialog.isConnected || !isElementVisible(dialog), 1800, 60);
-  }
-
-  function selectedProjectNextcloudLink() {
-    const selectedName = String(getSelectedFileName() || currentState?.fileName || "").replace(/\\/g, "/");
-    const normalized = selectedName.replace(/^\/+/, "").toLowerCase();
-    const baseName = normalized.split("/").pop();
-    return projectNextcloudLinks.find((link) => {
-      const targetPath = String(link.targetPath || "").replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
-      const targetName = String(link.targetName || "").toLowerCase();
-      return (normalized && targetPath === normalized) || (baseName && targetName === baseName);
-    }) || null;
-  }
-
-  function injectProjectNextcloudViewerRefreshButton() {
-    const link = selectedProjectNextcloudLink();
-    const existingButtons = [...document.querySelectorAll(".ctca-nextcloud-view-refresh")];
-    if (!link) {
-      existingButtons.forEach((button) => {
-        const parent = button.parentElement;
-        button.remove();
-        parent?.classList.remove("ctca-nextcloud-view-actions");
-      });
-      return;
-    }
-
-    const downloadButtons = [...document.querySelectorAll("button, a")].filter((candidate) => {
-      if (!isElementVisible(candidate) || candidate.closest("#ctca-app-dialog, #ctca-bib-manager, #ctca-popup")) return false;
-      const labels = [
-        candidate.getAttribute("aria-label"),
-        candidate.getAttribute("title"),
-        candidate.textContent
-      ].filter(Boolean).map((value) => String(value).replace(/\s+/g, " ").trim());
-      return labels.some((label) => /^(download|download file)$/i.test(label));
-    });
-
-    const validParents = new Set(downloadButtons.map((button) => button.parentElement).filter(Boolean));
-    existingButtons.forEach((button) => {
-      if (!validParents.has(button.parentElement)) {
-        const parent = button.parentElement;
-        button.remove();
-        parent?.classList.remove("ctca-nextcloud-view-actions");
-      }
-    });
-
-    for (const downloadButton of downloadButtons) {
-      const parent = downloadButton.parentElement;
-      if (!parent) continue;
-      parent.classList.add("ctca-nextcloud-view-actions");
-      const previous = parent.querySelector(":scope > .ctca-nextcloud-view-refresh");
-      if (previous?.dataset.linkId === link.id) continue;
-      previous?.remove();
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "ctca-nextcloud-view-refresh";
-      button.dataset.linkId = link.id;
-      button.textContent = "Refresh from NextCloud";
-      button.title = `Refresh ${link.targetName} from Nextcloud`;
-      button.setAttribute("aria-label", `Refresh ${link.targetName} from Nextcloud`);
-      button.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        refreshSingleProjectNextcloudFile(link.id).catch((error) => {
-          showProjectCloudToast(error.message || String(error), true);
-        });
-      });
-      downloadButton.insertAdjacentElement("afterend", button);
-    }
-  }
-
-  function injectNextcloudIntoNativeUploadDialogs() {
-    for (const [dialog, input] of findNativeProjectUploadDialogs()) {
-      if (dialog.querySelector(".ctca-nextcloud-upload-source")) continue;
-      const source = document.createElement("div");
-      source.className = "ctca-nextcloud-upload-source";
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "ctca-nextcloud-upload-source-button";
-      button.innerHTML = '<span aria-hidden="true">☁</span><span><strong>From Nextcloud</strong><small>Select files from your connected Nextcloud account</small></span>';
-      button.addEventListener("click", async (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        button.disabled = true;
-        const allowMultiple = input.multiple !== false;
-        try {
-          // The native Collabtex modal traps focus. Close it before opening an
-          // extension-owned dialog, then reopen a fresh upload input afterwards.
-          await closeNativeProjectUploadDialog(dialog);
-          const connected = await ensureProjectNextcloudConnection();
-          if (!connected) return;
-          const selected = await showNextcloudProjectFilePicker({ multiple: allowMultiple });
-          if (!selected?.length) return;
-          const freshInput = await openNativeProjectUploadInput();
-          await importNextcloudFilesThroughNativeInput(freshInput, selected);
-        } catch (error) {
-          showProjectCloudToast(error.message || String(error), true);
-        } finally {
-          button.disabled = false;
-        }
-      });
-      source.appendChild(button);
-      const anchor = input.closest(".form-group, .upload-area, .dropzone") || input;
-      anchor.parentElement?.insertBefore(source, anchor.nextSibling);
-    }
-  }
-
-  function refreshProjectNextcloudUi() {
-    injectNextcloudIntoNativeUploadDialogs();
-    injectProjectNextcloudFileButtons();
-    injectProjectNextcloudUpdateAllButton();
-    injectProjectNextcloudViewerRefreshButton();
-  }
-
-  function initializeProjectNextcloudUi() {
-    if (!projectNextcloudUiObserver) {
-      projectNextcloudUiObserver = new MutationObserver(() => scheduleProjectNextcloudUiRefresh());
-      projectNextcloudUiObserver.observe(document.documentElement, { childList: true, subtree: true });
-    }
-    refreshProjectNextcloudUi();
-  }
-
-  async function ensureProjectNextcloudConnection() {
-    let config = await globalThis.CollabTeXAttachmentStore.getConfig();
-    if (config.nextcloud?.appPassword) {
-      const connected = await globalThis.CollabTeXAttachmentStore.checkNextcloudConnection(config).catch(() => false);
-      if (connected) return true;
-    }
-    await managerOpenCloudSettings({ context: "project" });
-    config = await globalThis.CollabTeXAttachmentStore.getConfig();
-    return Boolean(
-      config.nextcloud?.appPassword &&
-      await globalThis.CollabTeXAttachmentStore.checkNextcloudConnection(config).catch(() => false)
-    );
-  }
-
-  function formatProjectCloudFileSize(bytes) {
-    const value = Number(bytes) || 0;
-    if (value < 1024) return `${value} B`;
-    if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} kB`;
-    if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
-    return `${(value / 1024 ** 3).toFixed(1)} GB`;
-  }
-
-  function formatProjectCloudDate(value) {
-    const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? "" : date.toLocaleString();
-  }
-
-  async function showNextcloudProjectFilePicker({ multiple = true } = {}) {
-    const selected = new Map();
-    let currentPath = "";
-    let currentEntries = [];
-    let loading = false;
-    let listNode, breadcrumbNode, statusNode, searchInput;
-    let searchRenderTimer = null;
-    let searchQuery = "";
-    let loadError = "";
-
-    const result = await showAppDialog({
-      title: "Select files from Nextcloud",
-      message: "Browse your personal Nextcloud files. Selected files are downloaded and passed to Collabtex's native upload process.",
-      controls: (container) => {
-        const picker = document.createElement("div");
-        picker.className = "ctca-nextcloud-file-picker";
-        picker.innerHTML = `
-          <div class="ctca-nextcloud-picker-toolbar">
-            <button type="button" class="ctca-nextcloud-picker-up" title="Parent directory" aria-label="Parent directory">↑</button>
-            <div class="ctca-nextcloud-picker-breadcrumb"></div>
-            <input type="search" class="ctca-nextcloud-picker-search" placeholder="Filter this directory">
-          </div>
-          <div class="ctca-nextcloud-picker-list" role="listbox"></div>
-          <div class="ctca-nextcloud-picker-status"></div>`;
-        container.appendChild(picker);
-        listNode = picker.querySelector(".ctca-nextcloud-picker-list");
-        breadcrumbNode = picker.querySelector(".ctca-nextcloud-picker-breadcrumb");
-        statusNode = picker.querySelector(".ctca-nextcloud-picker-status");
-        searchInput = picker.querySelector(".ctca-nextcloud-picker-search");
-
-        const updatePrimaryState = () => {
-          const primary = appDialog.querySelector(".ctca-app-dialog-primary");
-          if (primary) primary.disabled = loading || selected.size === 0;
-          statusNode.textContent = loading
-            ? "Loading Nextcloud directory…"
-            : loadError || `${selected.size} file${selected.size === 1 ? "" : "s"} selected`;
-          statusNode.classList.toggle("ctca-nextcloud-picker-status-error", Boolean(loadError));
-        };
-
-        const renderBreadcrumb = () => {
-          breadcrumbNode.replaceChildren();
-          const rootButton = document.createElement("button");
-          rootButton.type = "button";
-          rootButton.textContent = "Nextcloud";
-          rootButton.addEventListener("click", () => loadDirectory(""));
-          breadcrumbNode.appendChild(rootButton);
-          let accumulated = "";
-          for (const part of currentPath.split("/").filter(Boolean)) {
-            breadcrumbNode.append(" / ");
-            accumulated = accumulated ? `${accumulated}/${part}` : part;
-            const segmentPath = accumulated;
-            const segmentButton = document.createElement("button");
-            segmentButton.type = "button";
-            segmentButton.textContent = part;
-            segmentButton.addEventListener("click", () => loadDirectory(segmentPath));
-            breadcrumbNode.appendChild(segmentButton);
-          }
-        };
-
-        const renderEntries = () => {
-          const filter = String(searchQuery || "").trim().toLocaleLowerCase();
-          listNode.replaceChildren();
-          const visible = currentEntries.filter((entry) => !filter || entry.name.toLocaleLowerCase().includes(filter));
-          if (!visible.length && !loading) {
-            const empty = document.createElement("div");
-            empty.className = "ctca-nextcloud-picker-empty";
-            empty.textContent = filter ? "No matching files in this directory." : "This directory is empty.";
-            listNode.appendChild(empty);
-          }
-          for (const entry of visible) {
-            const row = document.createElement("div");
-            row.className = "ctca-nextcloud-picker-row";
-            row.dataset.path = entry.path;
-            const selection = document.createElement("input");
-            selection.type = multiple ? "checkbox" : "radio";
-            selection.name = multiple ? "" : "ctca-nextcloud-single-file";
-            selection.disabled = entry.isDirectory;
-            selection.checked = selected.has(entry.path);
-            selection.setAttribute("aria-label", `Select ${entry.name}`);
-            selection.addEventListener("change", () => {
-              if (!multiple) selected.clear();
-              if (selection.checked) selected.set(entry.path, entry);
-              else selected.delete(entry.path);
-              if (!multiple) renderEntries();
-              updatePrimaryState();
-            });
-            const icon = document.createElement("span");
-            icon.className = "ctca-nextcloud-picker-icon";
-            icon.textContent = entry.isDirectory ? "📁" : "📄";
-            const name = document.createElement("button");
-            name.type = "button";
-            name.className = "ctca-nextcloud-picker-name";
-            name.textContent = entry.name;
-            if (entry.isDirectory) {
-              name.addEventListener("click", () => loadDirectory(entry.path));
-              row.addEventListener("dblclick", () => loadDirectory(entry.path));
-            } else {
-              name.addEventListener("click", () => {
-                if (!multiple) selected.clear();
-                if (selected.has(entry.path)) selected.delete(entry.path);
-                else selected.set(entry.path, entry);
-                renderEntries();
-                updatePrimaryState();
-              });
-            }
-            const meta = document.createElement("span");
-            meta.className = "ctca-nextcloud-picker-meta";
-            meta.textContent = entry.isDirectory
-              ? formatProjectCloudDate(entry.lastModified)
-              : [formatProjectCloudFileSize(entry.size), formatProjectCloudDate(entry.lastModified)].filter(Boolean).join(" · ");
-            row.append(selection, icon, name, meta);
-            listNode.appendChild(row);
-          }
-          updatePrimaryState();
-        };
-
-        const loadDirectory = async (path) => {
-          if (loading) return;
-          loading = true;
-          currentPath = globalThis.CollabTeXAttachmentStore.normalizeNextcloudPath(path);
-          renderBreadcrumb();
-          renderEntries();
-          try {
-            currentEntries = await globalThis.CollabTeXAttachmentStore.listNextcloudDirectory(currentPath);
-            loadError = "";
-          } catch (error) {
-            currentEntries = [];
-            loadError = error.message || String(error);
-          } finally {
-            loading = false;
-            renderEntries();
-          }
-        };
-
-        picker.querySelector(".ctca-nextcloud-picker-up").addEventListener("click", () => {
-          const parts = currentPath.split("/").filter(Boolean);
-          parts.pop();
-          loadDirectory(parts.join("/"));
-        });
-        searchInput.addEventListener("input", () => {
-          window.clearTimeout(searchRenderTimer);
-          searchRenderTimer = window.setTimeout(() => {
-            searchRenderTimer = null;
-            searchQuery = searchInput.value || "";
-            renderEntries();
-          }, SEARCH_RENDER_DELAY_MS);
-        });
-        window.setTimeout(() => loadDirectory(""), 0);
-      },
-      buttons: [
-        { label: "Cancel", value: null },
-        { label: "Add selected", primary: true, getValue: () => [...selected.values()] }
-      ],
-      closeValue: null,
-      dialogClass: "ctca-nextcloud-picker-dialog-card"
-    });
-    return Array.isArray(result) ? result : null;
-  }
-
-  async function importNextcloudFilesThroughNativeInput(input, entries) {
-    if (!input || !entries.length) return;
-    showProjectCloudToast(`Downloading ${entries.length} file${entries.length === 1 ? "" : "s"} from Nextcloud…`);
-    const files = [];
-    const links = [];
-    for (const entry of entries) {
-      const downloaded = await globalThis.CollabTeXAttachmentStore.downloadNextcloudFile(entry.path);
-      const info = { ...entry, ...(downloaded.info || {}) };
-      const file = new File([downloaded.blob], entry.name, {
-        type: info.contentType || downloaded.blob.type || "application/octet-stream",
-        lastModified: info.lastModified ? (new Date(info.lastModified).getTime() || Date.now()) : Date.now()
-      });
-      files.push(file);
-      links.push(normalizeProjectNextcloudLink({
-        targetPath: entry.name,
-        targetName: entry.name,
-        nextcloudPath: entry.path,
-        nextcloudFileId: info.fileId,
-        etag: info.etag,
-        size: info.size || file.size,
-        lastModified: info.lastModified,
-        syncedAt: new Date().toISOString(),
-        pendingUpload: true
-      }));
-    }
-
-    if (!input.multiple && files.length > 1) files.splice(1);
-    const transfer = new DataTransfer();
-    for (const file of files) transfer.items.add(file);
-    input.files = transfer.files;
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-
-    for (const link of links.slice(0, files.length)) {
-      const existingIndex = projectNextcloudLinks.findIndex((candidate) => candidate.targetName.toLowerCase() === link.targetName.toLowerCase());
-      if (existingIndex >= 0) projectNextcloudLinks[existingIndex] = { ...projectNextcloudLinks[existingIndex], ...link };
-      else projectNextcloudLinks.push(link);
-    }
-    await saveProjectNextcloudLinks();
-
-    window.setTimeout(async () => {
-      let changed = false;
-      for (const link of projectNextcloudLinks) {
-        if (!link.pendingUpload) continue;
-        const item = findProjectFileTreeItem(link);
-        if (!item) continue;
-        link.targetPath = projectFileTreeItemName(item) || link.targetName;
-        link.pendingUpload = false;
-        changed = true;
-      }
-      if (changed) await saveProjectNextcloudLinks();
-      scheduleProjectNextcloudUiRefresh();
-    }, 2500);
-    showProjectCloudToast(`${files.length} Nextcloud file${files.length === 1 ? "" : "s"} handed to Collabtex for upload.`);
-  }
-
-  function findNativeProjectUploadButton() {
-    const buttons = [...document.querySelectorAll(
-      ".toolbar-filetree button, .file-tree-toolbar-action-buttons button, .file-tree-toolbar button, button"
-    )];
-    return buttons.find((button) => {
-      if (!isElementVisible(button) || button.closest("#ctca-app-dialog, #ctca-bib-manager")) return false;
-      const label = [button.getAttribute("aria-label"), button.getAttribute("title"), button.textContent].filter(Boolean).join(" ");
-      return /upload( files?)?|datei(en)? hochladen/i.test(label);
-    }) || null;
-  }
-
-  async function openNativeProjectUploadInput() {
-    const button = findNativeProjectUploadButton();
-    if (!button) throw new Error("The Collabtex file-upload button could not be found.");
-    button.click();
-    const input = await waitForCondition(() => {
-      const dialogs = findNativeProjectUploadDialogs();
-      return dialogs.map((entry) => entry[1]).find(Boolean) || null;
-    }, 8000, 100);
-    if (!input) throw new Error("The Collabtex upload dialog did not expose a file input.");
-    return input;
-  }
-
-  async function acceptNativeOverwritePrompt(fileName) {
-    const startedAt = Date.now();
-    const deadline = startedAt + 4000;
-    while (Date.now() < deadline) {
-      const dialogs = [...document.querySelectorAll('[role="dialog"], .modal, .modal-dialog, .modal-content')]
-        .filter((dialog) => !dialog.closest("#ctca-app-dialog") && isElementVisible(dialog));
-      for (const dialog of dialogs) {
-        const text = dialog.textContent || "";
-        if (!/exist|already|replace|overwrite|conflict|besteh|ersetzen|überschreiben/i.test(text)) continue;
-        if (fileName && !text.toLowerCase().includes(fileName.toLowerCase()) && dialogs.length > 1) continue;
-        const button = [...dialog.querySelectorAll("button")].find((candidate) =>
-          /^(replace|overwrite|upload|ersetzen|überschreiben)$/i.test((candidate.textContent || "").trim())
-        );
-        if (button) {
-          button.click();
-          return true;
-        }
-      }
-      if (Date.now() - startedAt > 900 && findNativeProjectUploadDialogs().length === 0) return false;
-      await delay(150);
-    }
-    return false;
-  }
-
-  async function uploadReplacementToCollabtex(link, file) {
-    const item = findProjectFileTreeItem(link);
-    const selectable = item?.querySelector(".item-name-button, button, [role='button']") || item;
-    selectable?.click?.();
-    await delay(150);
-    const input = await openNativeProjectUploadInput();
-    const transfer = new DataTransfer();
-    transfer.items.add(file);
-    input.files = transfer.files;
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-    await acceptNativeOverwritePrompt(link.targetName);
-    await delay(800);
-  }
-
-  async function refreshSingleProjectNextcloudFile(linkId, { skipConfirmation = false, knownInfo = null } = {}) {
-    if (projectNextcloudUpdateInProgress && !skipConfirmation) {
-      throw new Error("A Nextcloud project-file update is already running.");
-    }
-    const link = projectNextcloudLinks.find((candidate) => candidate.id === linkId);
-    if (!link) throw new Error("The Nextcloud link for this project file was not found.");
-    const info = knownInfo || await globalThis.CollabTeXAttachmentStore.getNextcloudFileInfo(link.nextcloudPath);
-    if (info.isDirectory) throw new Error("The linked Nextcloud source is a directory, not a file.");
-    if (link.etag && info.etag && link.etag === info.etag) {
-      if (!skipConfirmation) showProjectCloudToast(`${link.targetName} is already up to date.`);
-      return "unchanged";
-    }
-
-    if (!skipConfirmation) {
-      const confirmed = await showAppDialog({
-        title: "Refresh project file from Nextcloud",
-        message: `Replace ${link.targetName} with the latest Nextcloud version?\n\nNextcloud source: /${link.nextcloudPath}\nModified: ${formatProjectCloudDate(info.lastModified) || "unknown"}\nSize: ${formatProjectCloudFileSize(info.size)}`,
-        buttons: [
-          { label: "Cancel", value: false },
-          { label: "Replace from Nextcloud", primary: true, value: true }
-        ],
-        closeValue: false
-      });
-      if (!confirmed) return "cancelled";
-    }
-
-    const downloaded = await globalThis.CollabTeXAttachmentStore.downloadNextcloudFile(link.nextcloudPath);
-    const mergedInfo = { ...info, ...(downloaded.info || {}) };
-    const file = new File([downloaded.blob], link.targetName, {
-      type: mergedInfo.contentType || downloaded.blob.type || "application/octet-stream",
-      lastModified: mergedInfo.lastModified ? (new Date(mergedInfo.lastModified).getTime() || Date.now()) : Date.now()
-    });
-    await uploadReplacementToCollabtex(link, file);
-    Object.assign(link, {
-      etag: mergedInfo.etag || info.etag || link.etag,
-      nextcloudFileId: mergedInfo.fileId || info.fileId || link.nextcloudFileId,
-      size: mergedInfo.size || file.size,
-      lastModified: mergedInfo.lastModified || info.lastModified,
-      syncedAt: new Date().toISOString(),
-      pendingUpload: false
-    });
-    await saveProjectNextcloudLinks();
-    scheduleProjectNextcloudUiRefresh();
-    if (!skipConfirmation) showProjectCloudToast(`${link.targetName} was refreshed from Nextcloud.`);
-    return "updated";
-  }
-
-  async function updateAllProjectNextcloudFiles() {
-    if (projectNextcloudUpdateInProgress) return;
-    if (!projectNextcloudLinks.length) {
-      showProjectCloudToast("This project has no files linked to Nextcloud.");
-      return;
-    }
-    if (!(await ensureProjectNextcloudConnection())) throw new Error("Nextcloud is not connected.");
-    projectNextcloudUpdateInProgress = true;
-    injectProjectNextcloudUpdateAllButton();
-    const changed = [];
-    let unavailable = 0;
-    try {
-      showProjectCloudToast(`Checking ${projectNextcloudLinks.length} linked file${projectNextcloudLinks.length === 1 ? "" : "s"}…`);
-      for (const link of projectNextcloudLinks) {
-        try {
-          const info = await globalThis.CollabTeXAttachmentStore.getNextcloudFileInfo(link.nextcloudPath);
-          if (!link.etag || !info.etag || link.etag !== info.etag) changed.push({ link, info });
-        } catch (_error) {
-          unavailable += 1;
-        }
-      }
-      if (!changed.length) {
-        showProjectCloudToast(
-          unavailable
-            ? `All reachable linked files are current; ${unavailable} source${unavailable === 1 ? " is" : "s are"} unavailable.`
-            : "All linked Nextcloud files are already current."
-        );
-        return;
-      }
-      const confirmed = await showAppDialog({
-        title: "Update all Nextcloud project files",
-        message: `${changed.length} linked file${changed.length === 1 ? " has" : "s have"} a newer or changed Nextcloud source. Replace the corresponding Collabtex files now?${unavailable ? `\n\n${unavailable} source${unavailable === 1 ? " is" : "s are"} currently unavailable and will be skipped.` : ""}`,
-        buttons: [
-          { label: "Cancel", value: false },
-          { label: `Update ${changed.length} file${changed.length === 1 ? "" : "s"}`, primary: true, value: true }
-        ],
-        closeValue: false
-      });
-      if (!confirmed) return;
-
-      let updated = 0;
-      let failed = 0;
-      for (const { link, info } of changed) {
-        showProjectCloudToast(`Updating ${link.targetName} from Nextcloud (${updated + failed + 1}/${changed.length})…`);
-        try {
-          const state = await refreshSingleProjectNextcloudFile(link.id, { skipConfirmation: true, knownInfo: info });
-          if (state === "updated") updated += 1;
-        } catch (_error) {
-          failed += 1;
-        }
-      }
-      showProjectCloudToast(
-        `Nextcloud update complete: ${updated} updated, ${Math.max(0, projectNextcloudLinks.length - changed.length - unavailable)} already current, ${failed + unavailable} unavailable or failed.`,
-        failed > 0
-      );
-    } finally {
-      projectNextcloudUpdateInProgress = false;
-      injectProjectNextcloudUpdateAllButton();
-    }
-  }
-
   async function saveGlobalDatabase(entries, {
     categoryState = null,
     replaceCategoryState = false,
@@ -12051,9 +12562,22 @@
   }
 
   function globalItemsFromCurrentDocument() {
-    if (bibManager.classList.contains("ctca-manager-visible") && managerDrafts.size) {
+    // Once the project bibliography has been parsed, managerDrafts is the
+    // authoritative in-memory representation even while the full-window manager
+    // is hidden. Central additions and conflict choices are applied there before
+    // the background write. Falling back to `records` at that point would compare
+    // the central database against the pre-dialog state and could create false
+    // conflicts after the next page reload.
+    const managerStateIsAuthoritative = managerDrafts.size > 0 && (
+      managerInitialOpenParsed ||
+      bibManager.classList.contains("ctca-manager-visible") ||
+      managerGlobalSyncSession ||
+      managerDirtyIds.size > 0 ||
+      managerDeletedDrafts.size > 0
+    );
+    if (managerStateIsAuthoritative) {
       return [...managerDrafts.values()]
-        .filter((draft) => draft.centralPreview !== true)
+        .filter((draft) => draft.centralPreview !== true && !managerDeletedDrafts.has(draft.id))
         .map(globalItemFromDraft);
     }
     return records
@@ -12089,28 +12613,29 @@
       managerSetStatus("Central synchronization enabled. Central changes are shown as previews and are applied only by Update Bib or after closing.");
       await registerCurrentDocumentWithGlobalDatabase();
       await checkCurrentDocumentGlobalFlag({ allowAutomaticSync: false });
+      await parseBibliographyOnPageLoad().catch(() => null);
+      await notifyPageLoadGlobalDiffs();
       refreshManagerPendingHighlights().catch(() => {});
     } else if (!settings.syncGlobalDatabase) {
-      updateGlobalPendingUi(0, 0);
+      clearAllGlobalPendingUi();
       managerSetStatus("Global database synchronization disabled.");
     }
   }
 
   async function askWhetherToPushDocumentChangesToGlobal({ reason = "document changes" } = {}) {
     if (!settings.syncGlobalDatabase) return "skip";
-    if (bibManager.classList.contains("ctca-manager-visible")) {
-      deferredProjectGlobalPush = true;
-      return "deferred";
-    }
-    if (/\.bib$/i.test(String(currentState?.fileName || ""))) {
-      scheduleGlobalDatabaseSync(0, reason, true);
-      return "sync";
-    }
+    // Normal editor activity never starts a bibliography parse or opens a sync
+    // dialog. The pending local push is handled on Update Bib, manager close,
+    // or an explicit Sync now action.
     deferredProjectGlobalPush = true;
     return "deferred";
   }
 
-  async function saveManagerEntriesToGlobalDatabase({ source = "manual", skipPrompt = false } = {}) {
+  async function saveManagerEntriesToGlobalDatabase({
+    source = "manual",
+    skipPrompt = false,
+    promptEntrySelection = true
+  } = {}) {
     if (managerBusy) return;
     if (!skipPrompt) {
       const pending = await loadGlobalPendingState();
@@ -12125,9 +12650,22 @@
       const globalEntries = await loadGlobalDatabase();
       const byIdentity = new Map(globalEntries.map((entry) => [globalSyncIdentity(entry), entry]));
       const documentKeyToGlobalKey = new Map();
+      let documentItems = globalItemsFromCurrentDocument();
+      if (promptEntrySelection && documentItems.length) {
+        const selected = await choosePendingLocalPushes(documentItems);
+        if (selected === null) {
+          managerSetStatus("Central database update cancelled.");
+          return;
+        }
+        documentItems = documentItems.filter((item) => selected.has(globalSyncIdentity(item)));
+      }
+      if (!documentItems.length) {
+        managerSetStatus("No document bibliography entries were selected for the central database.");
+        return;
+      }
       let added = 0;
       let mergedCount = 0;
-      for (const incoming of globalItemsFromCurrentDocument()) {
+      for (const incoming of documentItems) {
         const identity = globalSyncIdentity(incoming);
         const existing = byIdentity.get(identity);
         if (existing) {
@@ -12241,7 +12779,7 @@
         const key = uniquePulledKey(item.key, reserved);
         reserved.add(key.toLowerCase());
         const cleanFields = Object.fromEntries(Object.entries(item.fields || {}).filter(([name]) => !CTCA_INTERNAL_FIELDS.has(name)));
-        const syntheticRecord = { key, type: item.type || "misc", sourceFile: targetFile, fields: Object.fromEntries(Object.entries(cleanFields).map(([name, value]) => [name, managerWrapBibValue(value)])) };
+        const syntheticRecord = { key, type: item.type || "misc", sourceFile: targetFile, fields: Object.fromEntries(Object.entries(cleanFields).map(([name, value]) => [name, managerWrapBibValue(value, name)])) };
         const draft = draftFromRecord(syntheticRecord);
         draft.originalKey = "";
         draft.key = key;
@@ -12282,44 +12820,131 @@
   }
 
   function globalSyncIdentity(item) {
-    // Synchronization records are keyed by citation key so that two BibTeX
-    // entries with the same DOI remain distinct. DOI identity is reserved for
-    // explicit deletion tombstones only.
-    return `key:${String(item?.key || "").trim().toLowerCase()}`;
+    // A bibliography entry is identified by DOI whenever one is available.
+    // Citation key is used only for entries without a DOI.
+    return globalIdentity(item);
+  }
+
+  function hasBalancedOuterBibBraces(text) {
+    if (!text.startsWith("{") || !text.endsWith("}")) return false;
+    let depth = 0;
+    let escaped = false;
+    for (let index = 0; index < text.length; index += 1) {
+      const character = text[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (character === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (character === "{") depth += 1;
+      else if (character === "}") depth -= 1;
+      if (depth === 0 && index < text.length - 1) return false;
+      if (depth < 0) return false;
+    }
+    return depth === 0;
+  }
+
+  function hasBalancedOuterBibQuotes(text) {
+    if (!text.startsWith('"') || !text.endsWith('"')) return false;
+    let escaped = false;
+    for (let index = 1; index < text.length - 1; index += 1) {
+      const character = text[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (character === "\\") escaped = true;
+      else if (character === '"') return false;
+    }
+    return !escaped;
+  }
+
+  function normalizeGlobalBibFieldValue(name, value) {
+    let text = String(value ?? "").normalize("NFC").replace(/\r\n?/g, "\n").trim();
+    // The parser, manager drafts and central store may represent the same value
+    // with different outer BibTeX delimiters. Remove only wrappers that enclose
+    // the complete value; braces inside the value remain significant.
+    for (let pass = 0; pass < 8 && text.length >= 2; pass += 1) {
+      if (hasBalancedOuterBibBraces(text) || hasBalancedOuterBibQuotes(text)) text = text.slice(1, -1).trim();
+      else break;
+    }
+    text = text.replace(/\s+/g, " ").trim();
+    const fieldName = String(name || "").trim().toLowerCase();
+    if (fieldName === "doi") return normalizeDoiInput(text).toLowerCase();
+    return text;
+  }
+
+  function canonicalGlobalRichTextItem(item) {
+    const fallbackHtml = managerEscapeHtml(String(item?.text || "")).replace(/\r?\n/g, "<br>");
+    const html = managerSanitizeRichTextHtml(item?.html != null ? item.html : fallbackHtml);
+    return {
+      text: managerRichTextPlainText(html).normalize("NFC").replace(/\s+/g, " ").trim(),
+      html,
+      style: managerNormalizeRichTextStyle(item?.style)
+    };
   }
 
   function canonicalGlobalItem(item) {
-    const fields = Object.fromEntries(
-      Object.entries(item?.fields || {})
-        .filter(([name]) => !CTCA_INTERNAL_FIELDS.has(name))
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([name, value]) => [name, String(value ?? "")])
-    );
-    const key = String(item?.key || "");
-    const aliasesByIdentity = new Map();
-    for (const alias of [...(item?.aliases || []), ...splitAliasKeys(fields.ids || "")]) {
-      const trimmed = String(alias || "").trim();
-      const identity = trimmed.toLowerCase();
-      if (!identity || identity === key.trim().toLowerCase()) continue;
-      if (!aliasesByIdentity.has(identity)) aliasesByIdentity.set(identity, trimmed);
+    const fieldsByName = new Map();
+    for (const [rawName, rawValue] of Object.entries(item?.fields || {})) {
+      const name = String(rawName || "").trim().toLowerCase();
+      if (!name || CTCA_INTERNAL_FIELDS.has(name)) continue;
+      const value = normalizeGlobalBibFieldValue(name, rawValue);
+      if (value) fieldsByName.set(name, value);
     }
-    const aliases = [...aliasesByIdentity.values()].sort((left, right) => left.localeCompare(right));
-    if (aliases.length) fields.ids = aliases.join(", ");
-    else delete fields.ids;
+    const fields = Object.fromEntries([...fieldsByName.entries()].sort(([left], [right]) => left.localeCompare(right)));
+    const doi = normalizeDoiInput(fields.doi || item?.doi || "").toLowerCase();
+    const key = String(item?.key || "").trim();
     return {
-      key,
-      type: String(item?.type || "misc"),
+      // For DOI-less entries, the normalized citation key already defines the
+      // identity and must not create a second, case/whitespace-sensitive diff.
+      // With a DOI, a genuinely different citation key remains a record change.
+      key: doi ? key : key.toLowerCase(),
+      type: String(item?.type || "misc").trim().toLowerCase(),
       fields,
-      aliases,
-      tags: globalThis.CollabTeXSearchTools.splitTags(item?.tags || []).slice().sort(),
+      // aliases is synchronization metadata. Only an explicit BibTeX `ids`
+      // field participates in equality through `fields`; generated aliases do not.
+      tags: globalThis.CollabTeXSearchTools.splitTags(item?.tags || [])
+        .map((tag) => String(tag || "").normalize("NFC").replace(/\s+/g, " ").trim().toLowerCase())
+        .filter(Boolean)
+        .sort(),
       comments: (Array.isArray(item?.comments) ? item.comments : [])
-        .map((comment, index) => managerNormalizeRichTextItem(comment, index, "comment")),
-      crosslinks: (Array.isArray(item?.crosslinks) ? item.crosslinks : []).map((key) => String(key || "").trim()).filter(Boolean)
+        .map(canonicalGlobalRichTextItem),
+      crosslinks: [...new Set((Array.isArray(item?.crosslinks) ? item.crosslinks : [])
+        .map((entryKey) => String(entryKey || "").trim().toLowerCase())
+        .filter(Boolean))]
+        .sort()
+    };
+  }
+
+  function canonicalGlobalComparableItem(item) {
+    const canonical = canonicalGlobalItem(item);
+    const fields = Object.fromEntries(
+      Object.entries(canonical.fields || {})
+        .filter(([name]) => !GLOBAL_SYNC_COMPARISON_IGNORED_FIELDS.has(name))
+    );
+    return {
+      // Identity is compared separately by globalSyncIdentity(). Repeating the
+      // citation key here is both redundant and incorrect for DOI entries whose
+      // key had to be changed locally to avoid a collision.
+      type: canonical.type,
+      fields,
+      tags: canonical.tags,
+      // Rich-text HTML can be reserialized by the manager without changing the
+      // visible comment. Compare normalized text and style, not representation.
+      comments: (canonical.comments || []).map((comment) => ({
+        text: comment.text,
+        style: comment.style
+      })),
+      crosslinks: canonical.crosslinks
     };
   }
 
   function globalItemFingerprint(item) {
-    return item ? JSON.stringify(canonicalGlobalItem(item)) : "";
+    return item ? JSON.stringify(canonicalGlobalComparableItem(item)) : "";
   }
 
   function changedGlobalEntryIdentities(globalItems, snapshotItems, localItems = [], limit = Number.POSITIVE_INFINITY) {
@@ -12460,7 +13085,18 @@
     return merged;
   }
 
-  function resolveThreeWayGlobalSync(localItems, globalItems, snapshotItems, deletedEntries = []) {
+  function resolveThreeWayGlobalSync(
+    localItems,
+    globalItems,
+    snapshotItems,
+    deletedEntries = [],
+    { excludedLocalPushIdentities = new Set() } = {}
+  ) {
+    const excludedLocalPushes = new Set(
+      [...(excludedLocalPushIdentities || [])]
+        .map((identity) => String(identity || "").trim().toLowerCase())
+        .filter(Boolean)
+    );
     const localByIdentity = new Map((localItems || []).map((item) => [globalSyncIdentity(item), item]));
     const globalByIdentity = new Map((globalItems || []).map((item) => [globalSyncIdentity(item), item]));
     const tombstoneByDeletionIdentity = new Map(
@@ -12476,6 +13112,7 @@
     let conflicts = 0;
     let localChanges = 0;
     let globalChanges = 0;
+    const localChangeIdentities = new Set();
 
     for (const identity of identities) {
       const localItem = localByIdentity.get(identity) || null;
@@ -12503,8 +13140,13 @@
         const localChanged = globalItemFingerprint(localItem) !== globalItemFingerprint(baseItem);
         const globalChanged = globalItemFingerprint(globalItem) !== globalItemFingerprint(baseItem);
         if (localChanged && !globalChanged) {
-          resolved.push(mergeLocalChangeIntoGlobal(globalItem, localItem));
-          localChanges += 1;
+          if (excludedLocalPushes.has(identity)) {
+            resolved.push(globalItem);
+          } else {
+            resolved.push(mergeLocalChangeIntoGlobal(globalItem, localItem));
+            localChanges += 1;
+            localChangeIdentities.add(identity);
+          }
         } else {
           resolved.push(globalItem);
           if (globalChanged) globalChanges += 1;
@@ -12527,9 +13169,10 @@
 
       // Absence from global storage is never deletion. The document record is
       // pushed to global storage, including records without a DOI.
-      if (localItem) {
+      if (localItem && !excludedLocalPushes.has(identity)) {
         resolved.push(localItem);
         localChanges += 1;
+        localChangeIdentities.add(identity);
       }
     }
 
@@ -12546,7 +13189,14 @@
       return clone;
     });
 
-    return { entries: normalized, deletions, conflicts, localChanges, globalChanges };
+    return {
+      entries: normalized,
+      deletions,
+      conflicts,
+      localChanges,
+      globalChanges,
+      localChangeIdentities: [...localChangeIdentities]
+    };
   }
 
   function draftSyncPayload(draft) {
@@ -12565,32 +13215,10 @@
     });
   }
 
-  async function confirmGlobalTombstoneDeletions(deletions) {
-    if (!Array.isArray(deletions) || deletions.length < GLOBAL_DELETION_CONFIRM_THRESHOLD) return true;
-    const preview = deletions.slice(0, 12).map(({ local, identity }) => {
-      const title = stripOneBibDelimiter(local?.fields?.title || "Untitled reference");
-      return `<li><strong>${managerEscapeHtml(local?.key || identity)}</strong><span>${managerEscapeHtml(title)}</span></li>`;
-    }).join("");
-    const remainder = deletions.length > 12
-      ? `<p class="ctca-dialog-note">…and ${deletions.length - 12} more.</p>`
-      : "";
-    const result = await showAppDialog({
-      title: `Delete ${deletions.length} entries from this document?`,
-      message: "These entries carry explicit deletion markers from the global database. Missing global entries without such a marker are never deleted.",
-      controls: (container) => {
-        const wrapper = document.createElement("div");
-        wrapper.className = "ctca-global-deletion-preview";
-        wrapper.innerHTML = `<ul>${preview}</ul>${remainder}`;
-        container.appendChild(wrapper);
-      },
-      buttons: [
-        { label: "Keep document unchanged", value: false },
-        { label: `Delete ${deletions.length} entries`, value: true, danger: true }
-      ],
-      closeValue: false,
-      danger: true
-    });
-    return Boolean(result);
+  async function confirmGlobalTombstoneDeletions(_deletions) {
+    // Explicit central deletion markers are handled by the same deterministic
+    // combined-file transaction as other synchronization decisions.
+    return true;
   }
 
   async function applyResolvedGlobalEntriesToProject(
@@ -12688,7 +13316,7 @@
           key: targetKey,
           type: item.type || "misc",
           sourceFile: targetFile,
-          fields: Object.fromEntries(Object.entries(cleanFields).map(([name, value]) => [name, managerWrapBibValue(value)]))
+          fields: Object.fromEntries(Object.entries(cleanFields).map(([name, value]) => [name, managerWrapBibValue(value, name)]))
         };
         const draft = draftFromRecord(syntheticRecord);
         draft.originalKey = "";
@@ -12789,7 +13417,8 @@
     force = false,
     allowManagerSession = false,
     localDeletedGlobalIdentities = null,
-    excludedGlobalImportIdentities = new Set()
+    excludedGlobalImportIdentities = new Set(),
+    promptLocalPush = true
   } = {}) {
     if (!settings.syncGlobalDatabase) return null;
     const excludedImportIdentities = new Set(
@@ -12821,17 +13450,22 @@
     const originalFile = captureSelectedTexFile(managerOriginalFile) || getSelectedFileName() || currentState?.fileName || "";
     const managerWasVisible = managerWasVisibleAtStart;
     let preservedPendingIdentities = new Set();
+    let preservedLocalPushIdentities = new Set();
     setManagerCentralSyncLoading(managerWasVisible);
     setManagerBusy(true, "Syncing…");
 
     try {
-      if (!managerFiles.length || !managerDrafts.size) {
-        const texState = await getManagerTexState();
-        const files = findBibliographyFiles(texState.value, texState.cursorIndex);
-        if (!files.length) return null;
-        managerOriginalFile = originalFile || texState.fileName;
-        managerFiles = files;
-        await managerLoadBibliography({ saveDirty: false });
+      if (!managerFiles.length) {
+        // Synchronization is not allowed to initiate a parse while the user is
+        // working in the editor. Reuse only data obtained by the page-load
+        // parse, first manager opening, or an explicit manual update.
+        if (pageLoadBibliographyParsePromise) {
+          await pageLoadBibliographyParsePromise.catch(() => null);
+        }
+        if (!managerFiles.length) {
+          deferredProjectGlobalPush = true;
+          return null;
+        }
       }
 
       const [globalState, snapshot] = await Promise.all([
@@ -12866,30 +13500,35 @@
       const highlightedGlobalIdentities = new Set(
         [...pendingGlobalIdentities].filter((identity) => !remainingPendingIdentities.has(identity))
       );
-      const resolved = resolveThreeWayGlobalSync(localItems, globalItems, snapshot, globalState.deletedEntries);
+      let resolved = resolveThreeWayGlobalSync(localItems, globalItems, snapshot, globalState.deletedEntries);
 
-      const deletionSignature = JSON.stringify(
-        resolved.deletions
-          .map(({ identity, tombstone }) => [identity, String(tombstone?.deletedAt || "")])
-          .sort(([left], [right]) => left.localeCompare(right))
-      );
-      if (resolved.deletions.length >= GLOBAL_DELETION_CONFIRM_THRESHOLD && deletionSignature === blockedGlobalDeletionSignature) {
-        // The user already rejected this exact deletion set. Do not reopen the
-        // same safety dialog on every storage/background synchronization event.
-        globalDatabaseSyncQueued = false;
-        return { ...resolved, cancelled: true, previouslyDeclined: true };
-      }
-      if (!(await confirmGlobalTombstoneDeletions(resolved.deletions))) {
-        blockedGlobalDeletionSignature = deletionSignature;
-        globalDatabaseSyncQueued = false;
-        window.clearTimeout(globalDatabaseSyncTimer);
-        globalDatabaseSyncTimer = null;
-        if (announce || managerWasVisible) {
-          managerSetStatus(`Synchronization paused. No document entries were deleted.`);
+      if (promptLocalPush && resolved.localChangeIdentities.length) {
+        const localChangeSet = new Set(resolved.localChangeIdentities);
+        const candidates = localItems
+          .filter((item) => localChangeSet.has(globalSyncIdentity(item)))
+          .sort((left, right) => String(left?.key || "").localeCompare(String(right?.key || "")));
+        const selectedLocalPushes = await choosePendingLocalPushes(candidates);
+        if (selectedLocalPushes === null) {
+          globalDatabaseSyncQueued = false;
+          return { ...resolved, cancelled: true, localPushSelectionCancelled: true };
         }
-        return { ...resolved, cancelled: true };
+        preservedLocalPushIdentities = new Set(
+          candidates
+            .map(globalSyncIdentity)
+            .filter((identity) => !selectedLocalPushes.has(identity))
+        );
+        if (preservedLocalPushIdentities.size) {
+          resolved = resolveThreeWayGlobalSync(
+            localItems,
+            globalItems,
+            snapshot,
+            globalState.deletedEntries,
+            { excludedLocalPushIdentities: preservedLocalPushIdentities }
+          );
+        }
       }
-      blockedGlobalDeletionSignature = "";
+
+      await confirmGlobalTombstoneDeletions(resolved.deletions);
 
       if (
         locallyDeletedGlobalItems.length ||
@@ -12927,10 +13566,14 @@
           true
         );
       }
+      const unsynchronizedSnapshotIdentities = new Set([
+        ...remainingPendingIdentities,
+        ...preservedLocalPushIdentities
+      ]);
       const nextSnapshotEntries = resolved.entries.filter(
-        (item) => !remainingPendingIdentities.has(globalSyncIdentity(item))
+        (item) => !unsynchronizedSnapshotIdentities.has(globalSyncIdentity(item))
       );
-      for (const identity of remainingPendingIdentities) {
+      for (const identity of unsynchronizedSnapshotIdentities) {
         const previous = snapshot.get(identity);
         if (previous) nextSnapshotEntries.push(previous);
       }
@@ -12943,8 +13586,8 @@
       for (const identity of locallyDeletedIdentities) {
         managerPendingCentralDeletionIdentities.delete(identity);
       }
-      deferredProjectGlobalPush = false;
-      managerSessionChanged = false;
+      deferredProjectGlobalPush = preservedLocalPushIdentities.size > 0;
+      managerSessionChanged = preservedLocalPushIdentities.size > 0;
       if (bibManager.classList.contains("ctca-manager-visible")) {
         await refreshManagerPendingHighlights();
       }
@@ -12954,9 +13597,12 @@
           ? ` ${resolved.conflicts} conflict${resolved.conflicts === 1 ? "" : "s"} resolved using global data.`
           : "";
         const pendingText = remainingPendingIdentities.size
-          ? ` ${remainingPendingIdentities.size} unselected new entr${remainingPendingIdentities.size === 1 ? "y remains" : "ies remain"} pending.`
+          ? ` ${remainingPendingIdentities.size} unselected central entr${remainingPendingIdentities.size === 1 ? "y remains" : "ies remain"} pending.`
           : "";
-        managerSetStatus(`Synchronized with global database.${conflictText}${pendingText}`);
+        const localPendingText = preservedLocalPushIdentities.size
+          ? ` ${preservedLocalPushIdentities.size} document entr${preservedLocalPushIdentities.size === 1 ? "y was" : "ies were"} not sent and will be offered again.`
+          : "";
+        managerSetStatus(`Synchronized with global database.${conflictText}${pendingText}${localPendingText}`);
       }
       return resolved;
     } catch (error) {
@@ -12968,7 +13614,7 @@
       setManagerCentralSyncLoading(false);
       setManagerBusy(false);
       globalDatabaseSyncInProgress = false;
-      if (preservedPendingIdentities.size) {
+      if (preservedPendingIdentities.size || preservedLocalPushIdentities.size) {
         globalDatabaseSyncQueued = false;
         window.clearTimeout(globalDatabaseSyncTimer);
         globalDatabaseSyncTimer = null;
@@ -12979,13 +13625,13 @@
     }
   }
 
-  function scheduleGlobalDatabaseSync(delayMs = 250, reason = "background sync", announce = false, { force = false } = {}) {
+  function scheduleGlobalDatabaseSync(_delayMs = 250, _reason = "background sync", _announce = false, _options = {}) {
     window.clearTimeout(globalDatabaseSyncTimer);
-    if (!settings.syncGlobalDatabase || bibManager.classList.contains("ctca-manager-visible")) return;
-    globalDatabaseSyncTimer = window.setTimeout(() => {
-      globalDatabaseSyncTimer = null;
-      synchronizeProjectWithGlobalDatabase({ reason, announce, force });
-    }, Math.max(0, Number(delayMs) || 0));
+    globalDatabaseSyncTimer = null;
+    if (!settings.syncGlobalDatabase) return;
+    // Background timers only record that a local push is pending. Actual sync
+    // runs are restricted to explicit user-facing actions.
+    deferredProjectGlobalPush = true;
   }
 
 
@@ -12997,76 +13643,171 @@
     globalBanner.innerHTML = `
       <div class="ctca-global-banner-text"></div>
       <div class="ctca-global-banner-actions">
+        <button type="button" class="ctca-global-banner-details" hidden>Details</button>
         <button type="button" class="ctca-global-banner-later">Not now</button>
         <button type="button" class="ctca-global-banner-select" hidden>Select</button>
         <button type="button" class="ctca-global-banner-yes">Yes</button>
       </div>
       <button type="button" class="ctca-global-banner-close" aria-label="Close banner" title="Close">×</button>
     `;
-    globalBanner.querySelector(".ctca-global-banner-close").addEventListener("click", hideGlobalBanner);
-    globalBanner.querySelector(".ctca-global-banner-later").addEventListener("click", hideGlobalBanner);
+    globalBanner.querySelector(".ctca-global-banner-close").addEventListener("click", () => hideGlobalBanner(true));
     document.documentElement.appendChild(globalBanner);
     return globalBanner;
   }
 
-  function hideGlobalBanner() {
+  function hideGlobalBanner(force = false) {
+    if (globalBannerPersistentError && force !== true) return;
     window.clearTimeout(globalBannerTimer);
     globalBannerTimer = null;
-    globalBanner?.classList.remove("ctca-global-banner-visible", "ctca-global-banner-busy");
+    globalBannerPersistentError = false;
+    globalBanner?.classList.remove("ctca-global-banner-visible", "ctca-global-banner-busy", "ctca-global-banner-success", "ctca-global-banner-error");
+  }
+
+  async function showGlobalErrorDetailsDialog(detailsText) {
+    const text = String(detailsText || "No additional debugging information is available.");
+    await showAppDialog({
+      title: "Smart Citations error details",
+      message: "The following diagnostic information can be copied when reporting the problem. Bibliography contents are not included.",
+      controls: (container) => {
+        const pre = document.createElement("pre");
+        pre.className = "ctca-error-details-pre";
+        pre.textContent = text;
+        container.appendChild(pre);
+      },
+      buttons: [{ label: "Close", value: true, primary: true }],
+      closeValue: true,
+      dialogClass: "ctca-error-details-dialog"
+    });
+  }
+
+  function bibWriteDebugReport(error, context = {}) {
+    const source = error instanceof Error ? error : new Error(String(error || "Unknown error"));
+    const remote = source.ctcaRemoteDiagnostics || source.ctcaDiagnostics || null;
+    const report = {
+      extensionVersion: "2.2.19",
+      timestamp: new Date().toISOString(),
+      operation: context.operation || "write local bibliography",
+      message: source.message || String(source),
+      name: source.name || "Error",
+      stack: source.stack || "",
+      pageUrl: window.location.href,
+      platform: IS_OVERLEAF ? "Overleaf" : "CollabTeX",
+      selectedEditorFile: getSelectedFileName() || currentState?.fileName || "",
+      bibliographyFiles: [...managerFiles],
+      managerDirtyEntries: managerDirtyIds.size,
+      managerDeletedEntries: managerDeletedDrafts.size,
+      initialParseState: managerInitialParseState,
+      globalSynchronizationEnabled: settings.syncGlobalDatabase === true,
+      userAgent: navigator.userAgent,
+      context,
+      remoteDiagnostics: remote
+    };
+    try {
+      return JSON.stringify(report, null, 2);
+    } catch (_error) {
+      return [
+        `Extension version: ${report.extensionVersion}`,
+        `Timestamp: ${report.timestamp}`,
+        `Operation: ${report.operation}`,
+        `Message: ${report.message}`,
+        `Stack: ${report.stack}`
+      ].join("\n");
+    }
   }
 
   function showGlobalBanner(message, {
     yesLabel = "Yes",
     noLabel = "Not now",
     selectLabel = "Select",
+    detailsLabel = "Details",
     onYes = null,
+    onNo = null,
     onSelect = null,
-    autoHideMs = 0
+    detailsText = "",
+    autoHideMs = 0,
+    variant = "",
+    replacePersistentError = false
   } = {}) {
+    if (globalBannerPersistentError && variant !== "error" && !replacePersistentError) return;
     window.clearTimeout(globalBannerTimer);
     globalBannerTimer = null;
     const banner = ensureGlobalBanner();
+    const persistentError = variant === "error";
+    globalBannerPersistentError = persistentError;
+    banner.setAttribute("role", persistentError ? "alert" : "status");
+    const closeButton = banner.querySelector(".ctca-global-banner-close");
+    closeButton.setAttribute("aria-label", persistentError ? "Acknowledge error" : "Close banner");
+    closeButton.title = persistentError ? "Acknowledge error" : "Close";
+    banner.classList.remove("ctca-global-banner-success", "ctca-global-banner-error");
+    if (variant === "success") banner.classList.add("ctca-global-banner-success");
+    if (persistentError) banner.classList.add("ctca-global-banner-error");
     banner.querySelector(".ctca-global-banner-text").textContent = message;
     const yes = banner.querySelector(".ctca-global-banner-yes");
     const later = banner.querySelector(".ctca-global-banner-later");
     const select = banner.querySelector(".ctca-global-banner-select");
+    const details = banner.querySelector(".ctca-global-banner-details");
     yes.classList.remove("ctca-global-banner-sync-link");
     yes.textContent = yesLabel;
-    later.textContent = noLabel;
+    later.textContent = persistentError && typeof onYes !== "function" && typeof onNo !== "function"
+      ? "Acknowledge"
+      : noLabel;
     select.textContent = selectLabel;
+    details.textContent = detailsLabel;
     yes.hidden = typeof onYes !== "function";
-    later.hidden = typeof onYes !== "function";
+    later.hidden = !(typeof onYes === "function" || typeof onNo === "function" || persistentError);
     select.hidden = typeof onSelect !== "function";
+    details.hidden = !String(detailsText || "").trim();
     yes.onclick = typeof onYes === "function" ? async () => {
+      if (persistentError) globalBannerPersistentError = false;
       banner.classList.add("ctca-global-banner-busy");
       yes.disabled = true;
       later.disabled = true;
       select.disabled = true;
+      details.disabled = true;
       try { await onYes(); }
       finally {
         yes.disabled = false;
         later.disabled = false;
         select.disabled = false;
+        details.disabled = false;
         banner.classList.remove("ctca-global-banner-busy");
       }
     } : null;
+    later.onclick = async () => {
+      if (typeof onNo === "function") await onNo();
+      hideGlobalBanner(true);
+    };
     select.onclick = typeof onSelect === "function" ? async () => {
       banner.classList.add("ctca-global-banner-busy");
       yes.disabled = true;
       later.disabled = true;
       select.disabled = true;
+      details.disabled = true;
       try { await onSelect(); }
       finally {
         yes.disabled = false;
         later.disabled = false;
         select.disabled = false;
+        details.disabled = false;
         banner.classList.remove("ctca-global-banner-busy");
       }
     } : null;
+    details.onclick = details.hidden ? null : () => showGlobalErrorDetailsDialog(detailsText).catch(() => {});
     banner.classList.add("ctca-global-banner-visible");
-    if (autoHideMs > 0) globalBannerTimer = window.setTimeout(() => {
+    // Error banners remain until the user explicitly acknowledges or closes them.
+    if (!persistentError && autoHideMs > 0) globalBannerTimer = window.setTimeout(() => {
       if (banner.classList.contains("ctca-global-banner-visible")) hideGlobalBanner();
     }, autoHideMs);
+  }
+
+  function showBibWriteResultBanner(message, isError = false, error = null, context = {}) {
+    if (!isError && !showBibWriteSuccessBanner) return;
+    showGlobalBanner(message, {
+      autoHideMs: isError ? 0 : 6000,
+      variant: isError ? "error" : "success",
+      replacePersistentError: true,
+      detailsText: isError ? bibWriteDebugReport(error || new Error(message), context) : ""
+    });
   }
 
   async function importDocumentBibliographyToGlobalFromBanner({ enableSync = false } = {}) {
@@ -13107,7 +13848,7 @@
     const originalFile = getSelectedFileName() || currentState?.fileName || "";
     try {
       text.textContent = "Applying the global bibliography database…";
-      const texState = await getManagerTexState();
+      const texState = await getManagerTexState({ background: !createIfMissing });
       let files = findBibliographyFiles(texState.value, texState.cursorIndex);
       if (!files.length && createIfMissing) {
         const created = await createProjectFile(GLOBAL_SETUP_BIB_FILE);
@@ -13177,35 +13918,96 @@
     }
   }
 
+  function currentToolbarActivityLabel() {
+    if (managerBusy) return managerBusyLabel || "Synchronizing bibliography…";
+    const labels = [...toolbarBackgroundActivityLabels.values()];
+    if (labels.length) return labels[labels.length - 1];
+    if (refreshInProgress) return "Updating bibliography…";
+    if (doiOperationInProgress) return "Updating DOI metadata…";
+    if (jumpInProgress) return "Opening bibliography…";
+    return "";
+  }
+
+  function updateToolbarButtonState() {
+    if (!toolbarButton) return;
+    const working = managerBusy || refreshInProgress || toolbarBackgroundActivityCount > 0;
+    const activityLabel = currentToolbarActivityLabel();
+    toolbarButton.classList.toggle("ctca-toolbar-working", working);
+    toolbarButton.disabled = Boolean(
+      working || refreshInProgress || jumpInProgress || doiOperationInProgress
+    );
+    toolbarButton.setAttribute("aria-busy", working ? "true" : "false");
+    const accessibleLabel = working
+      ? `${activityLabel || "Working on bibliography…"} Smart Citations is temporarily unavailable.`
+      : "Open Smart Citations bibliography manager";
+    toolbarButton.title = accessibleLabel;
+    toolbarButton.setAttribute("aria-label", accessibleLabel);
+    if (toolbarButton.parentElement) {
+      toolbarButton.parentElement.title = accessibleLabel;
+      toolbarButton.parentElement.setAttribute("aria-label", accessibleLabel);
+    }
+    setToolbarButtonLabel(
+      jumpInProgress
+        ? "Opening…"
+        : refreshInProgress
+          ? "Updating…"
+          : doiOperationInProgress
+            ? "DOI…"
+            : "bib"
+    );
+  }
+
+  function beginToolbarBackgroundActivity(label = "Working on bibliography…") {
+    const token = ++toolbarBackgroundActivitySequence;
+    toolbarBackgroundActivityCount += 1;
+    toolbarBackgroundActivityLabels.set(token, String(label || "Working on bibliography…"));
+    updateToolbarButtonState();
+    let finished = false;
+    return () => {
+      if (finished) return;
+      finished = true;
+      toolbarBackgroundActivityLabels.delete(token);
+      toolbarBackgroundActivityCount = Math.max(0, toolbarBackgroundActivityCount - 1);
+      updateToolbarButtonState();
+    };
+  }
+
+  function setToolbarButtonLabel(label) {
+    const labelNode = toolbarButton?.querySelector?.(".ctca-toolbar-label");
+    if (!labelNode) return;
+    const nextLabel = String(label || "bib");
+    // Avoid replacing the text node when the label is already correct. The
+    // toolbar observer watches child-list changes; rewriting identical text
+    // would otherwise retrigger the observer indefinitely and can prevent the
+    // CollabTeX application from completing its own startup.
+    if (labelNode.textContent !== nextLabel) labelNode.textContent = nextLabel;
+  }
+
   function createToolbarButton() {
     const button = document.createElement("button");
     button.id = "ctca-toolbar-button";
     button.type = "button";
-    button.textContent = "bib";
+    button.innerHTML = `
+      <span class="ctca-toolbar-working-spinner" aria-hidden="true"></span>
+      <span class="ctca-toolbar-mark" aria-hidden="true">S</span>
+      <span class="ctca-toolbar-label">bib</span>`;
     button.title = "Open Smart Citations bibliography manager";
     button.setAttribute("aria-label", "Open Smart Citations bibliography manager");
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      openBibManager();
-    });
-
-    const cloudButton = document.createElement("button");
-    cloudButton.id = "ctca-project-cloud-button";
-    cloudButton.type = "button";
-    cloudButton.textContent = "☁";
-    cloudButton.title = "Configure Nextcloud for this Collabtex project";
-    cloudButton.setAttribute("aria-label", "Configure Nextcloud for this Collabtex project");
-    cloudButton.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      managerOpenCloudSettings({ context: "project" }).catch((error) => {
-        showProjectCloudToast(error.message || String(error), true);
+      if (button.disabled) return;
+      openBibManager().catch((error) => {
+        const message = error?.message || String(error);
+        managerSetStatus(message, true);
+        showGlobalBanner(`Could not open the bibliography manager: ${message}`, {
+          variant: "error",
+          noLabel: "Close"
+        });
       });
     });
 
-    let overleafSlot = null;
-    let cloudSlot = null;
+    let toolbarSlot = null;
 
     const directChildWithin = (element, container) => {
       let current = element;
@@ -13223,64 +14025,54 @@
       return /(^|\s)(share|teilen)(\s|$)/i.test(label);
     }) || null;
 
-    const attachProjectCloudButton = () => {
+    const attach = () => {
       const shareButton = findShareButton();
       const fallbackActions = document.querySelector(
-        ".ide-redesign-toolbar-actions, .toolbar-header .toolbar-right, .project-actions, [class*='project'][class*='actions']"
+        ".ide-redesign-toolbar-actions, .toolbar-header .toolbar-right, " +
+        ".project-actions, [class*='project'][class*='actions']"
       );
       const actions = shareButton?.closest(
-        ".ide-redesign-toolbar-actions, .toolbar-header .toolbar-right, .project-actions, [class*='project'][class*='actions']"
+        ".ide-redesign-toolbar-actions, .toolbar-header .toolbar-right, " +
+        ".project-actions, [class*='project'][class*='actions']"
       ) || shareButton?.parentElement || fallbackActions;
-      if (!actions) return;
 
-      if (!cloudSlot || !cloudSlot.isConnected || cloudSlot.parentElement !== actions) {
-        cloudSlot?.remove();
-        cloudSlot = document.createElement("div");
-        cloudSlot.id = "ctca-project-cloud-slot";
-        cloudSlot.className = IS_OVERLEAF
-          ? "ide-redesign-toolbar-button-container ctca-project-cloud-slot"
-          : "ctca-project-cloud-slot";
-        cloudSlot.appendChild(cloudButton);
+      if (!actions) {
+        if (!button.isConnected) document.documentElement.appendChild(button);
+        return;
       }
 
-      cloudButton.className = IS_OVERLEAF
-        ? "d-inline-grid btn btn-secondary btn-sm ctca-project-cloud-top-button"
-        : "ctca-project-cloud-top-button";
-
-      if (shareButton) {
-        const shareContainer = directChildWithin(shareButton, actions);
-        if (cloudSlot.parentElement !== actions || cloudSlot.nextSibling !== shareContainer) {
-          actions.insertBefore(cloudSlot, shareContainer);
-        }
-      } else if (cloudSlot.parentElement !== actions) {
-        actions.appendChild(cloudSlot);
+      if (!toolbarSlot || !toolbarSlot.isConnected || toolbarSlot.parentElement !== actions) {
+        toolbarSlot?.remove();
+        toolbarSlot = document.createElement("div");
+        toolbarSlot.id = IS_OVERLEAF ? "ctca-overleaf-toolbar-slot" : "ctca-bib-toolbar-slot";
+        toolbarSlot.className = IS_OVERLEAF
+          ? "ide-redesign-toolbar-button-container ctca-overleaf-toolbar-slot"
+          : "ide-redesign-toolbar-button-container ctca-bib-toolbar-slot";
+        toolbarSlot.appendChild(button);
       }
-    };
 
-    const attach = () => {
+      button.classList.add("d-inline-grid", "btn", "btn-sm");
+      button.classList.toggle("btn-primary", IS_OVERLEAF);
+      button.classList.toggle("ctca-overleaf-top-button", IS_OVERLEAF);
+      button.classList.toggle("ctca-collabtex-top-button", !IS_OVERLEAF);
+
       if (IS_OVERLEAF) {
-        const actions = document.querySelector(".ide-redesign-toolbar-actions");
-        if (actions) {
-          if (!overleafSlot || !overleafSlot.isConnected || overleafSlot.parentElement !== actions) {
-            overleafSlot?.remove();
-            overleafSlot = document.createElement("div");
-            overleafSlot.id = "ctca-overleaf-toolbar-slot";
-            overleafSlot.className = "ide-redesign-toolbar-button-container ctca-overleaf-toolbar-slot";
-          }
-
-          button.classList.remove("ol-cm-toolbar-button", "ctca-overleaf-toolbar-button");
-          button.classList.add("d-inline-grid", "btn", "btn-primary", "btn-sm", "ctca-overleaf-top-button");
-          if (button.parentElement !== overleafSlot) overleafSlot.appendChild(button);
-          if (overleafSlot.parentElement !== actions) actions.insertBefore(overleafSlot, actions.firstChild);
-        }
-      } else {
-        const toolbar = document.querySelector(".toolbar.toolbar-editor");
-        if (toolbar && !(button.isConnected && toolbar.contains(button))) {
-          if (getComputedStyle(toolbar).position === "static") toolbar.style.position = "relative";
-          toolbar.appendChild(button);
-        }
+        if (toolbarSlot.parentElement !== actions) actions.insertBefore(toolbarSlot, actions.firstChild);
+        return;
       }
-      attachProjectCloudButton();
+
+      // SmartTeX places its own slot immediately before Share. Smart Citations
+      // stays immediately to its left when SmartTeX is present, otherwise it
+      // occupies the same top-right action area immediately before Share.
+      const smartTexSlot = actions.querySelector(":scope > #smarttex-toolbar-slot, :scope > .smarttex-toolbar-slot");
+      const shareContainer = shareButton ? directChildWithin(shareButton, actions) : null;
+      const insertionAnchor = smartTexSlot || shareContainer || actions.firstChild;
+      if (
+        toolbarSlot.parentElement !== actions ||
+        (insertionAnchor && toolbarSlot.nextSibling !== insertionAnchor)
+      ) {
+        actions.insertBefore(toolbarSlot, insertionAnchor);
+      }
     };
 
     attach();
@@ -13298,8 +14090,10 @@
   async function loadCachedRecords() {
     try {
       const key = storageKey();
-      const data = await extensionApi.storage.local.get([key]);
+      const data = await extensionApi.storage.local.get([key, AUTHOR_OPTIONS_KEY]);
       const cached = data[key];
+      const authorOptions = data[AUTHOR_OPTIONS_KEY] || {};
+      showBibWriteSuccessBanner = authorOptions.showBibWriteSuccessBanner !== false;
 
       // Global-database synchronization is intentionally a per-project choice.
       // A newly opened ColLabTeX project therefore starts with synchronization
@@ -13316,7 +14110,7 @@
       applySettingsToPopup();
       applyManagerSearchSettings();
       applyManagerColumnWidths();
-      cachedFiles = Array.isArray(cached?.files) ? cached.files : [];
+      cachedFiles = uniqueBibliographyFileCandidates(Array.isArray(cached?.files) ? cached.files : []);
       legacyCachedDoiSyncLedger = cached?.doiSyncLedger && typeof cached.doiSyncLedger === "object" ? { ...cached.doiSyncLedger } : null;
       legacyCachedManagerState = cached?.managerCategoryState ? normalizeManagerCategoryState(cached.managerCategoryState) : null;
       doiSyncLedger = {};
@@ -13341,7 +14135,7 @@
   }
 
   async function saveCachedState(files = cachedFiles) {
-    cachedFiles = Array.isArray(files) ? files : [];
+    cachedFiles = uniqueBibliographyFileCandidates(Array.isArray(files) ? files : []);
 
     try {
       const key = storageKey();
@@ -13427,7 +14221,9 @@
     if (response.ok) {
       pending.resolve(response);
     } else {
-      pending.reject(new Error(response.error || "Editor bridge request failed"));
+      const error = new Error(response.error || "Editor bridge request failed");
+      if (response.diagnostics) error.ctcaDiagnostics = response.diagnostics;
+      pending.reject(error);
     }
   });
 
@@ -13453,13 +14249,8 @@
       // and remote-presence updates. Pending work must not reschedule on every
       // unchanged event or an in-progress synchronization continually queues
       // its successor.
-      const request = bibSyncRequestForObservation(observation, {
-        syncInProgress: globalDatabaseSyncInProgress,
-        doiInProgress: doiOperationInProgress,
-        deferredPush: deferredProjectGlobalPush
-      });
-      if (request) {
-        scheduleGlobalDatabaseSync(request.delayMs, request.reason, false, { force: request.force });
+      if (observation.textChanged && !globalDatabaseSyncInProgress && !doiOperationInProgress) {
+        deferredProjectGlobalPush = true;
       }
     }
   });
@@ -13569,6 +14360,11 @@
   }
 
   function updateFromEditorState() {
+    if (suppressTransientListsUntilInteraction) {
+      cancelScheduledPopup();
+      hidePopup();
+      return;
+    }
     if (
       refreshInProgress ||
       jumpInProgress ||
@@ -14324,6 +15120,28 @@
     list.appendChild(item);
   }
 
+  function exactCitationKeyMatchIndex(query, records = renderedRecords) {
+    const typedKey = String(query ?? "").trim();
+    if (!typedKey) return -1;
+
+    const exactIndex = records.findIndex(
+      (record) => String(record?.key ?? "") === typedKey
+    );
+    if (exactIndex >= 0) return exactIndex;
+
+    // The normal citation search is case-insensitive unless the user explicitly
+    // enables case-sensitive matching. Mirror that behavior for the visual exact-
+    // key marker, while always inserting the canonical key stored in the record.
+    if (!settings.caseSensitive) {
+      const foldedKey = typedKey.toLocaleLowerCase();
+      return records.findIndex(
+        (record) => String(record?.key ?? "").toLocaleLowerCase() === foldedKey
+      );
+    }
+
+    return -1;
+  }
+
   function renderSuggestions() {
     const filter = popup.querySelector(".ctca-filter");
     const list = popup.querySelector(".ctca-list");
@@ -14343,7 +15161,15 @@
     applySettingsToPopup();
 
     renderedRecords = matchingRecords(query);
-    if (selectedIndex >= renderedRecords.length) {
+    const exactKeyMatchIndex = exactCitationKeyMatchIndex(query, renderedRecords);
+
+    // An already typed complete citation key is the most relevant result. Select
+    // it whenever the list is rendered, irrespective of result sorting. Keyboard
+    // or pointer navigation may still move the active selection afterwards; the
+    // exact-key marker remains visible independently.
+    if (exactKeyMatchIndex >= 0) {
+      selectedIndex = exactKeyMatchIndex;
+    } else if (selectedIndex >= renderedRecords.length) {
       selectedIndex = renderedRecords.length ? renderedRecords.length - 1 : -1;
     }
     list.replaceChildren();
@@ -14385,9 +15211,13 @@
 
     renderedRecords.forEach((record, index) => {
       const item = document.createElement("div");
-      item.className = `ctca-item${index === selectedIndex ? " ctca-selected" : ""}`;
+      const isExactKeyMatch = index === exactKeyMatchIndex;
+      item.className = `ctca-item${index === selectedIndex ? " ctca-selected" : ""}${isExactKeyMatch ? " ctca-exact-key-match" : ""}`;
       item.setAttribute("role", "option");
       item.setAttribute("aria-selected", index === selectedIndex ? "true" : "false");
+      if (isExactKeyMatch) {
+        item.dataset.exactCitationKeyMatch = "true";
+      }
       item.title = record.sourceFile ? `Source: ${record.sourceFile}` : "";
 
       const heading = document.createElement("div");
@@ -14444,6 +15274,9 @@
     });
     updateSuggestionListOverflow();
     restoreScrollPosition();
+    if (exactKeyMatchIndex >= 0) {
+      list.querySelectorAll('.ctca-item[role="option"]')[exactKeyMatchIndex]?.scrollIntoView({ block: "nearest" });
+    }
   }
 
   function updateSelectedItem() {
@@ -14488,12 +15321,14 @@
 
   function showPopup() {
     popup.classList.add("ctca-visible");
+    popup.setAttribute("aria-hidden", "false");
   }
 
   function hidePopup() {
     cancelScheduledPopup();
     closeMenus();
     popup.classList.remove("ctca-visible");
+    popup.setAttribute("aria-hidden", "true");
     popupContextId = "";
     clearStatus();
   }
@@ -14629,14 +15464,7 @@
     if (bulkDoiButton) {
       bulkDoiButton.disabled = busy || doiOperationInProgress;
     }
-    toolbarButton.disabled = busy || doiOperationInProgress || jumpInProgress;
-    toolbarButton.textContent = busy
-      ? "Updating…"
-      : doiOperationInProgress
-        ? "DOI…"
-        : jumpInProgress
-          ? "Opening…"
-          : "bib";
+    updateToolbarButtonState();
     renderSuggestions();
   }
 
@@ -14676,102 +15504,206 @@
     return [...unique.values()];
   }
 
+  function projectFileTreeItemName(item) {
+    return String(
+      item?.getAttribute?.("data-path") ||
+      item?.getAttribute?.("data-file-path") ||
+      item?.getAttribute?.("data-name") ||
+      item?.getAttribute?.("aria-label") ||
+      item?.getAttribute?.("title") ||
+      item?.querySelector?.(
+        ".item-name-button span, .item-name span, .entity-name span, [data-testid*=file-name]"
+      )?.textContent ||
+      item?.textContent ||
+      ""
+    ).trim();
+  }
+
   function visibleBibFileNames() {
-    const names = new Set();
-    document.querySelectorAll('.file-tree-list [role="treeitem"][aria-label$=".bib" i]').forEach((item) => {
-      const name = item.getAttribute("aria-label")?.trim();
-      if (name) names.add(name);
-    });
-    document.querySelectorAll(".file-tree-list .item-name-button span").forEach((span) => {
-      const name = span.textContent?.trim();
-      if (/\.bib$/i.test(name)) names.add(name);
-    });
-    return [...names];
+    const names = new Map();
+
+    // Use all currently rendered file-tree candidates, not only the legacy
+    // `.file-tree-list` structure. CollabTeX may render file rows through
+    // Angular or React depending on the deployment version.
+    for (const item of projectFileTreeCandidates()) {
+      for (const candidate of normalizedFileTreeCandidateNames(item)) {
+        const normalized = String(candidate || "").trim().replace(/\\/g, "/");
+        if (!/\.bib$/i.test(normalized)) continue;
+        if (isIgnoredBibliographyFileName(normalized)) continue;
+        const identity = normalizeBibSourceName(normalized);
+        if (!names.has(identity)) names.set(identity, normalized);
+      }
+    }
+
+    return [...names.values()];
   }
 
   function getSelectedFileName() {
-    const selected = document.querySelector(
-      '.file-tree-list [role="treeitem"][aria-selected="true"], ' +
-      '.file-tree-list li.selected[role="treeitem"]'
-    );
-    const selectedName = (
-      selected?.getAttribute("aria-label") ||
-      selected?.querySelector(".item-name-button span")?.textContent ||
-      selected?.querySelector(".item-name span")?.textContent ||
-      selected?.querySelector(".entity-name span")?.textContent ||
-      ""
-    ).trim();
-    if (selectedName) return selectedName;
+    const selected = document.querySelector([
+      '.file-tree-list [role="treeitem"][aria-selected="true"]',
+      '.file-tree-list li.selected[role="treeitem"]',
+      '[role="treeitem"][aria-selected="true"]',
+      '[role="treeitem"][data-selected="true"]',
+      '[data-testid*="file-tree" i] .selected[role="treeitem"]',
+      '[class*="file-tree" i] .selected[role="treeitem"]'
+    ].join(', '));
+
+    if (selected) {
+      const directValues = [
+        selected.getAttribute?.("data-path"),
+        selected.getAttribute?.("data-file-path"),
+        selected.getAttribute?.("data-name"),
+        selected.getAttribute?.("aria-label"),
+        selected.getAttribute?.("title"),
+        selected.querySelector?.(
+          ".item-name-button span, .item-name span, .entity-name span, [data-testid*=file-name]"
+        )?.textContent
+      ];
+      for (const value of directValues) {
+        const name = String(value || "").trim().replace(/\\/g, "/");
+        if (/\.[A-Za-z0-9]+$/i.test(name)) return name;
+      }
+
+      // As a last DOM fallback, use only a filename-looking candidate. This
+      // avoids returning the complete row text including action-button labels.
+      const candidate = normalizedFileTreeCandidateNames(selected)
+        .find((name) => /\.[A-Za-z0-9]+$/i.test(String(name || "").trim()));
+      if (candidate) return String(candidate).trim();
+    }
+
     if (IS_OVERLEAF) {
       const breadcrumbName = document.querySelector(".ol-cm-breadcrumbs > div")?.textContent?.trim() || "";
       if (/\.[A-Za-z0-9]+$/i.test(breadcrumbName)) return breadcrumbName;
     }
-    return "";
+
+    // The editor-state bridge is more authoritative than a temporarily
+    // unselected file-tree row during project startup or tree rerendering.
+    const editorFile = String(currentState?.fileName || "").trim();
+    return /\.[A-Za-z0-9]+$/i.test(editorFile) ? editorFile : "";
   }
 
   function captureSelectedTexFile(...fallbacks) {
     const selectedFile = getSelectedFileName();
-    const editorFile = String(currentState?.fileName || "");
+    const editorFile = String(currentState?.fileName || "").trim();
     const candidates = [
       editorFile && (!selectedFile || bibSourceMatches(editorFile, selectedFile)) ? editorFile : "",
       selectedFile,
       ...fallbacks,
       managerReturnTexFile,
-      managerOriginalFile
+      managerOriginalFile,
+      getMainDocumentName()
     ];
-    return String(candidates.find((fileName) => /\.tex$/i.test(String(fileName || "").trim())) || "");
+
+    const texFile = candidates.find((fileName) => /\.tex$/i.test(String(fileName || "").trim()));
+    return String(texFile || "").trim();
+  }
+
+  function projectFileTreeRoots() {
+    const roots = [
+      ...document.querySelectorAll(
+        '.file-tree-list, .file-tree, [role="tree"], [data-testid*="file-tree" i], [class*="file-tree" i], [aria-label*="file tree" i]'
+      )
+    ];
+    return roots.length ? [...new Set(roots)] : [];
+  }
+
+  function normalizedFileTreeCandidateNames(element) {
+    const values = [
+      element?.getAttribute?.("data-path"),
+      element?.getAttribute?.("data-file-path"),
+      element?.getAttribute?.("data-name"),
+      element?.getAttribute?.("aria-label"),
+      element?.getAttribute?.("title"),
+      projectFileTreeItemName(element)
+    ];
+    const names = new Set();
+    for (const value of values) {
+      const text = String(value || "").trim().replace(/\\/g, "/");
+      if (!text) continue;
+      names.add(text.toLowerCase());
+      const bibMatch = text.match(/(?:^|[\s:/])([^\s:/]+\.bib)(?:$|[\s,;])/i);
+      if (bibMatch?.[1]) names.add(bibMatch[1].toLowerCase());
+    }
+    return [...names];
+  }
+
+  function projectFileTreeCandidates() {
+    const roots = projectFileTreeRoots();
+    const selector = [
+      '[role="treeitem"]',
+      '[data-path]',
+      '[data-file-path]',
+      '[data-name]',
+      '.item-name-button',
+      '.item-name',
+      '.entity-name',
+      'button[aria-label]',
+      'button[title]'
+    ].join(',');
+    const items = [];
+    for (const root of roots) {
+      items.push(root, ...root.querySelectorAll(selector));
+    }
+    return [...new Set(items)];
+  }
+
+  function fileTreeClickControl(element) {
+    if (!element) return null;
+    if (element.matches?.('button, a, [role="button"]')) return element;
+    return (
+      element.querySelector?.('.item-name-button, button[data-testid*=file], button, a, [role="button"]') ||
+      element.closest?.('.item-name-button, button, a, [role="button"]') ||
+      element
+    );
   }
 
   function findFileButton(fileName) {
     const targetName = String(fileName || "").replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
     const targetBase = targetName.split("/").pop();
-    const items = document.querySelectorAll('.file-tree-list [role="treeitem"]');
     let baseNameMatch = null;
 
-    for (const item of items) {
-      const label = (
-        item.getAttribute("aria-label") ||
-        item.querySelector(".item-name-button span")?.textContent ||
-        ""
-      ).trim();
-      const itemName = projectFileTreeItemName(item).replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
-      const control = (
-        item.querySelector(".item-name-button") ||
-        item.querySelector(".file-tree-entity-details") ||
-        item.querySelector(".entity-name") ||
-        item
-      );
-      if (itemName === targetName || label.toLowerCase() === targetName) return control;
-      const itemBase = itemName.split("/").pop();
-      if (!baseNameMatch && (itemBase === targetBase || label.toLowerCase() === targetBase)) {
-        baseNameMatch = control;
-      }
+    for (const item of projectFileTreeCandidates()) {
+      const names = normalizedFileTreeCandidateNames(item);
+      if (!names.length) continue;
+      const exact = names.some((name) => name === targetName || name.endsWith(`/` + targetName));
+      const base = names.some((name) => name.split("/").pop() === targetBase);
+      if (exact) return fileTreeClickControl(item);
+      if (!baseNameMatch && base) baseNameMatch = fileTreeClickControl(item);
     }
 
     return baseNameMatch;
   }
 
-  async function expandFoldersUntilFound(fileName) {
-    let button = findFileButton(fileName);
-    if (button) return button;
-
-    for (let pass = 0; pass < 3; pass += 1) {
-      const collapsed = [
-        ...document.querySelectorAll(
-          '.file-tree-list [role="treeitem"][aria-expanded="false"] button[aria-label="Expand"]'
-        )
-      ];
-      if (!collapsed.length) break;
-
-      for (const expandButton of collapsed) {
-        expandButton.click();
+  function discoveredFileTreeBibNames() {
+    const names = new Set();
+    for (const item of projectFileTreeCandidates()) {
+      for (const name of normalizedFileTreeCandidateNames(item)) {
+        const base = name.split("/").pop();
+        if (/\.bib$/i.test(base)) names.add(base);
       }
-      await delay(150);
-
-      button = findFileButton(fileName);
-      if (button) return button;
     }
+    return [...names].sort();
+  }
 
+  async function expandFoldersUntilFound(fileName, timeoutMs = FILE_OPEN_TIMEOUT_MS) {
+    const deadline = Date.now() + Math.max(5000, Number(timeoutMs) || FILE_OPEN_TIMEOUT_MS);
+    const clickedExpanders = new WeakSet();
+    while (Date.now() < deadline) {
+      const button = findFileButton(fileName);
+      if (button) return button;
+
+      for (const root of projectFileTreeRoots()) {
+        const collapsed = root.querySelectorAll(
+          '[role="treeitem"][aria-expanded="false"] button, button[aria-expanded="false"], button[aria-label*="expand" i]'
+        );
+        for (const expandButton of collapsed) {
+          if (clickedExpanders.has(expandButton)) continue;
+          clickedExpanders.add(expandButton);
+          try { expandButton.click(); } catch (_error) {}
+        }
+      }
+      await delay(250);
+    }
     return null;
   }
 
@@ -14913,7 +15845,11 @@
   async function openFileAndWait(fileName) {
     const button = await expandFoldersUntilFound(fileName);
     if (!button) {
-      throw new Error(`Could not find ${fileName} in the ColLabTeX file tree`);
+      const discovered = discoveredFileTreeBibNames();
+      const suffix = discovered.length
+        ? ` Visible BibTeX candidates: ${discovered.join(", ")}.`
+        : " The CollabTeX file tree did not expose any BibTeX entries before the timeout.";
+      throw new Error(`Could not find ${fileName} in the ColLabTeX file tree.${suffix}`);
     }
 
     let beforeState = null;
@@ -14936,9 +15872,75 @@
     });
   }
 
+  async function readProjectTextFileInBackgroundDetailed(fileName, timeoutMs = 90000) {
+    const requestedTimeout = Math.max(10000, Number(timeoutMs) || 90000);
+    const startedAt = Date.now();
+    try {
+      // The page-world reader may first wait for the collaboration socket and
+      // then try an HTTP or project-ZIP fallback. Keep the content-script bridge
+      // alive longer than the complete page-world operation instead of timing
+      // out while its final fallback is still running.
+      const response = await bridgeRequest(
+        "readProjectTextFile",
+        {
+          fileName: String(fileName || ""),
+          timeoutMs: requestedTimeout
+        },
+        requestedTimeout + 30000
+      );
+      if (typeof response?.text !== "string") {
+        const error = new Error(`ColLabTeX returned no text for ${fileName}.`);
+        error.ctcaDiagnostics = response?.diagnostics || null;
+        throw error;
+      }
+      return {
+        text: response.text,
+        fileName: String(response.fileName || fileName || ""),
+        documentId: String(response.documentId || ""),
+        method: String(response.method || "unknown"),
+        durationMs: Date.now() - startedAt,
+        diagnostics: response.diagnostics || null
+      };
+    } catch (error) {
+      if (!error.ctcaDiagnostics) {
+        error.ctcaDiagnostics = {
+          requestedFileName: String(fileName || ""),
+          requestedTimeoutMs: requestedTimeout,
+          elapsedMs: Date.now() - startedAt,
+          bridgeError: error?.message || String(error)
+        };
+      }
+      throw error;
+    }
+  }
+
+  async function readProjectTextFileInBackground(fileName, timeoutMs = 90000) {
+    return (await readProjectTextFileInBackgroundDetailed(fileName, timeoutMs)).text;
+  }
+
+  async function writeProjectTextFileInBackground(fileName, expectedText, nextText, timeoutMs = 90000) {
+    const response = await bridgeRequest(
+      "writeProjectTextFile",
+      {
+        fileName: String(fileName || ""),
+        expectedText: String(expectedText ?? ""),
+        text: String(nextText ?? ""),
+        timeoutMs: Math.max(1000, Number(timeoutMs) || 90000)
+      },
+      Math.max(1000, Number(timeoutMs) || 90000) + 65000
+    );
+    if (String(response?.text ?? "") !== String(nextText ?? "")) {
+      throw new Error(`The background update of ${fileName} could not be verified.`);
+    }
+    return response;
+  }
+
   async function openAndReadFile(fileName) {
-    const state = await openFileAndWait(fileName);
-    return state.value;
+    // Bibliography parsing must never change the visible file-tree selection or
+    // replace the user's active ACE/CodeMirror document. The page-world bridge
+    // reads the project document directly through ColLabTeX's document API or
+    // collaboration socket.
+    return readProjectTextFileInBackground(fileName, 60000);
   }
 
   function findBibEntryKeyIndex(text, citationKey) {
@@ -15034,6 +16036,15 @@
   }
 
   function serializeBibEntry(type, key, fields) {
+    const entryType = String(type || "misc").trim().toLowerCase();
+    const citationKey = String(key || "").trim();
+    if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(entryType)) {
+      throw new Error(`Invalid BibTeX entry type: ${entryType || "(empty)"}.`);
+    }
+    if (!citationKey || /[\s,{}()=]/.test(citationKey)) {
+      throw new Error(`Invalid BibTeX citation key: ${citationKey || "(empty)"}.`);
+    }
+
     const preferredOrder = [
       "title",
       "year",
@@ -15057,10 +16068,24 @@
         (name) => !preferredOrder.includes(name) && fields[name]
       )
     ];
-    const lines = orderedNames.map(
-      (name) => `    ${name} = ${String(fields[name]).trim()}`
-    );
-    return `@${type || "misc"}{${key},\n${lines.join(",\n")}\n}`;
+    const canonicalize = globalThis.CollabTeXBibTeX?.canonicalizeSerializedBibFieldValue;
+    const lines = orderedNames.map((name) => {
+      if (!/^[A-Za-z][A-Za-z0-9_:.+-]*$/.test(name)) {
+        throw new Error(`Invalid BibTeX field name ${name} in ${citationKey}.`);
+      }
+      const rawValue = String(fields[name]).trim();
+      const serializedValue = typeof canonicalize === "function"
+        ? canonicalize(name, rawValue)
+        : rawValue;
+      if (!serializedValue) return "";
+      return `    ${name} = ${serializedValue}`;
+    }).filter(Boolean);
+    const serialized = `@${entryType}{${citationKey},\n${lines.join(",\n")}\n}`;
+    const validation = globalThis.CollabTeXBibTeX?.validateBibTeXFormatting?.(serialized);
+    if (validation && !validation.valid) {
+      throw new Error(`Could not serialize ${citationKey} as valid BibTeX: ${validation.errors.slice(0, 3).join(" ")}`);
+    }
+    return serialized;
   }
 
   function buildBibEntry(key, metadata, existingRecord = null) {
@@ -15075,7 +16100,7 @@
     if (!escapedKey) return null;
 
     const pattern = new RegExp(
-      `^[\\t ]*@([A-Za-z]+)\\s*([({])\\s*${escapedKey}(?=\\s*,)`,
+      `^[\t ]*@([A-Za-z]+)\s*([({])\s*${escapedKey}(?=\s*,)`,
       "m"
     );
     const match = pattern.exec(source);
@@ -15085,11 +16110,20 @@
     const openChar = match[2];
     const closeChar = openChar === "{" ? "}" : ")";
     const openIndex = source.indexOf(openChar, start);
+
+    // Never let malformed braces or quotes in one entry consume subsequent
+    // entries. The start of the next top-level BibTeX record is a hard upper
+    // boundary for this replacement range.
+    const remainder = source.slice(match.index + match[0].length);
+    const nextMatch = /^[\t ]*@[A-Za-z]+\s*[({]/m.exec(remainder);
+    const hardEnd = nextMatch
+      ? match.index + match[0].length + nextMatch.index
+      : source.length;
+
     let depth = 0;
     let quoted = false;
     let escaped = false;
-
-    for (let index = openIndex; index < source.length; index += 1) {
+    for (let index = openIndex; index < hardEnd; index += 1) {
       const char = source[index];
       if (escaped) {
         escaped = false;
@@ -15107,18 +16141,11 @@
       if (char === openChar) depth += 1;
       if (char === closeChar) {
         depth -= 1;
-        if (depth === 0) {
-          return { start, end: index + 1, type: match[1].toLowerCase() };
-        }
+        if (depth === 0) return { start, end: index + 1, type: match[1].toLowerCase() };
       }
     }
 
-    const nextEntry = source.slice(openIndex + 1).search(/^[\t ]*@[A-Za-z]+\s*[({]/m);
-    return {
-      start,
-      end: nextEntry >= 0 ? openIndex + 1 + nextEntry : source.length,
-      type: match[1].toLowerCase()
-    };
+    return { start, end: hardEnd, type: match[1].toLowerCase(), malformed: true };
   }
 
   function replaceRecordInMemory(updatedRecord) {
@@ -15185,14 +16212,7 @@
 
   function setDoiOperationBusy(busy, label = "DOI…") {
     doiOperationInProgress = busy;
-    toolbarButton.disabled = busy || refreshInProgress || jumpInProgress;
-    toolbarButton.textContent = busy
-      ? label
-      : refreshInProgress
-        ? "Updating…"
-        : jumpInProgress
-          ? "Opening…"
-          : "bib";
+    updateToolbarButtonState();
     const updateButton = popup.querySelector(".ctca-update");
     const bulkDoiButton = popup.querySelector(".ctca-update-all-doi");
     updateButton.disabled = busy || refreshInProgress;
@@ -15573,8 +16593,7 @@
     jumpInProgress = true;
     cancelScheduledPopup();
     hidePopup();
-    toolbarButton.disabled = true;
-    toolbarButton.textContent = "Opening…";
+    updateToolbarButtonState();
 
     try {
       const state = await openFileAndWait(record.sourceFile);
@@ -15637,8 +16656,7 @@
       }
     } finally {
       jumpInProgress = false;
-      toolbarButton.disabled = refreshInProgress;
-      toolbarButton.textContent = refreshInProgress ? "Updating…" : "bib";
+      updateToolbarButtonState();
 
       if (!jumpFailed || targetFileOpened) {
         cancelScheduledPopup();
@@ -15728,7 +16746,7 @@
 
       for (let index = 0; index < files.length; index += 1) {
         const fileName = files[index];
-        setStatus(`Opening and parsing ${fileName} (${index + 1}/${files.length})…`);
+        setStatus(`Reading and parsing ${fileName} in the background (${index + 1}/${files.length})…`);
         try {
           const bibText = await openAndReadFile(fileName);
           parsed.push(...window.CollabTeXBibTeX.parseBibTeX(bibText, fileName));
@@ -15811,6 +16829,16 @@
   }
 
   extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === "ctca-bib-write-worker-start") {
+      // Acknowledge immediately. Completion is reported separately through the
+      // dedicated worker-result message, so the sender must not wait for the
+      // entire editor write on this control channel.
+      startBackgroundBibWriteWorker(message.jobId).catch((error) => {
+        console.warn("[Smart Citations] Isolated bibliography worker failed:", error);
+      });
+      sendResponse({ ok: true, accepted: true });
+      return false;
+    }
     if (message?.type === "ctca-auto-continue-web-pdf") {
       const scheduled = scheduleWebPdfAutoContinue(message.tabId);
       sendResponse({ ok: scheduled });
@@ -15825,21 +16853,26 @@
 
   function bibFileTreeSelection(event) {
     // Internal reads and writes use HTMLElement.click() to select a project
-    // file. Those synthetic clicks must reach ColLabTeX; only a real user
-    // activation should be redirected to the full-screen manager.
+    // file. Those synthetic clicks must reach ColLabTeX; only a real primary
+    // mouse activation should be redirected to the full-window manager.
     if (!IS_COLLABTEX || !event.isTrusted || event.button !== 0) return null;
-    const item = typeof event.target?.closest === "function"
-      ? event.target.closest('.file-tree-list [role="treeitem"]')
-      : null;
+    const target = event.target instanceof Element ? event.target : null;
+    const item = target?.closest('.file-tree-list [role="treeitem"]') || null;
     if (!item) return null;
 
     const name = projectFileTreeItemName(item);
     if (!/\.bib$/i.test(name)) return null;
 
-    const selectionControl = event.target.closest(
-      ".item-name-button, .file-tree-entity-details, .entity-name, .item-name"
+    // Do not hijack tree controls that are not intended to open the file.
+    const excludedControl = target.closest(
+      'input, textarea, select, [contenteditable="true"], ' +
+      'button[aria-label*="expand" i], button[aria-label*="collapse" i], ' +
+      'button[aria-label*="menu" i], button[aria-label*="actions" i], ' +
+      'button[aria-label*="rename" i], button[aria-label*="delete" i], ' +
+      '[data-testid*="menu" i], [data-testid*="actions" i]'
     );
-    if (!selectionControl || !item.contains(selectionControl)) return null;
+    if (excludedControl && excludedControl !== target.closest('.item-name-button')) return null;
+
     return name;
   }
 
@@ -15865,7 +16898,9 @@
   extensionApi.storage.onChanged?.addListener((changes, areaName) => {
     if (areaName !== "local") return;
     if (AUTHOR_OPTIONS_KEY in changes) {
-      managerAuthorshipUserName = String(changes[AUTHOR_OPTIONS_KEY]?.newValue?.userName || "").trim();
+      const authorOptions = changes[AUTHOR_OPTIONS_KEY]?.newValue || {};
+      managerAuthorshipUserName = String(authorOptions.userName || "").trim();
+      showBibWriteSuccessBanner = authorOptions.showBibWriteSuccessBanner !== false;
       if (bibManager?.classList.contains("ctca-manager-visible")) {
         renderManagerCategories();
         renderManagerList();
@@ -15882,9 +16917,11 @@
       if (!wasEnabled && nextEnabled) {
         registerCurrentDocumentWithGlobalDatabase()
           .then(() => checkCurrentDocumentGlobalFlag({ allowAutomaticSync: true }))
+          .then(() => parseBibliographyOnPageLoad())
+          .then(() => notifyPageLoadGlobalDiffs())
           .catch(() => {});
       }
-      if (!nextEnabled) updateGlobalPendingUi(0, 0);
+      if (!nextEnabled) clearAllGlobalPendingUi();
     }
     if (globalThis.CollabTeXAttachmentStore?.CONFIG_KEY in changes) {
       managerUpdateCloudIconState(changes[globalThis.CollabTeXAttachmentStore.CONFIG_KEY]?.newValue || null).catch(() => {});
@@ -15896,18 +16933,22 @@
       const draft = managerDrafts.get(managerSelectedId);
       if (draft) managerRenderPdfAttachmentList(draft).catch(() => {});
     }
-    if (projectNextcloudLinksKey() in changes) {
-      const value = changes[projectNextcloudLinksKey()]?.newValue || {};
-      projectNextcloudLinks = (Array.isArray(value.links) ? value.links : []).map(normalizeProjectNextcloudLink).filter(Boolean);
-      scheduleProjectNextcloudUiRefresh();
-    }
     // Global database changes are intentionally not inspected here. Each
     // document checks only its own pending flag on the 30-second cadence below.
   });
 
   document.addEventListener(
+    "pointerdown",
+    (event) => {
+      if (event.isTrusted) suppressTransientListsUntilInteraction = false;
+    },
+    true
+  );
+
+  document.addEventListener(
     "keydown",
     (event) => {
+      if (event.isTrusted) suppressTransientListsUntilInteraction = false;
       const eventIsInsidePopup = popup.contains(event.target);
       const isArrowNavigation = [
         "ArrowLeft",
@@ -16017,7 +17058,7 @@
       !popup.contains(event.target) &&
       !abstractOverlay.contains(event.target) &&
       !bibManager.contains(event.target) &&
-      event.target !== toolbarButton
+      !toolbarButton.contains(event.target)
     ) {
       lastEditorInteraction = "pointer";
       lastEditorInteractionAt = performance.now();
@@ -16040,10 +17081,388 @@
     }
   }, GLOBAL_CHANGE_CHECK_INTERVAL_MS);
 
+  function uniqueBibliographyFileCandidates(...groups) {
+    const files = new Map();
+    for (const value of groups.flat()) {
+      const normalized = normalizeBibFileName(value);
+      if (!normalized || isIgnoredBibliographyFileName(normalized)) continue;
+      const identity = normalizeBibSourceName(normalized);
+      if (!files.has(identity)) files.set(identity, normalized);
+    }
+    return [...files.values()];
+  }
+
+  async function discoverBibliographyFilesForParsing({ requestedBibFile = "", allowVisibleMainDocument = false } = {}) {
+    let texState = null;
+    let backgroundError = null;
+    try {
+      texState = await getManagerTexState({ background: true });
+    } catch (error) {
+      backgroundError = error;
+    }
+
+    if (!texState && allowVisibleMainDocument) {
+      texState = await getManagerTexState({ background: false });
+    }
+
+    const configuredFiles = uniqueBibliographyFileCandidates(
+      texState ? findBibliographyFiles(texState.value, texState.cursorIndex) : []
+    );
+    const requestedFiles = uniqueBibliographyFileCandidates(requestedBibFile ? [requestedBibFile] : []);
+    const visibleFiles = uniqueBibliographyFileCandidates(visibleBibFileNames());
+    const cachedCandidates = uniqueBibliographyFileCandidates(cachedFiles);
+
+    // A bibliography declaration in the main TeX document is authoritative.
+    // Visible/cached files are only discovery fallbacks and must never add an
+    // unrelated copy or backup to the active bibliography set.
+    let files = configuredFiles;
+    if (!files.length && requestedFiles.length) files = requestedFiles;
+    if (!files.length && visibleFiles.length) files = visibleFiles;
+    if (!files.length && cachedCandidates.length) files = cachedCandidates;
+
+    return { files, texState, backgroundError, configuredFiles, visibleFiles };
+  }
+
+  function compactErrorDiagnostics(error) {
+    if (!error) return null;
+    return {
+      name: error?.name || "Error",
+      message: error?.message || String(error),
+      stack: error?.stack || "",
+      diagnostics: error?.ctcaDiagnostics || null
+    };
+  }
+
+  function backgroundParseDebugReport() {
+    const report = {
+      extensionVersion: "2.2.19",
+      timestamp: new Date().toISOString(),
+      operation: "background bibliography parse",
+      pageUrl: window.location.href,
+      platform: IS_OVERLEAF ? "Overleaf" : "CollabTeX",
+      selectedEditorFile: getSelectedFileName() || currentState?.fileName || "",
+      mainDocument: getMainDocumentName() || "",
+      managerFiles: [...managerFiles],
+      cachedFiles: [...cachedFiles],
+      visibleBibFiles: visibleBibFileNames(),
+      fileTreeBibFiles: discoveredFileTreeBibNames(),
+      fileTreeRootCount: projectFileTreeRoots().length,
+      parseState: managerInitialParseState,
+      parseError: managerInitialParseError,
+      diagnostics: managerInitialParseDiagnostics,
+      userAgent: navigator.userAgent
+    };
+    try {
+      return JSON.stringify(report, null, 2);
+    } catch (_error) {
+      return `Smart Citations 2.2.12\nBackground parse error: ${managerInitialParseError || "unknown"}`;
+    }
+  }
+
+  async function parseBibliographyOnPageLoad({ force = false, maxAttempts = 2 } = {}) {
+    if (pageLoadBibliographyParsePromise && !force) return pageLoadBibliographyParsePromise;
+    if (force) pageLoadBibliographyParsePromise = null;
+
+    managerInitialParseState = "pending";
+    managerInitialParseError = "";
+    managerInitialParseDiagnostics = {
+      extensionVersion: "2.2.19",
+      startedAt: new Date().toISOString(),
+      requestedMode: "background",
+      attempts: []
+    };
+    pageLoadBibliographyParsePromise = (async () => {
+      const finishToolbarActivity = beginToolbarBackgroundActivity("Parsing bibliography in the background…");
+      try {
+        let lastError = null;
+        let lastFiles = [];
+        const attempts = Math.max(1, Number(maxAttempts) || 1);
+
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+          if (attempt > 0) {
+            const retryDelay = Math.min(3000, 500 * (2 ** Math.min(attempt - 1, 3)));
+            await delay(retryDelay);
+          }
+
+          const attemptDiagnostics = {
+            attempt: attempt + 1,
+            startedAt: new Date().toISOString(),
+            selectedEditorFile: getSelectedFileName() || currentState?.fileName || "",
+            mainDocument: getMainDocumentName() || "",
+            fileTreeRootCount: projectFileTreeRoots().length,
+            fileTreeBibFiles: discoveredFileTreeBibNames()
+          };
+          managerInitialParseDiagnostics.attempts.push(attemptDiagnostics);
+
+          try {
+            const discovery = await discoverBibliographyFilesForParsing();
+            lastFiles = discovery.files;
+            attemptDiagnostics.mainDocumentRead = discovery.texState ? {
+              fileName: discovery.texState.fileName || "",
+              editorKind: discovery.texState.editorKind || "visible-editor",
+              textLength: String(discovery.texState.value || "").length
+            } : null;
+            attemptDiagnostics.mainDocumentBackgroundError = compactErrorDiagnostics(discovery.backgroundError);
+            attemptDiagnostics.configuredFiles = [...discovery.configuredFiles];
+            attemptDiagnostics.visibleFiles = [...discovery.visibleFiles];
+            attemptDiagnostics.cachedCandidates = uniqueBibliographyFileCandidates(cachedFiles);
+            attemptDiagnostics.selectedBibliographyFiles = [...lastFiles];
+
+            if (!lastFiles.length) {
+              // A missing main-document state is a transient startup failure,
+              // not proof that the project has no bibliography. Never clear a
+              // valid cache or report an empty project in that situation.
+              if (discovery.backgroundError) throw discovery.backgroundError;
+              if (attempt + 1 < attempts) {
+                attemptDiagnostics.outcome = "no-files-retry";
+                continue;
+              }
+
+              managerFiles = [];
+              managerRecords = [];
+              records = [];
+              cachedFiles = [];
+              resetManagerDrafts();
+              managerInitialOpenParsed = true;
+              managerInitialParseState = "success";
+              managerInitialParseError = "";
+              managerOpenFallbackParseAttempted = false;
+              attemptDiagnostics.outcome = "success-empty-project";
+              managerInitialParseDiagnostics.completedAt = new Date().toISOString();
+              managerInitialParseDiagnostics.outcome = "success";
+              await saveCachedState([]);
+              return 0;
+            }
+
+            const result = await managerLoadBibliography({
+              saveDirty: false,
+              scheduleSync: false,
+              filesOverride: lastFiles,
+              requireReadable: true,
+              reader: (fileName) => readProjectTextFileInBackgroundDetailed(fileName, 120000)
+            });
+            attemptDiagnostics.fileResults = result.fileResults || [];
+            attemptDiagnostics.parsedCount = result.parsedCount;
+            attemptDiagnostics.outcome = "success";
+            managerInitialOpenParsed = true;
+            managerInitialParseState = "success";
+            managerInitialParseError = "";
+            managerOpenFallbackParseAttempted = false;
+            managerInitialParseDiagnostics.completedAt = new Date().toISOString();
+            managerInitialParseDiagnostics.outcome = "success";
+            managerInitialParseDiagnostics.selectedBibliographyFiles = [...lastFiles];
+            managerInitialParseDiagnostics.parsedCount = result.parsedCount;
+            return result.parsedCount;
+          } catch (error) {
+            lastError = error;
+            attemptDiagnostics.outcome = "failed";
+            attemptDiagnostics.error = compactErrorDiagnostics(error);
+            attemptDiagnostics.completedAt = new Date().toISOString();
+            console.warn(`[Smart Citations] Background bibliography parse attempt ${attempt + 1}/${attempts} failed:`, error);
+          }
+        }
+
+        managerInitialOpenParsed = false;
+        managerInitialParseState = "failed";
+        managerInitialParseError = lastError?.message || (
+          lastFiles.length
+            ? `Could not read ${lastFiles.join(", ")}.`
+            : "No bibliography file could be discovered."
+        );
+        managerInitialParseDiagnostics.completedAt = new Date().toISOString();
+        managerInitialParseDiagnostics.outcome = "failed";
+        managerInitialParseDiagnostics.finalError = compactErrorDiagnostics(lastError);
+        managerInitialParseDiagnostics.selectedBibliographyFiles = [...lastFiles];
+        console.warn("[Smart Citations] Background bibliography parse on page load failed:", lastError);
+        return null;
+      } finally {
+        finishToolbarActivity();
+        // A failed startup parse must never leave the toolbar disabled. Nested
+        // activities retain their own tokens and remain active independently.
+        updateToolbarButtonState();
+      }
+    })();
+    return pageLoadBibliographyParsePromise;
+  }
+
+  async function ensureBibliographyParsedForManagerOpen(requestedBibFile = "") {
+    const requested = normalizeBibFileName(requestedBibFile);
+    const requestedAlreadyLoaded = !requested || managerFiles.some((fileName) => bibSourceMatches(fileName, requested));
+    const needsFallback = !managerInitialOpenParsed || !managerFiles.length || !managerRecords.length || !requestedAlreadyLoaded;
+    if (!needsFallback) return true;
+    if (managerOpenFallbackParseAttempted) return false;
+
+    managerOpenFallbackParseAttempted = true;
+    const returnTexFile = captureSelectedTexFile(managerReturnTexFile, managerOriginalFile, getMainDocumentName());
+    try {
+      // Retry the preferred invisible reader once now that the explicit user
+      // action confirms that the editor has finished loading.
+      await parseBibliographyOnPageLoad({ force: true, maxAttempts: 1 });
+      const requestedLoadedAfterRetry = !requested || managerFiles.some((fileName) => bibSourceMatches(fileName, requested));
+      if (managerInitialOpenParsed && managerFiles.length && managerRecords.length && requestedLoadedAfterRetry) {
+        await notifyPageLoadGlobalDiffs({ showBanner: false });
+        return true;
+      }
+
+      // Compatibility fallback: open the actual .bib file in the normal source
+      // editor, parse it, and unconditionally return to the prior TeX file. This
+      // path is used only on an explicit manager opening after background parsing
+      // failed; it is never triggered by ordinary editor activity.
+      const discovery = await discoverBibliographyFilesForParsing({
+        requestedBibFile: requested,
+        allowVisibleMainDocument: true
+      });
+      if (!discovery.files.length) {
+        if (discovery.backgroundError) throw discovery.backgroundError;
+        managerFiles = [];
+        managerRecords = [];
+        records = [];
+        resetManagerDrafts();
+        managerInitialOpenParsed = true;
+        managerInitialParseState = "success";
+        managerInitialParseError = "";
+        await notifyPageLoadGlobalDiffs({ showBanner: false });
+        return true;
+      }
+
+      const result = await managerLoadBibliography({
+        saveDirty: false,
+        scheduleSync: false,
+        filesOverride: discovery.files,
+        requireReadable: true,
+        reader: async (fileName) => {
+          const state = await openFileAndWait(fileName);
+          return String(state?.value ?? "");
+        }
+      });
+      managerInitialOpenParsed = true;
+      managerInitialParseState = "success";
+      managerInitialParseError = "";
+      await notifyPageLoadGlobalDiffs({ showBanner: false });
+      return result.parsedCount >= 0;
+    } catch (error) {
+      managerInitialOpenParsed = false;
+      managerInitialParseState = "failed";
+      managerInitialParseError = error?.message || String(error);
+      console.warn("[Smart Citations] Bibliography fallback parse on manager opening failed:", error);
+      await notifyPageLoadGlobalDiffs({ showBanner: false }).catch(() => null);
+      return false;
+    } finally {
+      managerOpenFallbackParseAttempted = false;
+      if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false }).catch(() => null);
+      updateToolbarButtonState();
+    }
+  }
+
+  async function initializeBackgroundBibWriteWorker(jobId) {
+    const startedAt = Date.now();
+    let job = null;
+    let currentFile = "";
+    try {
+      const response = await extensionApi.runtime.sendMessage({
+        type: "ctca-bib-write-worker-get",
+        jobId
+      });
+      if (!response?.ok || !response.job) {
+        throw new Error(response?.error || "The isolated bibliography-write job is no longer available.");
+      }
+      job = response.job;
+
+      // Wait for the source editor bridge without initializing bibliography
+      // parsing, synchronization polling, PDF views, or the full manager UI.
+      let state = null;
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        try {
+          state = (await bridgeRequest("getState", {}, 2500)).state || null;
+          if (state) break;
+        } catch (_error) {}
+        await delay(500);
+      }
+      if (!state) throw new Error("The isolated CollabTeX editor tab did not become ready.");
+      currentState = state;
+
+      const opened = await openFileAndWait(job.fileName);
+      currentFile = opened?.fileName || job.fileName;
+      const currentText = String(opened?.value ?? "");
+      const expectedText = String(job.expectedText ?? "");
+      const targetText = String(job.text ?? "");
+      if (currentText !== expectedText && currentText !== targetText) {
+        throw new Error(`${job.fileName} changed before the isolated background editor could write it.`);
+      }
+
+      let changed = false;
+      if (currentText !== targetText) {
+        await replaceEditorRangeAndVerify({
+          fileName: job.fileName,
+          start: 0,
+          end: currentText.length,
+          text: targetText,
+          expectedValue: targetText,
+          timeoutMs: 120000
+        });
+        changed = true;
+      }
+
+      await extensionApi.runtime.sendMessage({
+        type: "ctca-bib-write-worker-result",
+        jobId,
+        ok: true,
+        changed,
+        diagnostics: {
+          method: "isolated-background-editor-tab",
+          durationMs: Date.now() - startedAt,
+          requestedFile: job.fileName,
+          openedFile: currentFile,
+          expectedLength: expectedText.length,
+          targetLength: targetText.length,
+          targetFingerprint: contentFingerprint(targetText)
+        }
+      });
+    } catch (error) {
+      await extensionApi.runtime.sendMessage({
+        type: "ctca-bib-write-worker-result",
+        jobId,
+        ok: false,
+        error: error?.message || String(error),
+        diagnostics: {
+          method: "isolated-background-editor-tab",
+          durationMs: Date.now() - startedAt,
+          requestedFile: job?.fileName || "",
+          openedFile: currentFile,
+          selectedFile: getSelectedFileName() || currentState?.fileName || "",
+          readyState: document.readyState,
+          visibleBibFiles: discoveredFileTreeBibNames(),
+          fileTreeRootCount: projectFileTreeRoots().length,
+          errorName: error?.name || "Error",
+          errorMessage: error?.message || String(error),
+          errorStack: error?.stack || ""
+        }
+      }).catch(() => {});
+    }
+  }
+
+  function startBackgroundBibWriteWorker(jobId) {
+    const normalizedJobId = String(jobId || "").trim();
+    if (!normalizedJobId) return Promise.reject(new Error("The isolated bibliography-write job ID is missing."));
+    document.documentElement.classList.add("ctca-bib-write-worker-mode");
+    if (!backgroundBibWriteWorkerPromise) {
+      backgroundBibWriteWorkerPromise = initializeBackgroundBibWriteWorker(normalizedJobId);
+    }
+    return backgroundBibWriteWorkerPromise;
+  }
+
+
   async function initialize() {
+    // The background process starts an isolated writer with a direct message to
+    // the exact temporary tab. Give that message a brief opportunity to arrive,
+    // but never query worker state or navigate from a normal editor tab.
+    await delay(250);
+    if (backgroundBibWriteWorkerPromise) {
+      await backgroundBibWriteWorkerPromise;
+      return;
+    }
+
     await loadCachedRecords();
-    await loadProjectNextcloudLinks();
-    initializeProjectNextcloudUi();
     managerUpdateCloudIconState().catch(() => {});
 
     for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -16051,16 +17470,36 @@
         const response = await bridgeRequest("getState", {}, 1000);
         currentState = response.state;
         updateFromEditorState();
+        const initialParse = parseBibliographyOnPageLoad();
         if (settings.syncGlobalDatabase) {
-          window.setTimeout(() => checkGlobalDatabasePrompts(), 700);
+          window.setTimeout(() => {
+            initialParse
+              .then(async () => {
+                try {
+                  await checkGlobalDatabasePrompts({ allowAutomaticSync: false });
+                } finally {
+                  // Diff notification and the toolbar badge must still be updated
+                  // when the startup assistant itself cannot complete.
+                  await notifyPageLoadGlobalDiffs();
+                }
+              })
+              .catch((error) => {
+                console.warn("[Smart Citations] Could not complete the page-load bibliography check:", error);
+                notifyPageLoadGlobalDiffs().catch(() => null);
+              });
+          }, 700);
+        } else {
+          initialParse.then(() => {
+            if (managerInitialParseState !== "failed") return;
+            showGlobalBanner("The local bibliography could not be parsed in the background.", {
+              variant: "error",
+              detailsText: backgroundParseDebugReport(),
+              detailsLabel: "Details",
+              replacePersistentError: true
+            });
+          }).catch(() => null);
         }
         window.setTimeout(() => managerScheduleNextcloudSync(50), 1000);
-        window.setTimeout(() => {
-          if (projectNextcloudLinks.length || startupAssistantCheckInProgress || projectBibliographySetupInProgress) return;
-          loadProjectNextcloudLinksFromMetadataFile().catch((error) => {
-            console.warn("[Smart Citations] Could not read the project Nextcloud link file:", error);
-          });
-        }, 6000);
         return;
       } catch (_error) {
         await delay(250);

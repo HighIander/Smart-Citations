@@ -439,3 +439,17 @@ button {
   border-radius: 3px;
   outline: 3px solid rgba(9, 105, 218, .25);
 }
+
+
+.ctca-options-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-weight: 650;
+}
+
+.ctca-options-checkbox input {
+  width: 17px;
+  height: 17px;
+  margin: 0;
+}

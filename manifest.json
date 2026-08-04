@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Smart Citations",
-  "version": "2.0",
-  "description": "Smart Citations provides citation autocomplete, BibTeX management, Nextcloud synchronization, and linked Nextcloud project-file import and refresh for Collabtex/Overleaf.",
+  "version": "2.2.19",
+  "description": "Smart Citations provides citation autocomplete, BibTeX management, optional bibliography and PDF synchronization, and Collabtex/Overleaf integration.",
   "permissions": [
     "storage",
     "tabs",

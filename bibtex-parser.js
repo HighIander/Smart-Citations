@@ -3,22 +3,218 @@
 (() => {
   "use strict";
 
-  function stripOuterDelimiters(value) {
-    let result = String(value || "").trim();
-    let changed = true;
-
-    while (changed && result.length >= 2) {
-      changed = false;
-      if (
-        (result.startsWith("{") && result.endsWith("}")) ||
-        (result.startsWith('"') && result.endsWith('"'))
-      ) {
-        result = result.slice(1, -1).trim();
-        changed = true;
+  function matchingBraceIndex(text, startIndex = 0) {
+    const source = String(text || "");
+    if (source[startIndex] !== "{") return -1;
+    let depth = 0;
+    let escaped = false;
+    for (let index = startIndex; index < source.length; index += 1) {
+      const char = source[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === "{") depth += 1;
+      else if (char === "}") {
+        depth -= 1;
+        if (depth === 0) return index;
+        if (depth < 0) return -1;
       }
     }
+    return -1;
+  }
 
+  function matchingQuoteIndex(text, startIndex = 0) {
+    const source = String(text || "");
+    if (source[startIndex] !== '"') return -1;
+    let escaped = false;
+    for (let index = startIndex + 1; index < source.length; index += 1) {
+      const char = source[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === '"') return index;
+    }
+    return -1;
+  }
+
+  function stripSingleBalancedOuterDelimiter(value) {
+    const text = String(value ?? "").trim();
+    if (text.length < 2) return text;
+    if (text.startsWith("{") && matchingBraceIndex(text, 0) === text.length - 1) {
+      return text.slice(1, -1).trim();
+    }
+    if (text.startsWith('"') && matchingQuoteIndex(text, 0) === text.length - 1) {
+      return text.slice(1, -1).trim();
+    }
+    return text;
+  }
+
+  function stripOuterDelimiters(value) {
+    let result = String(value || "").trim();
+    for (let depth = 0; depth < 8; depth += 1) {
+      const next = stripSingleBalancedOuterDelimiter(result);
+      if (next === result) break;
+      result = next;
+    }
     return result;
+  }
+
+  function repairBibBraceBalance(value) {
+    const source = String(value ?? "").replace(/\r\n?/g, "\n").trim();
+    let result = "";
+    let depth = 0;
+    let escaped = false;
+
+    for (let index = 0; index < source.length; index += 1) {
+      const char = source[index];
+      if (escaped) {
+        result += char;
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        result += char;
+        escaped = true;
+        continue;
+      }
+      if (char === "{") {
+        depth += 1;
+        result += char;
+        continue;
+      }
+      if (char === "}") {
+        if (depth > 0) {
+          depth -= 1;
+          result += char;
+        } else {
+          // An unmatched closing brace would terminate the field value. Keep
+          // the literal character, but escape it so the generated BibTeX stays
+          // syntactically valid.
+          result += "\\}";
+        }
+        continue;
+      }
+      result += char;
+    }
+
+    if (depth > 0) result += "}".repeat(depth);
+    return result.trim();
+  }
+
+  function splitAuthorContentAtTopLevel(value) {
+    const source = String(value ?? "").trim();
+    const parts = [];
+    let current = "";
+    let depth = 0;
+    let escaped = false;
+    for (let index = 0; index < source.length;) {
+      const char = source[index];
+      if (escaped) {
+        current += char;
+        escaped = false;
+        index += 1;
+        continue;
+      }
+      if (char === "\\") {
+        current += char;
+        escaped = true;
+        index += 1;
+        continue;
+      }
+      if (char === "{") {
+        depth += 1;
+        current += char;
+        index += 1;
+        continue;
+      }
+      if (char === "}") {
+        depth = Math.max(0, depth - 1);
+        current += char;
+        index += 1;
+        continue;
+      }
+      if (depth === 0 && source.slice(index, index + 5).toLowerCase() === " and ") {
+        if (current.trim()) parts.push(current.trim());
+        current = "";
+        index += 5;
+        continue;
+      }
+      current += char;
+      index += 1;
+    }
+    if (current.trim()) parts.push(current.trim());
+    return parts;
+  }
+
+  function normalizeBibAuthorContent(value) {
+    const repaired = repairBibBraceBalance(value);
+    const authors = splitAuthorContentAtTopLevel(repaired);
+    if (authors.length < 2) return repaired;
+
+    return authors.map((author) => {
+      const inner = stripSingleBalancedOuterDelimiter(author);
+      // Braces around a comma-form personal name make BibTeX treat the whole
+      // token as a corporate author. Remove that accidental wrapper. Braced
+      // institutional names without a comma remain protected.
+      return inner !== author && inner.includes(",") ? inner : author;
+    }).join(" and ");
+  }
+
+  function normalizeBibFieldContent(name, value) {
+    const fieldName = String(name || "").trim().toLowerCase();
+    const repaired = repairBibBraceBalance(value);
+    if (fieldName === "author" || fieldName === "editor") {
+      return normalizeBibAuthorContent(repaired);
+    }
+    return repaired;
+  }
+
+  function serializeBibFieldValue(name, value) {
+    const content = normalizeBibFieldContent(name, value);
+    return content ? `{${content}}` : "";
+  }
+
+  function extractBibFieldContent(value) {
+    const text = String(value ?? "").trim();
+    if (!text) return "";
+    const balanced = stripSingleBalancedOuterDelimiter(text);
+    if (balanced !== text) return balanced;
+
+    // Callers use this helper for values that are intended to be complete
+    // serialized field values. Recover gracefully from a damaged outer wrapper
+    // such as `{{Title}` or `{Title` before applying the canonical wrapper.
+    if (text.startsWith("{")) {
+      const closeIndex = matchingBraceIndex(text, 0);
+      // A complete brace group followed by more content (for example
+      // `{Smith, John} and {Doe, Jane}`) is field content, not an outer field
+      // wrapper. The canonical serializer will add the one required wrapper.
+      if (closeIndex >= 0 && closeIndex < text.length - 1) return text;
+      let inner = text.slice(1);
+      if (inner.endsWith("}")) inner = inner.slice(0, -1);
+      return inner.trim();
+    }
+    if (text.startsWith('"')) {
+      const closeIndex = matchingQuoteIndex(text, 0);
+      if (closeIndex >= 0 && closeIndex < text.length - 1) return text;
+      let inner = text.slice(1);
+      if (inner.endsWith('"')) inner = inner.slice(0, -1);
+      return inner.trim();
+    }
+    return text;
+  }
+
+  function canonicalizeSerializedBibFieldValue(name, value) {
+    return serializeBibFieldValue(name, extractBibFieldContent(value));
   }
 
   function latexToText(value) {
@@ -495,6 +691,59 @@
     };
   }
 
+  function validateBibTeXFormatting(text) {
+    const source = String(text || "");
+    const starts = findEntryStarts(source);
+    const errors = [];
+    let parsedEntryCount = 0;
+
+    starts.forEach((entry, index) => {
+      const nextStart = starts[index + 1]?.start ?? source.length;
+      const segment = source.slice(entry.start, nextStart);
+      const localOpenIndex = entry.openIndex - entry.start;
+      const closeChar = entry.openChar === "{" ? "}" : ")";
+      const closeIndex = readBalanced(segment, localOpenIndex, entry.openChar, closeChar);
+      if (closeIndex < 0) {
+        errors.push(`Unbalanced ${entry.openChar}${closeChar} delimiters near character ${entry.start}.`);
+        return;
+      }
+      const trailing = segment.slice(closeIndex + 1).trim();
+      if (trailing && !trailing.startsWith("%")) {
+        errors.push(`Unexpected text after the BibTeX entry near character ${entry.start}.`);
+      }
+      if (["comment", "preamble", "string"].includes(entry.type)) return;
+      const record = parseEntrySegment(source, entry, nextStart, "");
+      if (!record) {
+        errors.push(`The BibTeX entry near character ${entry.start} has no valid citation key or field body.`);
+        return;
+      }
+      parsedEntryCount += 1;
+      for (const [fieldName, rawValue] of Object.entries(record.fields || {})) {
+        const value = String(rawValue || "").trim();
+        if (!value) continue;
+        const first = value[0];
+        if (first === "{") {
+          if (matchingBraceIndex(value, 0) !== value.length - 1) {
+            errors.push(`${record.key}.${fieldName} is not one balanced braced value.`);
+          }
+        } else if (first === '"') {
+          if (matchingQuoteIndex(value, 0) !== value.length - 1) {
+            errors.push(`${record.key}.${fieldName} is not one balanced quoted value.`);
+          }
+        } else if (!/^(?:[+-]?\d+(?:\.\d+)?|[A-Za-z][A-Za-z0-9_:.+-]*)$/.test(value)) {
+          errors.push(`${record.key}.${fieldName} is not a single valid BibTeX value.`);
+        }
+      }
+    });
+
+    return {
+      valid: errors.length === 0,
+      errors,
+      entryCount: parsedEntryCount,
+      detectedEntryCount: starts.filter((entry) => !["comment", "preamble", "string"].includes(entry.type)).length
+    };
+  }
+
   function parseBibTeX(text, sourceFile = "") {
     const source = String(text || "");
     const starts = findEntryStarts(source);
@@ -532,6 +781,13 @@
     findAuthorCompletion,
     normalizeDoi,
     normalizeAbstract,
-    extractUrl
+    extractUrl,
+    stripSingleBalancedOuterDelimiter,
+    repairBibBraceBalance,
+    normalizeBibFieldContent,
+    serializeBibFieldValue,
+    extractBibFieldContent,
+    canonicalizeSerializedBibFieldValue,
+    validateBibTeXFormatting
   };
 })();

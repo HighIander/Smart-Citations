@@ -174,14 +174,9 @@
   }
 
   function stripBibValue(value) {
-    let text = String(value ?? "").trim();
-    for (let depth = 0; depth < 4 && text.length >= 2; depth += 1) {
-      const braced = text.startsWith("{") && text.endsWith("}");
-      const quoted = text.startsWith('"') && text.endsWith('"');
-      if (!braced && !quoted) break;
-      text = text.slice(1, -1).trim();
-    }
-    return text;
+    const helper = globalThis.CollabTeXBibTeX?.stripSingleBalancedOuterDelimiter;
+    if (typeof helper === "function") return helper(value);
+    return String(value ?? "").trim();
   }
 
   function formatDoiSyncDateTime(value) {
@@ -455,7 +450,7 @@
     root.classList.toggle("ctca-manager-busy", value);
     const controls = root.querySelectorAll(
       ".ctca-manager-add-entry, .ctca-manager-add-menu button, .ctca-manager-add-category, .ctca-manager-update, " +
-      ".ctca-manager-update-all-doi, .ctca-manager-update-selected, .ctca-manager-remove-selected, " +
+      ".ctca-manager-update-all-doi, .ctca-manager-more-button, .ctca-manager-find-duplicates, .ctca-manager-update-selected, .ctca-manager-remove-selected, " +
       ".ctca-manager-select-visible-checkbox, .ctca-manager-global-sync-checkbox, .ctca-manager-cloud-settings, .ctca-manager-options, .ctca-manager-star-sort, .ctca-manager-column-eye, [data-manager-sort]"
     );
     controls.forEach((control) => { control.disabled = value; });
@@ -6153,6 +6148,154 @@
     setStatus("Stopping DOI update after the current request…");
   }
 
+
+  function duplicateInternalFields() {
+    return new Set([
+      CTCA_TAGS_FIELD,
+      CTCA_COMMENTS_FIELD,
+      CTCA_CROSSLINKS_FIELD,
+      "ctca_meta_version",
+      "ctca_doi_synced",
+      "ctca_categories",
+      "ctca_category_tree",
+      "ctca_added_on",
+      "ctca_starred"
+    ]);
+  }
+
+  function duplicateEntryTitle(entry) {
+    return stripBibValue(entry?.fields?.title || "") || "Untitled entry";
+  }
+
+  async function findAndDeleteDuplicates() {
+    if (busy) return;
+    const writableEntries = entries.filter((entry) => !isReadOnlySharedEntry(entry.key));
+    const groups = globalThis.SmartCitationsDuplicates.findGroups(writableEntries, {
+      getId: (entry, index) => `${index}\u241f${entry.key}`,
+      getKey: (entry) => entry.key,
+      latexToText: globalThis.CollabTeXBibTeX?.latexToText,
+      internalFields: duplicateInternalFields()
+    });
+    if (!groups.length) {
+      setStatus("No duplicate bibliography entries were found.");
+      return;
+    }
+
+    const review = globalThis.SmartCitationsDuplicates.createReviewControl(groups, {
+      document,
+      getTitle: duplicateEntryTitle,
+      getSource: () => "central database"
+    });
+    const selectedGroups = await showDialog({
+      title: `Review ${groups.length} duplicate group${groups.length === 1 ? "" : "s"}`,
+      message:
+        "Duplicates are entries with the same DOI or the same normalized title, journal, number, pages and year. " +
+        "The entry with the most filled fields is selected by default. Choose which entry and citation key to keep.",
+      controls: review.element,
+      buttons: [
+        { label: "Cancel", value: null },
+        {
+          label: "Delete selected duplicates",
+          primary: true,
+          danger: true,
+          getValue: () => review.getSelection()
+        }
+      ],
+      closeValue: null,
+      danger: true,
+      dialogClass: "ctca-duplicate-dialog"
+    });
+    if (!selectedGroups) return;
+    if (!selectedGroups.length) {
+      setStatus("No duplicate groups were selected for deletion.");
+      return;
+    }
+
+    const plans = selectedGroups.map((selection) => {
+      const keeperCandidate = selection.group.items.find((candidate) => candidate.id === selection.keeperId)
+        || selection.group.items[0];
+      const groupEntries = selection.group.items.map((candidate) => candidate.item);
+      return {
+        keeper: keeperCandidate.item,
+        groupEntries,
+        remove: groupEntries.filter((entry) => entry !== keeperCandidate.item),
+        desiredKey: String(selection.citationKey || keeperCandidate.item.key || "Reference").trim()
+      };
+    });
+    const removedEntries = plans.flatMap((plan) => plan.remove);
+    if (!removedEntries.length) {
+      setStatus("Every duplicate group already retained all entries; nothing was deleted.");
+      return;
+    }
+
+    setBusy(true, "Removing duplicates…");
+    try {
+      await globalThis.CollabTeXAttachmentStore.removeForEntries(removedEntries);
+
+      const removedSet = new Set(removedEntries);
+      const replacementByKey = new Map();
+      const categoriesByPlan = new Map();
+      for (const plan of plans) {
+        const categories = new Set();
+        for (const entry of plan.groupEntries) {
+          replacementByKey.set(String(entry.key || "").toLocaleLowerCase(), plan.desiredKey);
+          for (const categoryId of categoryState.memberships?.[entry.key] || []) categories.add(categoryId);
+        }
+        categoriesByPlan.set(plan, categories);
+      }
+
+      for (const entry of removedEntries) rememberGlobalDeletion(entry);
+      entries = entries.filter((entry) => !removedSet.has(entry));
+
+      for (const plan of plans) {
+        const oldKeeperKey = plan.keeper.key;
+        const aliases = new Set([
+          ...(plan.keeper.aliases || []),
+          ...plan.groupEntries.flatMap((entry) => [entry.key, ...(entry.aliases || [])])
+        ].filter(Boolean));
+        aliases.delete(plan.desiredKey);
+        plan.keeper.key = plan.desiredKey;
+        plan.keeper.aliases = [...aliases];
+        plan.keeper.updatedAt = new Date().toISOString();
+
+        for (const entry of plan.groupEntries) delete categoryState.memberships[entry.key];
+        const categories = [...categoriesByPlan.get(plan)];
+        if (categories.length) categoryState.memberships[plan.desiredKey] = categories;
+        else delete categoryState.memberships[plan.desiredKey];
+
+        for (const entry of plan.groupEntries) {
+          if (entry.key !== plan.desiredKey) updateSharedLocalKeyOverride(entry.key, plan.desiredKey);
+        }
+        if (oldKeeperKey !== plan.desiredKey) updateSharedLocalKeyOverride(oldKeeperKey, plan.desiredKey);
+      }
+
+      for (const entry of entries) {
+        entry.crosslinks = normalizeCrosslinkKeys(
+          (entry.crosslinks || []).map((key) => replacementByKey.get(String(key).toLocaleLowerCase()) || key),
+          entry.key
+        );
+      }
+      crosslinkNavigationStack = crosslinkNavigationStack.map((key) =>
+        replacementByKey.get(String(key).toLocaleLowerCase()) || key
+      );
+      selectedKeys = new Set([...selectedKeys]
+        .map((key) => replacementByKey.get(String(key).toLocaleLowerCase()) || key)
+        .filter((key) => entries.some((entry) => entry.key === key)));
+      selectedKey = replacementByKey.get(String(selectedKey).toLocaleLowerCase()) || selectedKey;
+      if (!entries.some((entry) => entry.key === selectedKey)) selectedKey = entries[0]?.key || "";
+      detailOnlyKey = replacementByKey.get(String(detailOnlyKey).toLocaleLowerCase()) || detailOnlyKey;
+      selectionAnchorKey = replacementByKey.get(String(selectionAnchorKey).toLocaleLowerCase()) || selectionAnchorKey;
+
+      markDirty("Saving duplicate removals automatically…");
+      await saveDatabase(`Removed ${removedEntries.length} duplicate entr${removedEntries.length === 1 ? "y" : "ies"}.`);
+      renderAll();
+    } catch (error) {
+      setStatus(`The duplicates were kept because deletion failed: ${error?.message || String(error)}`, true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function removeEntryKeys(keys) {
     const removal = new Set(keys);
     const removalIdentities = new Set([...removal].map((key) => String(key).toLocaleLowerCase()));
@@ -7493,7 +7636,9 @@
       : decodeURIComponent(escape(binary));
   }
 
-  function exportBibValue(value) {
+  function exportBibValue(value, fieldName = "") {
+    const serializer = globalThis.CollabTeXBibTeX?.serializeBibFieldValue;
+    if (typeof serializer === "function") return serializer(fieldName, value);
     const text = String(value ?? "").trim();
     return text ? `{${text}}` : "";
   }
@@ -7537,8 +7682,17 @@
       ...preferredOrder.filter((name) => fields[name]),
       ...Object.keys(fields).filter((name) => !preferredOrder.includes(name) && fields[name]).sort()
     ];
-    const lines = names.map((name) => `    ${name} = ${exportBibValue(fields[name])}`);
-    return `@${entry.type || "misc"}{${entry.key},\n${lines.join(",\n")}\n}`;
+    const lines = names.map((name) => `    ${name} = ${exportBibValue(fields[name], name)}`);
+    const entryType = String(entry.type || "misc").trim().toLowerCase();
+    const citationKey = String(entry.key || "").trim();
+    if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(entryType)) throw new Error(`Invalid BibTeX entry type: ${entryType || "(empty)"}.`);
+    if (!citationKey || /[\s,{}()=]/.test(citationKey)) throw new Error(`Invalid BibTeX citation key: ${citationKey || "(empty)"}.`);
+    const serialized = `@${entryType}{${citationKey},\n${lines.join(",\n")}\n}`;
+    const validation = globalThis.CollabTeXBibTeX?.validateBibTeXFormatting?.(serialized);
+    if (validation && !validation.valid) {
+      throw new Error(`Could not serialize ${citationKey} as valid BibTeX: ${validation.errors.slice(0, 3).join(" ")}`);
+    }
+    return serialized;
   }
 
 
@@ -7956,6 +8110,29 @@
     });
     $(".ctca-manager-update-all-doi", root).addEventListener("click", () => {
       updateEntriesFromDoi(entries, { showBatchConfirmation: true });
+    });
+    const managerMoreWrap = $(".ctca-manager-more-wrap", root);
+    const managerMoreButton = $(".ctca-manager-more-button", root);
+    const managerMoreMenu = $(".ctca-manager-more-menu", root);
+    const closeManagerMoreMenu = () => {
+      if (managerMoreMenu) managerMoreMenu.hidden = true;
+      managerMoreButton?.setAttribute("aria-expanded", "false");
+    };
+    managerMoreButton?.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const willOpen = Boolean(managerMoreMenu?.hidden);
+      if (managerMoreMenu) managerMoreMenu.hidden = !willOpen;
+      managerMoreButton.setAttribute("aria-expanded", willOpen ? "true" : "false");
+    });
+    managerMoreWrap?.addEventListener("click", (event) => event.stopPropagation());
+    document.addEventListener("click", closeManagerMoreMenu);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeManagerMoreMenu();
+    }, true);
+    $(".ctca-manager-find-duplicates", root).addEventListener("click", () => {
+      closeManagerMoreMenu();
+      findAndDeleteDuplicates().catch((error) => setStatus(error?.message || String(error), true));
     });
     $(".ctca-manager-update-selected", root).addEventListener("click", () => {
       updateEntriesFromDoi(

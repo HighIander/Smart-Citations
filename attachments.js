@@ -2262,7 +2262,13 @@
     const categoryTree = database.categories.length
       ? btoa(unescape(encodeURIComponent(JSON.stringify({ version: 1, categories: database.categories, updatedAt: database.updatedAt }))))
       : "";
+    const serializeValue = globalThis.CollabTeXBibTeX?.serializeBibFieldValue;
     const entryText = database.entries.map((entry, index) => {
+      const entryType = String(entry.type || "misc").trim().toLowerCase();
+      const citationKey = String(entry.key || "").trim();
+      if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(entryType)) throw new Error(`Invalid BibTeX entry type: ${entryType || "(empty)"}.`);
+      if (!citationKey || /[\s,{}()=]/.test(citationKey)) throw new Error(`Invalid BibTeX citation key: ${citationKey || "(empty)"}.`);
+
       const fields = { ...(entry.fields || {}) };
       if ((entry.aliases || []).length) fields.ids = [...new Set(entry.aliases)].join(", ");
       if ((entry.tags || []).length) fields.ctca_tags = [...new Set(entry.tags)].join(",");
@@ -2275,26 +2281,31 @@
       if (entry.starred) fields.ctca_starred = "true";
       const body = Object.entries(fields)
         .filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== "")
-        .map(([name, value]) => `  ${name} = {${bibEscape(value)}}`)
+        .map(([name, value]) => {
+          if (!/^[A-Za-z][A-Za-z0-9_:.+-]*$/.test(name)) throw new Error(`Invalid BibTeX field name ${name} in ${citationKey}.`);
+          const content = bibEscape(value);
+          const serialized = typeof serializeValue === "function" ? serializeValue(name, content) : `{${content}}`;
+          return `  ${name} = ${serialized}`;
+        })
         .join(",\n");
-      return `@${entry.type || "misc"}{${entry.key},\n${body}\n}`;
+      return `@${entryType}{${citationKey},\n${body}\n}`;
     }).join("\n\n");
 
     const deletionText = database.deletedEntries.length
       ? `@comment{${DELETION_COMMENT_PREFIX}${btoa(unescape(encodeURIComponent(JSON.stringify({ version: 1, deletedEntries: database.deletedEntries }))))}}`
       : "";
-    return [entryText, deletionText].filter(Boolean).join("\n\n") + (entryText || deletionText ? "\n" : "");
+    const result = [entryText, deletionText].filter(Boolean).join("\n\n") + (entryText || deletionText ? "\n" : "");
+    const validation = globalThis.CollabTeXBibTeX?.validateBibTeXFormatting?.(result);
+    if (validation && !validation.valid) {
+      throw new Error(`Could not serialize the bibliography as valid BibTeX: ${validation.errors.slice(0, 5).join(" ")}`);
+    }
+    return result;
   }
 
   function stripBibValue(value) {
-    let text = String(value ?? "").trim();
-    for (let depth = 0; depth < 6 && text.length >= 2; depth += 1) {
-      const braced = text.startsWith("{") && text.endsWith("}");
-      const quoted = text.startsWith('"') && text.endsWith('"');
-      if (!braced && !quoted) break;
-      text = text.slice(1, -1).trim();
-    }
-    return text;
+    const helper = globalThis.CollabTeXBibTeX?.stripSingleBalancedOuterDelimiter;
+    if (typeof helper === "function") return helper(value);
+    return String(value ?? "").trim();
   }
 
   function decodeBibMetadata(value) {
