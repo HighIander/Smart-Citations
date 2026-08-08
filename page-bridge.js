@@ -3,6 +3,11 @@
 (() => {
   "use strict";
 
+  // The bridge belongs only to a concrete project editor, never to the
+  // project overview/dashboard. This also guards against stale broad dynamic
+  // content-script registrations left behind by an older extension version.
+  if (!/^\/project\/[^/?#]+(?:\/|$)/i.test(window.location.pathname)) return;
+
   if (globalThis.__smartCitationsEditorBridgeLoaded) return;
   globalThis.__smartCitationsEditorBridgeLoaded = true;
 

@@ -1,3 +1,8 @@
+## 2.2.20
+
+- Disabled Smart Citations editor integration on CollabTeX/Overleaf project overview pages.
+- Editor scripts and styles are now injected only on concrete `/project/<id>` document URLs, with runtime guards for stale registrations from older versions.
+
 ## 2.2.19
 
 - Exact Citation Key matches in the CollabTeX citation popup remain fully highlighted in light blue even when mouse or keyboard navigation selects another result.
@@ -66,7 +71,7 @@
 - Stale session-level worker blocking rules from 2.2.5 are removed automatically.
 
 
-**Current version: 2.2.19**
+**Current version: 2.2.20**
 
 Smart Citations is a browser extension for building a personal BibTeX library, reusing it in CollabTeX and Overleaf, and keeping the papers behind those citations close at hand. It combines citation autocomplete, bibliography management, ORCID-based publication discovery, author-impact statistics, PDF capture, a built-in reader, annotations, notes, and optional Nextcloud synchronization.
 

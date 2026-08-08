@@ -334,7 +334,7 @@
         acknowledgedRevision: Math.max(0, Number(raw.acknowledgedRevision) || 0),
         pendingEntryIdentities: [...new Set((Array.isArray(raw.pendingEntryIdentities) ? raw.pendingEntryIdentities : [])
           .map((identity) => String(identity || "").trim().toLowerCase())
-          .filter((identity) => identity.startsWith("key:")))],
+          .filter((identity) => identity.startsWith("doi:") || identity.startsWith("key:")))],
         registeredAt: String(raw.registeredAt || ""),
         updatedAt: String(raw.updatedAt || "")
       };
@@ -6228,6 +6228,24 @@
       return;
     }
 
+    // Preserve the original records that must disappear from Nextcloud before
+    // any keeper citation key is changed below. When the user keeps the
+    // citation key of an entry that is otherwise removed, the old keeper key
+    // must be deleted remotely instead of the retained final key.
+    const nextcloudDeletionEntries = plans.flatMap((plan) => {
+      const retainedKey = String(plan.desiredKey || "").trim().toLocaleLowerCase();
+      return plan.groupEntries
+        .filter((entry) => String(entry?.key || "").trim().toLocaleLowerCase() !== retainedKey)
+        .map((entry) => ({
+          ...entry,
+          fields: { ...(entry.fields || {}) },
+          aliases: [...(entry.aliases || [])],
+          tags: [...(entry.tags || [])],
+          comments: normalizeCommentItems(entry.comments),
+          crosslinks: [...(entry.crosslinks || [])]
+        }));
+    });
+
     setBusy(true, "Removing duplicates…");
     try {
       await globalThis.CollabTeXAttachmentStore.removeForEntries(removedEntries);
@@ -6288,6 +6306,7 @@
 
       markDirty("Saving duplicate removals automatically…");
       await saveDatabase(`Removed ${removedEntries.length} duplicate entr${removedEntries.length === 1 ? "y" : "ies"}.`);
+      await propagateRemovedEntriesToNextcloud(nextcloudDeletionEntries);
       renderAll();
     } catch (error) {
       setStatus(`The duplicates were kept because deletion failed: ${error?.message || String(error)}`, true);

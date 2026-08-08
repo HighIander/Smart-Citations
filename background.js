@@ -76,7 +76,18 @@
   }
 
   function editorSiteMatchPattern(domain) {
-    return `https://${domain}/*`;
+    // Smart Citations is an editor integration, not a project-dashboard integration.
+    // Restrict injection to project routes. The trailing-slash dashboard variant
+    // is explicitly excluded below because a match-pattern `*` can be empty.
+    return `https://${domain}/project/*`;
+  }
+
+  function editorSiteOverviewMatchPattern(domain) {
+    return `https://${domain}/project/`;
+  }
+
+  function isActualEditorProjectUrl(url) {
+    return /^\/project\/[^/?#]+(?:\/|$)/i.test(url?.pathname || "");
   }
 
   async function configuredEditorDomains() {
@@ -94,8 +105,8 @@
     }
 
     const domains = await configuredEditorDomains();
-    const matches = domains
-      .map(editorSiteMatchPattern);
+    const matches = domains.map(editorSiteMatchPattern);
+    const excludeMatches = domains.map(editorSiteOverviewMatchPattern);
     const ids = [EDITOR_BOOTSTRAP_SCRIPT_ID, EDITOR_BRIDGE_SCRIPT_ID, EDITOR_CONTENT_SCRIPT_ID];
     // Unregister one ID at a time. Some browser versions reject a batch when
     // one requested ID is absent, which could otherwise leave the legacy
@@ -112,6 +123,7 @@
       {
         id: EDITOR_BRIDGE_SCRIPT_ID,
         matches,
+        excludeMatches,
         js: ["page-bridge.js"],
         runAt: "document_idle",
         allFrames: false,
@@ -121,6 +133,7 @@
       {
         id: EDITOR_CONTENT_SCRIPT_ID,
         matches,
+        excludeMatches,
         css: ["content.css", "privacy-consent.css"],
         js: [
           "latex-renderer.js",
@@ -3268,7 +3281,7 @@
     } catch (_error) {
       return false;
     }
-    if (url.protocol !== "https:") return false;
+    if (url.protocol !== "https:" || !isActualEditorProjectUrl(url)) return false;
     const domains = await configuredEditorDomains();
     return domains.some((domain) => editorSiteDomainMatches(url.hostname, domain));
   }

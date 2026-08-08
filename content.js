@@ -3,6 +3,12 @@
 (() => {
   "use strict";
 
+  // Do not initialize Smart Citations on a project overview/dashboard page.
+  // Dynamic registration is also restricted to /project/*, but this runtime
+  // guard protects users who still have a broader persisted registration from
+  // an older extension version until the service worker refreshes it.
+  if (!/^\/project\/[^/?#]+(?:\/|$)/i.test(window.location.pathname)) return;
+
   if (globalThis.__smartCitationsEditorContentLoaded) return;
   globalThis.__smartCitationsEditorContentLoaded = true;
 
@@ -240,6 +246,7 @@
   let managerInitialParseState = "pending";
   let managerInitialParseError = "";
   let managerInitialParseDiagnostics = null;
+  let managerParsedBibFingerprints = new Map();
   let managerOpenFallbackParseAttempted = false;
   let managerGlobalSyncSession = null;
   let pageLoadBibliographyParsePromise = null;
@@ -3466,60 +3473,11 @@
 
   async function chooseManagerCentralDeletions(drafts) {
     const choices = new Map();
-    if (!settings.syncGlobalDatabase) {
-      for (const draft of drafts) choices.set(draft.id, false);
-      return choices;
-    }
-
-    let choiceForRemaining = null;
-    for (let index = 0; index < drafts.length; index += 1) {
-      const draft = drafts[index];
-      if (choiceForRemaining !== null) {
-        choices.set(draft.id, choiceForRemaining);
-        continue;
-      }
-
-      let useForAll = false;
-      const decision = await showAppDialog({
-        title: `Delete ${draft.key} from the central database too?`,
-        message:
-          `${draft.key} will be removed from this ColLabTeX document. ` +
-          "Choose whether the synchronized entry should also be deleted from the Smart Citations central database.",
-        controls: drafts.length > 1
-          ? (container) => {
-              const label = document.createElement("label");
-              label.className = "ctca-app-dialog-check";
-              const checkbox = document.createElement("input");
-              checkbox.type = "checkbox";
-              checkbox.addEventListener("change", () => {
-                useForAll = checkbox.checked;
-              });
-              label.append(checkbox, document.createTextNode("Use this choice for all entries"));
-              container.appendChild(label);
-            }
-          : null,
-        buttons: [
-          { label: "Cancel deletion", value: null },
-          {
-            label: "Keep in central database",
-            primary: true,
-            getValue: () => ({ deleteCentral: false, useForAll })
-          },
-          {
-            label: "Delete from central database",
-            danger: true,
-            getValue: () => ({ deleteCentral: true, useForAll })
-          }
-        ],
-        closeValue: null,
-        danger: true
-      });
-      if (!decision) return null;
-      choices.set(draft.id, decision.deleteCentral);
-      if (decision.useForAll) choiceForRemaining = decision.deleteCentral;
-    }
+    const deleteCentral = settings.syncGlobalDatabase === true;
+    for (const draft of drafts || []) choices.set(draft.id, deleteCentral);
     return choices;
   }
+
 
   function managerChosenCentralDeletionIdentities() {
     return new Set([
@@ -3589,6 +3547,7 @@
       return {
         keeper: keeperCandidate.item,
         groupDrafts,
+        originalItems: groupDrafts.map((draft) => globalItemFromDraft(draft)),
         remove: groupDrafts.filter((draft) => draft !== keeperCandidate.item),
         desiredKey: String(selection.citationKey || keeperCandidate.item.key || "Reference").trim()
       };
@@ -3621,6 +3580,16 @@
       if (oldKeeperKey !== plan.desiredKey) managerUpdateSharedLocalKeyOverride(oldKeeperKey, plan.desiredKey);
       managerSetEntryCategoryIds(plan.keeper.id, [...categoryIds]);
       managerMarkDirty(plan.keeper, false);
+
+      if (settings.syncGlobalDatabase) {
+        const retainedIdentity = globalSyncIdentity(globalItemFromDraft(plan.keeper));
+        for (const originalItem of plan.originalItems || []) {
+          const originalIdentity = globalSyncIdentity(originalItem);
+          if (originalIdentity !== "key:" && originalIdentity !== retainedIdentity) {
+            managerPendingCentralDeletionIdentities.add(originalIdentity);
+          }
+        }
+      }
     }
 
     for (const draft of removedDrafts) {
@@ -9338,6 +9307,7 @@
     const parsed = [];
     const failures = [];
     const fileResults = [];
+    const fileFingerprints = new Map();
     for (let index = 0; index < files.length; index += 1) {
       const fileName = files[index];
       const startedAt = Date.now();
@@ -9362,6 +9332,8 @@
           throw parseError;
         }
         parsed.push(...parsedFile);
+        observedBibTextByFile.set(fileName, text);
+        fileFingerprints.set(normalizeBibSourceName(fileName), contentFingerprint(text));
         fileResults.push({
           fileName,
           ok: true,
@@ -9387,7 +9359,7 @@
         });
       }
     }
-    return { parsed, failures, fileResults };
+    return { parsed, failures, fileResults, fileFingerprints };
   }
 
   function resetManagerDrafts(preserveSelectionKey = "") {
@@ -9437,7 +9409,7 @@
       nextFiles = uniqueBibliographyFileCandidates(setup.files);
     }
 
-    const { parsed, failures, fileResults } = await managerReadBibliographyFiles(nextFiles, { reader });
+    const { parsed, failures, fileResults, fileFingerprints } = await managerReadBibliographyFiles(nextFiles, { reader });
     if (requireReadable && nextFiles.length && failures.length === nextFiles.length) {
       if (originalFile) await restoreFile(originalFile, { waitForStable: false }).catch(() => null);
       const error = new Error(`Could not read any configured BibTeX file. ${failures.join("; ")}`);
@@ -9450,6 +9422,7 @@
     const unique = new Map();
     for (const record of parsed) unique.set(managerRecordId(record), record);
     managerRecords = [...unique.values()];
+    managerParsedBibFingerprints = new Map(fileFingerprints || []);
     restoreEmbeddedManagerState(managerRecords);
     records = managerRecords.slice();
     cachedFiles = managerFiles.slice();
@@ -9745,6 +9718,7 @@
       managerDirtyIds.delete(addition.draft.id);
     }
     observedBibTextByFile.set(plan.fileName, finalText);
+    managerParsedBibFingerprints.set(normalizeBibSourceName(plan.fileName), contentFingerprint(finalText));
   }
 
   async function managerWriteDirtyEntries({ scheduleSync = false, fastRestore = false } = {}) {
@@ -10204,8 +10178,8 @@
     if (!diffs.length) return new Set();
     const selected = new Set(diffs.map((diff) => diff.identity));
     const result = await showAppDialog({
-      title: `Apply ${diffs.length} central database change${diffs.length === 1 ? "" : "s"} locally?`,
-      message: "This list contains entries that are new in the central database or were modified only there. Selected entries overwrite or add the central version locally; unselected entries keep the current local state.",
+      title: `Handle ${diffs.length} central database addition/deletion${diffs.length === 1 ? "" : "s"}`,
+      message: "These entries were added to or deleted from the central database. Selected changes are applied to this document; unselected changes keep the current document version.",
       controls: (container) => {
         const toolbar = document.createElement("div");
         toolbar.className = "ctca-global-import-toolbar";
@@ -10245,7 +10219,7 @@
           heading.innerHTML = managerLatexHtml(stripOneBibDelimiter(fields.title || item.key || "Untitled reference"));
           const meta = document.createElement("span");
           meta.className = "ctca-global-import-entry-meta";
-          const kind = diff.globalChangeKind === "new" ? "new centrally" : "modified centrally";
+          const kind = diff.globalChangeKind === "deleted" ? "deleted centrally" : "new centrally";
           meta.textContent = `${kind} · ${managerGlobalDiffMeta(diff)}`;
           details.append(heading, meta);
           label.append(checkbox, details);
@@ -10308,7 +10282,7 @@
 
         const setAll = (action) => {
           for (const diff of diffs) {
-            if (action === "central" && !diff.global) continue;
+            if (action === "central" && !diff.global && !(conflict && diff.base)) continue;
             choices.set(diff.identity, action);
             const radios = radiosByIdentity.get(diff.identity) || [];
             for (const radio of radios) radio.checked = radio.value === action;
@@ -10329,14 +10303,16 @@
           legend.innerHTML = managerLatexHtml(stripOneBibDelimiter(fields.title || item.key || "Untitled reference"));
           const meta = document.createElement("div");
           meta.className = "ctca-global-import-entry-meta";
-          const kind = conflict ? "modified locally and centrally" : (diff.localChangeKind === "new" ? "new locally" : "modified locally");
+          const kind = conflict
+            ? `${diff.localChangeKind === "deleted" ? "deleted locally" : "modified locally"} and ${diff.globalChangeKind === "deleted" ? "deleted centrally" : "modified centrally"}`
+            : (diff.localChangeKind === "new" ? "new locally" : (diff.localChangeKind === "deleted" ? "deleted locally" : "modified locally"));
           meta.textContent = `${kind} · ${managerGlobalDiffMeta(diff)}`;
           card.append(legend, meta);
 
           const radioName = `ctca-global-choice-${Math.random().toString(36).slice(2)}`;
           const options = [
             ["keep-local", "Keep local", "Leave the central database unchanged."],
-            ["central", "Overwrite local with central", diff.global ? "Use the current central version locally." : "No central version exists for this new local entry."],
+            ["central", diff.global ? "Overwrite local with central" : "Accept central deletion", diff.global ? "Use the current central version locally." : "Remove the local entry because it was deleted centrally."],
             ["push", "Keep local + update central", "Keep the local version and write it to the central database."]
           ];
           const radios = [];
@@ -10347,7 +10323,7 @@
             radio.type = "radio";
             radio.name = radioName;
             radio.value = value;
-            radio.disabled = value === "central" && !diff.global;
+            radio.disabled = value === "central" && !diff.global && !(conflict && diff.base);
             radio.checked = choices.get(diff.identity) === value;
             radio.addEventListener("change", () => {
               if (radio.checked) choices.set(diff.identity, value);
@@ -10410,10 +10386,6 @@
   }
 
   function classifyManagerGlobalDiffs(localItems, globalItems, snapshotItems) {
-    // Compare both current sides against the last successfully synchronized
-    // version. A conflict exists only when both sides changed independently.
-    // Entries that exist on only one side and were not in the snapshot are new
-    // on that side.
     const localByIdentity = new Map((localItems || []).map((item) => [globalSyncIdentity(item), item]));
     const globalByIdentity = new Map((globalItems || []).map((item) => [globalSyncIdentity(item), item]));
     const identities = new Set([...localByIdentity.keys(), ...globalByIdentity.keys(), ...snapshotItems.keys()]);
@@ -10429,30 +10401,14 @@
       const globalFingerprint = globalItemFingerprint(globalItem);
       const baseFingerprint = globalItemFingerprint(baseItem);
 
-      // Equal current versions need no decision, even when no snapshot exists.
       if (localFingerprint === globalFingerprint) continue;
 
-      let localChanged = false;
-      let globalChanged = false;
-      if (baseItem) {
-        localChanged = localFingerprint !== baseFingerprint;
-        globalChanged = globalFingerprint !== baseFingerprint;
-      } else {
-        localChanged = Boolean(localItem);
-        globalChanged = Boolean(globalItem);
-      }
-
-      // A one-sided entry with no base is new. For conservative compatibility,
-      // a one-sided entry with a base remains a change on the side that exists;
-      // explicit central deletion tombstones are handled by the deletion path.
-      if (!localItem && globalItem) {
-        localChanged = false;
-        globalChanged = true;
-      } else if (localItem && !globalItem) {
-        localChanged = true;
-        globalChanged = false;
-      }
-
+      const localChanged = baseItem
+        ? localFingerprint !== baseFingerprint
+        : Boolean(localItem);
+      const globalChanged = baseItem
+        ? globalFingerprint !== baseFingerprint
+        : Boolean(globalItem);
       if (!localChanged && !globalChanged) continue;
 
       const signature = managerGlobalDiffSignature(localItem, globalItem, baseItem);
@@ -10467,8 +10423,8 @@
         baseFingerprint,
         localChanged,
         globalChanged,
-        localChangeKind: !localItem ? "missing" : (!baseItem ? "new" : "modified"),
-        globalChangeKind: !globalItem ? "missing" : (!baseItem ? "new" : "modified")
+        localChangeKind: !localItem ? (baseItem ? "deleted" : "missing") : (!baseItem ? "new" : "modified"),
+        globalChangeKind: !globalItem ? (baseItem ? "deleted" : "missing") : (!baseItem ? "new" : "modified")
       };
 
       if (localChanged && globalChanged) conflicts.push({ ...common, category: "conflict" });
@@ -10483,6 +10439,7 @@
     conflicts.sort(byKey);
     return { central, local, conflicts, localByIdentity, globalByIdentity };
   }
+
 
 
   const MANAGER_GLOBAL_VALID_ACTIONS = {
@@ -10504,8 +10461,23 @@
     };
   }
 
+  function centralDiffRequiresUserAction(diff) {
+    return diff?.category === "central" && (
+      diff.globalChangeKind === "new" || diff.globalChangeKind === "deleted"
+    );
+  }
+
+  function actionableManagerGlobalDiffs(diffs, ledger, { forceAskAll = false } = {}) {
+    const unresolved = unresolvedManagerGlobalDiffs(diffs, ledger, { forceAskAll });
+    return {
+      ...unresolved,
+      centralActionable: unresolved.central.filter(centralDiffRequiresUserAction)
+    };
+  }
+
   async function notifyPageLoadGlobalDiffsImpl({ showBanner = true } = {}) {
     if (!settings.syncGlobalDatabase) {
+      updateGlobalPendingUi(0, 0);
       updateGlobalComparisonPendingUi(0);
       if (showBanner && managerInitialParseState === "failed") {
         showGlobalBanner("The local bibliography could not be parsed in the background.", {
@@ -10524,9 +10496,12 @@
       loadManagerGlobalSyncDecisionLedger()
     ]);
     const globalItems = globalState.entries || [];
-    // An entirely empty central database is handled by the existing initial
-    // import assistant; do not replace that prompt with a generic diff banner.
-    if (!globalItems.length && !snapshotItems.size) {
+    const documentFlag = normalizeGlobalDocumentSync(globalState.documentSync).documents[currentDocumentSyncId()];
+
+    if (!managerInitialOpenParsed) {
+      // An exact badge count requires the actual document bibliography. A raw
+      // database revision count is deliberately not displayed as an entry count.
+      updateGlobalPendingUi(0, documentFlag?.pendingRevision || 0);
       updateGlobalComparisonPendingUi(0);
       if (showBanner && managerInitialParseState === "failed") {
         showGlobalBanner("The local bibliography could not be parsed in the background.", {
@@ -10539,46 +10514,32 @@
       return null;
     }
 
-    const localItems = managerInitialOpenParsed ? globalItemsFromCurrentDocument() : [];
-    const allDiffs = classifyManagerGlobalDiffs(localItems, globalItems, snapshotItems);
-    const diffs = unresolvedManagerGlobalDiffs(allDiffs, ledger);
-    const total = diffs.central.length + diffs.local.length + diffs.conflicts.length;
-    updateGlobalComparisonPendingUi(total);
-    if (!total) {
-      if (showBanner && managerInitialParseState === "failed") {
-        showGlobalBanner("The local bibliography could not be parsed in the background.", {
-          variant: "error",
-          detailsText: backgroundParseDebugReport(),
-          detailsLabel: "Details",
-          replacePersistentError: true
-        });
-      }
-      return diffs;
+    if (!globalItems.length && !snapshotItems.size) {
+      updateGlobalPendingUi(0, documentFlag?.pendingRevision || 0);
+      updateGlobalComparisonPendingUi(0);
+      return { central: [], local: [], conflicts: [], centralActionable: [] };
     }
 
-    const parts = [];
-    if (diffs.central.length) parts.push(`${diffs.central.length} central change${diffs.central.length === 1 ? "" : "s"}`);
-    if (diffs.local.length) parts.push(`${diffs.local.length} local change${diffs.local.length === 1 ? "" : "s"}`);
-    if (diffs.conflicts.length) parts.push(`${diffs.conflicts.length} true conflict${diffs.conflicts.length === 1 ? "" : "s"}`);
+    const localItems = globalItemsFromCurrentDocument();
+    const allDiffs = classifyManagerGlobalDiffs(localItems, globalItems, snapshotItems);
+    const actionable = actionableManagerGlobalDiffs(allDiffs, ledger);
+    const conflicts = actionable.conflicts;
+    updateGlobalPendingUi(actionable.centralActionable.length, documentFlag?.pendingRevision || 0);
+    updateGlobalComparisonPendingUi(conflicts.length);
+
+    if (!conflicts.length) return actionable;
 
     if (showBanner) {
-      const parsePrefix = managerInitialOpenParsed
-        ? "Bibliography differences detected"
-        : "The local bibliography could not be parsed in the background; central entries are available";
       showGlobalBanner(
-        `${parsePrefix}: ${parts.join(", ")}. Resolve them now?`,
+        `Bibliography synchronization conflict detected: ${conflicts.length} entr${conflicts.length === 1 ? "y was" : "ies were"} changed both locally and centrally. Resolve now?`,
         {
           yesLabel: "Resolve now",
-          noLabel: managerInitialOpenParsed ? "Later" : "Acknowledge",
-          onYes: resolvePageLoadGlobalDiffsNow,
-          detailsText: managerInitialOpenParsed ? "" : backgroundParseDebugReport(),
-          detailsLabel: "Details",
-          variant: managerInitialOpenParsed ? "" : "error",
-          replacePersistentError: !managerInitialOpenParsed
+          noLabel: "Later",
+          onYes: resolvePageLoadGlobalDiffsNow
         }
       );
     }
-    return diffs;
+    return actionable;
   }
 
   async function notifyPageLoadGlobalDiffs(options = {}) {
@@ -10612,7 +10573,7 @@
       }
 
       await registerCurrentDocumentWithGlobalDatabase();
-      const session = await prepareManagerGlobalSyncDecisions({ forceAskAll: false });
+      const session = await prepareManagerGlobalSyncDecisions({ forceAskAll: false, promptActionable: globalDocumentPendingCount > 0 });
       if (!session) return null;
 
       showDocumentBibliographyUpdateOverlay("Applying bibliography synchronization decisions…");
@@ -10807,6 +10768,27 @@
     return false;
   }
 
+  function applyCentralDeletionToManagerDraft(diff) {
+    const identity = String(diff?.identity || "");
+    if (!identity) return false;
+    const draft = [...managerDrafts.values()].find(
+      (candidate) => candidate.centralPreview !== true && globalSyncIdentity(globalItemFromDraft(candidate)) === identity
+    ) || null;
+    if (!draft) return false;
+
+    managerDeletedDrafts.set(draft.id, { ...draft });
+    managerDirtyIds.delete(draft.id);
+    managerDrafts.delete(draft.id);
+    managerSelectedIds.delete(draft.id);
+    delete managerCategoryState.memberships[draft.id];
+    managerRecords = managerRecords.filter((record) => managerRecordId(record) !== draft.id);
+    managerCrosslinkNavigationStack = managerCrosslinkNavigationStack.filter((id) => id !== draft.id);
+    if (managerSelectedId === draft.id) managerSelectedId = managerDrafts.keys().next().value || "";
+    managerSessionChanged = true;
+    return true;
+  }
+
+
   function cloneManagerSyncValue(value) {
     if (typeof globalThis.structuredClone === "function") {
       try { return globalThis.structuredClone(value); } catch (_error) {}
@@ -10849,14 +10831,16 @@
   function rollbackProvisionalGlobalSyncAfterWriteFailure() {
     const session = managerGlobalSyncSession;
     if (!session) return;
-    const pendingCount = session.promptedIdentities?.size || 0;
+    const centralCount = session.promptedCentralIdentities?.size || 0;
+    const conflictCount = session.promptedConflictIdentities?.size || 0;
     restoreManagerProvisionalSyncState(session.rollbackState);
     managerGlobalSyncSession = null;
     deferredProjectGlobalPush = true;
-    updateGlobalComparisonPendingUi(Math.max(pendingCount, globalDocumentPendingCount || 0));
+    updateGlobalPendingUi(centralCount, globalDocumentPendingRevision);
+    updateGlobalComparisonPendingUi(conflictCount);
   }
 
-  async function prepareManagerGlobalSyncDecisionsImpl({ forceAskAll = false } = {}) {
+  async function prepareManagerGlobalSyncDecisionsImpl({ forceAskAll = false, promptActionable = false } = {}) {
     if (!settings.syncGlobalDatabase || !managerFiles.length) {
       managerGlobalSyncSession = null;
       return null;
@@ -10871,39 +10855,34 @@
     const diffs = classifyManagerGlobalDiffs(localItems, globalState.entries || [], snapshotItems);
     const actions = new Map();
     const allDiffs = [...diffs.central, ...diffs.local, ...diffs.conflicts];
-
-    const unresolved = unresolvedManagerGlobalDiffs(diffs, ledger, { forceAskAll });
-    const unresolvedCentral = unresolved.central;
-    const unresolvedLocal = unresolved.local;
+    const unresolved = actionableManagerGlobalDiffs(diffs, ledger, { forceAskAll });
+    const unresolvedCentralActions = promptActionable ? unresolved.centralActionable : [];
     const unresolvedConflicts = unresolved.conflicts;
 
-    const collectPrior = (items, kind) => {
-      for (const diff of items) {
-        const prior = ledger.decisions[diff.identity];
-        if (!forceAskAll && prior?.signature === diff.signature && MANAGER_GLOBAL_VALID_ACTIONS[kind].has(prior.action)) {
-          actions.set(diff.identity, prior.action);
-        }
+    // Reuse a previously completed choice only while the exact three-way
+    // fingerprints remain unchanged. Local one-sided changes are always pushed
+    // silently, while central modifications are pulled silently.
+    for (const diff of diffs.central) {
+      const prior = ledger.decisions[diff.identity];
+      if (!forceAskAll && prior?.signature === diff.signature && MANAGER_GLOBAL_VALID_ACTIONS.central.has(prior.action)) {
+        actions.set(diff.identity, prior.action);
+      } else if (!centralDiffRequiresUserAction(diff)) {
+        actions.set(diff.identity, "central");
       }
-    };
-    collectPrior(diffs.central, "central");
-    collectPrior(diffs.local, "local");
-    collectPrior(diffs.conflicts, "conflict");
-
-    if (unresolvedCentral.length) {
-      const selected = await chooseManagerCentralChanges(unresolvedCentral);
-      if (selected === null) return null;
-      for (const diff of unresolvedCentral) {
-        const action = selected.has(diff.identity) ? "pull" : "keep-local";
-        actions.set(diff.identity, action);
-        ledger.decisions[diff.identity] = { signature: diff.signature, action, updatedAt: new Date().toISOString() };
+    }
+    for (const diff of diffs.local) actions.set(diff.identity, "push");
+    for (const diff of diffs.conflicts) {
+      const prior = ledger.decisions[diff.identity];
+      if (!forceAskAll && prior?.signature === diff.signature && MANAGER_GLOBAL_VALID_ACTIONS.conflict.has(prior.action)) {
+        actions.set(diff.identity, prior.action);
       }
     }
 
-    if (unresolvedLocal.length) {
-      const selectedActions = await chooseManagerLocalOrConflictActions(unresolvedLocal, { conflict: false });
-      if (selectedActions === null) return null;
-      for (const diff of unresolvedLocal) {
-        const action = selectedActions.get(diff.identity) || "keep-local";
+    if (unresolvedCentralActions.length) {
+      const selected = await chooseManagerCentralChanges(unresolvedCentralActions);
+      if (selected === null) return null;
+      for (const diff of unresolvedCentralActions) {
+        const action = selected.has(diff.identity) ? "central" : "keep-local";
         actions.set(diff.identity, action);
         ledger.decisions[diff.identity] = { signature: diff.signature, action, updatedAt: new Date().toISOString() };
       }
@@ -10919,21 +10898,19 @@
       }
     }
 
-    if (unresolvedCentral.length || unresolvedLocal.length || unresolvedConflicts.length) {
+    if (unresolvedCentralActions.length || unresolvedConflicts.length) {
       await releaseAppDialogBeforeBackgroundWork();
     }
-
-    // Newly answered synchronization choices remain provisional until the
-    // local bibliography write and the central-database commit both succeed.
-    // Persisting them here would incorrectly hide unresolved differences after
-    // a write timeout or rejected background update.
 
     const rollbackState = captureManagerProvisionalSyncState();
     let centralApplied = 0;
     for (const diff of allDiffs) {
       const action = actions.get(diff.identity);
-      if ((action === "pull" || action === "central") && diff.global) {
+      if (action !== "pull" && action !== "central") continue;
+      if (diff.global) {
         if (applyCentralItemToManagerDraft(diff.global)) centralApplied += 1;
+      } else if (diff.base && applyCentralDeletionToManagerDraft(diff)) {
+        centralApplied += 1;
       }
     }
     if (centralApplied) {
@@ -10952,19 +10929,35 @@
       snapshotItems,
       decisionLedger: ledger,
       promptedIdentities: new Set([
-        ...unresolvedCentral.map((diff) => diff.identity),
-        ...unresolvedLocal.map((diff) => diff.identity),
+        ...unresolvedCentralActions.map((diff) => diff.identity),
         ...unresolvedConflicts.map((diff) => diff.identity)
       ]),
+      promptedCentralIdentities: new Set(unresolvedCentralActions.map((diff) => diff.identity)),
+      promptedConflictIdentities: new Set(unresolvedConflicts.map((diff) => diff.identity)),
       rollbackState,
       preparedAt: new Date().toISOString(),
-      forceAsked: forceAskAll
+      forceAsked: forceAskAll,
+      requiresCommit: allDiffs.length > 0
     };
-    const promptedCount = unresolvedCentral.length + unresolvedLocal.length + unresolvedConflicts.length;
+
+    // Once the user has supplied all requested choices, those entries are no
+    // longer actionable. A failed write restores the exact two counts above.
+    if (promptActionable) {
+      updateGlobalPendingUi(0, globalDocumentPendingRevision);
+      updateGlobalComparisonPendingUi(0);
+    }
+
+    const deferredCentralActions = promptActionable
+      ? []
+      : unresolved.centralActionable.filter((diff) => !actions.has(diff.identity));
     managerSetStatus(
-      promptedCount
-        ? `Synchronization choices collected for ${unresolvedCentral.length} central change${unresolvedCentral.length === 1 ? "" : "s"}, ${unresolvedLocal.length} local change${unresolvedLocal.length === 1 ? "" : "s"}, and ${unresolvedConflicts.length} true conflict${unresolvedConflicts.length === 1 ? "" : "s"}.`
-        : (allDiffs.length ? "All existing differences already have a saved decision." : "Central synchronization checked: no differences.")
+      unresolvedCentralActions.length || unresolvedConflicts.length
+        ? `Synchronization choices collected for ${unresolvedCentralActions.length} central addition/deletion${unresolvedCentralActions.length === 1 ? "" : "s"} and ${unresolvedConflicts.length} true conflict${unresolvedConflicts.length === 1 ? "" : "s"}.`
+        : (deferredCentralActions.length
+            ? `${deferredCentralActions.length} central addition/deletion${deferredCentralActions.length === 1 ? " is" : "s are"} waiting for review; all other one-sided changes synchronize automatically.`
+            : (allDiffs.length
+                ? `${diffs.central.length + diffs.local.length} one-sided bibliography change${diffs.central.length + diffs.local.length === 1 ? " is" : "s are"} synchronized automatically.`
+                : "Central synchronization checked: no differences."))
     );
     return managerGlobalSyncSession;
   }
@@ -10976,6 +10969,31 @@
     } finally {
       finishToolbarActivity();
     }
+  }
+
+  async function propagateCentralDeletionsToNextcloud(entries) {
+    if (!entries?.length) return;
+    const config = await globalThis.CollabTeXAttachmentStore.getConfig();
+    if (!config?.nextcloud?.syncBibliography || !config.nextcloud?.appPassword) return;
+
+    window.clearTimeout(managerNextcloudSyncTimer);
+    managerNextcloudSyncTimer = null;
+    const deadline = Date.now() + 30000;
+    while (managerNextcloudSyncInProgress && Date.now() < deadline) await delay(100);
+    if (managerNextcloudSyncInProgress) {
+      managerScheduleNextcloudSync(1500);
+      return;
+    }
+
+    managerNextcloudSyncInProgress = true;
+    try {
+      await globalThis.CollabTeXAttachmentStore.deleteBibliographyEntriesNextcloud(entries);
+    } catch (error) {
+      console.warn("[Smart Citations] Could not propagate central deletions directly to Nextcloud:", error);
+    } finally {
+      managerNextcloudSyncInProgress = false;
+    }
+    managerScheduleNextcloudSync(0);
   }
 
   async function commitManagerGlobalSyncDecisions({ source = "bibliography manager closed" } = {}) {
@@ -10991,7 +11009,18 @@
     const keptLocalOnly = new Set();
     const unresolved = new Set();
     const synchronized = new Set();
+    const deletedGlobalItems = [];
+    const deletedGlobalIdentities = new Set();
     let changedGlobal = false;
+
+    const deleteGlobalIdentity = (identity, item) => {
+      if (!item || deletedGlobalIdentities.has(identity)) return;
+      deletedGlobalIdentities.add(identity);
+      deletedGlobalItems.push(item);
+      globalByIdentity.delete(identity);
+      changedGlobal = true;
+      synchronized.add(identity);
+    };
 
     const identities = new Set([
       ...localByIdentity.keys(),
@@ -11010,9 +11039,6 @@
       const postDecisionFingerprint = session.postDecisionLocalFingerprints.get(identity) || "";
       const localChangedInManager = globalItemFingerprint(localItem) !== postDecisionFingerprint;
 
-      // The user explicitly accepts the local state without changing central.
-      // The decision ledger suppresses the same exact difference until either
-      // side changes again, so this is acknowledged rather than unresolved.
       if (action === "keep-local") {
         if (diff?.category === "central") keptCentralPending.add(identity);
         else keptLocalOnly.add(identity);
@@ -11025,37 +11051,49 @@
       }
 
       const explicitlyPush = action === "push";
-      const shouldPushManagerEdit = !diff && localChangedInManager && Boolean(localItem);
-      if ((explicitlyPush || shouldPushManagerEdit) && localItem) {
+      const shouldPushManagerEdit = !diff && localChangedInManager;
+      if (explicitlyPush || shouldPushManagerEdit) {
         if (centralChangedWhileOpen && currentGlobalFingerprint !== globalItemFingerprint(localItem)) {
           unresolved.add(identity);
           continue;
         }
-        if (currentGlobalFingerprint !== globalItemFingerprint(localItem)) {
-          globalByIdentity.set(identity, { ...localItem, updatedAt: new Date().toISOString() });
-          changedGlobal = true;
+        if (localItem) {
+          if (currentGlobalFingerprint !== globalItemFingerprint(localItem)) {
+            globalByIdentity.set(identity, { ...localItem, updatedAt: new Date().toISOString() });
+            changedGlobal = true;
+          }
+          synchronized.add(identity);
+        } else if (globalItem) {
+          deleteGlobalIdentity(identity, globalItem);
+        } else {
+          synchronized.add(identity);
         }
-        synchronized.add(identity);
         continue;
       }
 
-      if ((action === "pull" || action === "central") && globalItem) {
-        if (localItem && globalItemFingerprint(localItem) === currentGlobalFingerprint) synchronized.add(identity);
-        else unresolved.add(identity);
+      if (action === "pull" || action === "central") {
+        if (centralChangedWhileOpen) {
+          unresolved.add(identity);
+          continue;
+        }
+        if (globalItem) {
+          if (localItem && globalItemFingerprint(localItem) === currentGlobalFingerprint) synchronized.add(identity);
+          else unresolved.add(identity);
+        } else if (!localItem) {
+          synchronized.add(identity);
+        } else {
+          unresolved.add(identity);
+        }
         continue;
       }
 
       if (action) unresolved.add(identity);
     }
 
-    const deletedGlobalItems = [];
     for (const identity of managerPendingCentralDeletionIdentities) {
       const item = globalByIdentity.get(identity);
       if (!item) continue;
-      deletedGlobalItems.push(item);
-      globalByIdentity.delete(identity);
-      changedGlobal = true;
-      synchronized.add(identity);
+      deleteGlobalIdentity(identity, item);
     }
 
     if (changedGlobal) {
@@ -11074,6 +11112,7 @@
         sourceDocumentId: currentDocumentSyncId(),
         changeCount: Math.max(1, synchronized.size)
       });
+      await propagateCentralDeletionsToNextcloud(deletedGlobalItems);
     }
 
     const latestGlobalState = changedGlobal ? await loadGlobalDatabaseState() : globalState;
@@ -11088,17 +11127,23 @@
         nextSnapshot.set(identity, canonicalGlobalItem(localItem));
       }
     }
+    for (const identity of deletedGlobalIdentities) nextSnapshot.delete(identity);
     for (const identity of managerPendingCentralDeletionIdentities) nextSnapshot.delete(identity);
 
-    await Promise.all([
-      saveGlobalSyncSnapshot([...nextSnapshot.values()]),
-      saveManagerGlobalSyncDecisionLedger(session.decisionLedger || { version: 1, decisions: {} }),
-      markDocumentBibliographyPushed(source),
-      preserveCurrentDocumentPendingGlobalChanges(new Set([...unresolved]))
-    ]);
+    const hasSynchronizationWork = Boolean(
+      changedGlobal || synchronized.size || keptCentralPending.size || keptLocalOnly.size || unresolved.size || session.requiresCommit
+    );
+    if (hasSynchronizationWork) {
+      await Promise.all([
+        saveGlobalSyncSnapshot([...nextSnapshot.values()]),
+        saveManagerGlobalSyncDecisionLedger(session.decisionLedger || { version: 1, decisions: {} }),
+        markDocumentBibliographyPushed(source),
+        preserveCurrentDocumentPendingGlobalChanges(new Set([...unresolved]))
+      ]);
+    }
     deferredProjectGlobalPush = unresolved.size > 0;
-    updateGlobalComparisonPendingUi(unresolved.size);
-    for (const identity of managerPendingCentralDeletionIdentities) {
+    await notifyPageLoadGlobalDiffsImpl({ showBanner: false });
+    for (const identity of [...managerPendingCentralDeletionIdentities]) {
       managerPendingCentralDeletionIdentities.delete(identity);
     }
     return {
@@ -11109,6 +11154,7 @@
       unresolved: unresolved.size
     };
   }
+
 
 
   async function managerSaveAndReload() {
@@ -11125,9 +11171,8 @@
         await managerWriteDirtyEntries({ scheduleSync: false, fastRestore: true });
       }
 
-      // A manual Update Bib explicitly reparses all configured BibTeX files and
-      // asks again for every currently existing central/local difference,
-      // regardless of decisions remembered from prior manager openings.
+      // A manual Update Bib explicitly reparses all configured BibTeX files.
+      // One-sided changes remain automatic; true conflicts are asked again.
       await managerLoadBibliography({
         saveDirty: false,
         preserveSelectionKey: selectedKey,
@@ -11160,7 +11205,7 @@
     }
   }
 
-  async function openBibManager({ bibFileName = "", citationKey = "" } = {}) {
+  async function openBibManager({ bibFileName = "", citationKey = "", promptPendingActions = false } = {}) {
     await globalThis.SmartCitationsPrivacy.ensureAccepted();
     if (managerBusy) {
       throw new Error(managerBusyLabel || "Smart Citations is still completing another bibliography operation.");
@@ -11262,7 +11307,7 @@
       // central and synchronization-snapshot fingerprints remain unchanged.
       if (settings.syncGlobalDatabase) {
         await registerCurrentDocumentWithGlobalDatabase();
-        await prepareManagerGlobalSyncDecisions({ forceAskAll: false });
+        await prepareManagerGlobalSyncDecisions({ forceAskAll: false, promptActionable: promptPendingActions });
       }
       bibManager.querySelector(".ctca-manager-search")?.focus();
     } catch (error) {
@@ -11308,7 +11353,25 @@
     }
 
     const hasPendingBibWrites = Boolean(managerDirtyIds.size || managerDeletedDrafts.size);
-    const shouldCommitCentral = Boolean(!skipSynchronization && settings.syncGlobalDatabase && managerGlobalSyncSession);
+    const shouldCommitCentral = Boolean(
+      !skipSynchronization &&
+      settings.syncGlobalDatabase &&
+      managerGlobalSyncSession &&
+      (
+        managerGlobalSyncSession.requiresCommit ||
+        hasPendingBibWrites ||
+        managerSessionChanged ||
+        managerPendingCentralDeletionIdentities.size
+      )
+    );
+    if (!hasPendingBibWrites && !shouldCommitCentral) {
+      managerSessionChanged = false;
+      managerGlobalSyncSession = null;
+      if (returnTexFile) await restoreFile(returnTexFile, { waitForStable: false });
+      managerReturnTexFile = "";
+      bridgeRequest("focus").catch(() => {});
+      return;
+    }
     if (hasPendingBibWrites || shouldCommitCentral) {
       showDocumentBibliographyUpdateOverlay(
         hasPendingBibWrites ? "Updating bibliography in the background…" : "Updating central database…"
@@ -11316,9 +11379,9 @@
     }
     setManagerBusy(true, hasPendingBibWrites ? "Writing bibliography…" : "Updating central database…");
     try {
-      // The opening dialogs already established all transfer and conflict
-      // choices. Closing therefore performs one deterministic transaction. The
-      // project bibliography is updated only through the background document channel.
+      // One-sided changes already have deterministic actions and any true
+      // conflicts were resolved while opening. Closing performs one transaction;
+      // the project bibliography is updated only through the background channel.
       if (hasPendingBibWrites) {
         await managerWriteDirtyEntries({ scheduleSync: false, fastRestore: true });
       }
@@ -11548,7 +11611,7 @@
         acknowledgedRevision: Math.max(0, Number(raw.acknowledgedRevision) || 0),
         pendingEntryIdentities: [...new Set((Array.isArray(raw.pendingEntryIdentities) ? raw.pendingEntryIdentities : [])
           .map((identity) => String(identity || "").trim().toLowerCase())
-          .filter((identity) => identity.startsWith("key:")))],
+          .filter((identity) => identity.startsWith("doi:") || identity.startsWith("key:")))],
         registeredAt: String(raw.registeredAt || ""),
         updatedAt: String(raw.updatedAt || "")
       };
@@ -11679,7 +11742,7 @@
     const remaining = [...new Set(
       [...(identities || [])]
         .map((identity) => String(identity || "").trim().toLowerCase())
-        .filter((identity) => identity.startsWith("key:"))
+        .filter((identity) => identity.startsWith("doi:") || identity.startsWith("key:"))
     )];
     if (!remaining.length) {
       await acknowledgeCurrentDocumentGlobalChanges();
@@ -11709,7 +11772,7 @@
     } finally {
       suppressGlobalDatabaseStorageSync = false;
     }
-    updateGlobalPendingUi(remaining.length, sync.documents[documentId].pendingRevision);
+    await notifyPageLoadGlobalDiffsImpl({ showBanner: false });
     globalDocumentWasPending = true;
   }
 
@@ -11749,14 +11812,16 @@
   }
 
   function renderGlobalPendingUi() {
-    globalDocumentPendingCount = Math.max(globalDocumentFlagPendingCount, globalComparisonPendingCount);
+    globalDocumentPendingCount = globalDocumentFlagPendingCount + globalComparisonPendingCount;
     toolbarButton.classList.toggle("ctca-global-pending", globalDocumentPendingCount > 0);
     if (globalDocumentPendingCount > 0) {
       toolbarButton.dataset.globalPendingCount = globalDocumentPendingCount > 99 ? "99+" : String(globalDocumentPendingCount);
-      toolbarButton.title = `${globalDocumentPendingCount} bibliography difference${globalDocumentPendingCount === 1 ? "" : "s"} waiting to be reviewed`;
+      toolbarButton.title = `${globalDocumentPendingCount} bibliography action${globalDocumentPendingCount === 1 ? "" : "s"} waiting for review`;
+      toolbarButton.setAttribute("aria-label", `${globalDocumentPendingCount} bibliography action${globalDocumentPendingCount === 1 ? "" : "s"} waiting for review; open Smart Citations to handle them`);
     } else {
       delete toolbarButton.dataset.globalPendingCount;
       toolbarButton.title = "Open bibliography manager";
+      toolbarButton.setAttribute("aria-label", "Open Smart Citations bibliography manager");
       globalSuggestionRecords = [];
       globalSuggestionDeletedIdentities = new Set();
       globalDocumentWasPending = false;
@@ -11913,8 +11978,6 @@
     if (!settings.syncGlobalDatabase || globalDocumentFlagCheckInProgress) return null;
     globalDocumentFlagCheckInProgress = true;
     try {
-      // Change detection deliberately reads only this document's flag. Entry
-      // arrays are inspected only after the flag says that changes are pending.
       const data = await extensionApi.storage.local.get(GLOBAL_DATABASE_KEY);
       const rawDatabase = data?.[GLOBAL_DATABASE_KEY] && typeof data[GLOBAL_DATABASE_KEY] === "object"
         ? data[GLOBAL_DATABASE_KEY]
@@ -11924,31 +11987,45 @@
       let flag = sync.documents[documentId];
       if (!flag) flag = await registerCurrentDocumentWithGlobalDatabase();
       const pending = flag?.pending === true;
-      const count = pending ? Math.max(1, Number(flag.pendingCount) || 1) : 0;
-      updateGlobalPendingUi(count, flag?.pendingRevision || 0);
+
       if (pending) {
-        const managerIsApplyingChanges = Boolean(
-          managerSessionChanged ||
-          globalDatabaseSyncInProgress ||
-          documentBibliographyUpdateOverlay?.classList.contains("ctca-document-bibliography-update-visible")
-        );
         globalSuggestionRecords = (Array.isArray(rawDatabase.entries) ? rawDatabase.entries : []).map(globalItemToSuggestionRecord);
         globalSuggestionDeletedIdentities = new Set(
           normalizeGlobalDeletionTombstones(rawDatabase.deletedEntries).map((item) => item.identity)
         );
         if (popup.classList.contains("ctca-visible")) renderSuggestions();
-        // A manager edit is synchronized to the central database before the
-        // corresponding .bib write completes. During that short interval the
-        // same edit can look like an incoming global change. The close/update
-        // transaction already applies it locally, so do not prompt for it.
-        if (!globalDocumentWasPending && !managerIsApplyingChanges) {
-          // Pending central changes are surfaced when the full-window manager is
-          // opened. Normal editor work must not start synchronization dialogs.
-          globalDocumentWasPending = true;
-        }
-        // Pending central changes are displayed, but never parsed/applied merely
-        // because the user is editing or has selected a BibTeX file.
+      } else {
+        globalSuggestionRecords = [];
+        globalSuggestionDeletedIdentities = new Set();
       }
+
+      // Do not overwrite provisional choices while the manager transaction is
+      // open. Otherwise the periodic flag check would make an already answered
+      // badge reappear before the local write/central commit finishes.
+      if (!managerGlobalSyncSession) {
+        if (managerInitialOpenParsed) {
+          const [snapshotItems, ledger] = await Promise.all([
+            loadGlobalSyncSnapshot(),
+            loadManagerGlobalSyncDecisionLedger()
+          ]);
+          const allDiffs = classifyManagerGlobalDiffs(
+            globalItemsFromCurrentDocument(),
+            Array.isArray(rawDatabase.entries) ? rawDatabase.entries : [],
+            snapshotItems
+          );
+          const actionable = actionableManagerGlobalDiffs(allDiffs, ledger);
+          updateGlobalPendingUi(actionable.centralActionable.length, flag?.pendingRevision || 0);
+          updateGlobalComparisonPendingUi(actionable.conflicts.length);
+        } else {
+          // The raw pendingCount is a revision approximation, not an exact
+          // entry count. Keep the badge hidden until parsing permits a precise
+          // classification.
+          updateGlobalPendingUi(0, flag?.pendingRevision || 0);
+          updateGlobalComparisonPendingUi(0);
+        }
+      }
+
+      globalDocumentWasPending = pending;
       return flag;
     } catch (error) {
       console.warn("[Smart Citations] Could not check the global bibliography flag:", error);
@@ -12610,7 +12687,7 @@
     await saveCachedState(cachedFiles);
     await clearGlobalPendingState();
     if (settings.syncGlobalDatabase && runNow) {
-      managerSetStatus("Central synchronization enabled. Central changes are shown as previews and are applied only by Update Bib or after closing.");
+      managerSetStatus("Central synchronization enabled. One-sided additions, removals, and edits synchronize automatically; only true conflicts require a choice.");
       await registerCurrentDocumentWithGlobalDatabase();
       await checkCurrentDocumentGlobalFlag({ allowAutomaticSync: false });
       await parseBibliographyOnPageLoad().catch(() => null);
@@ -13424,14 +13501,14 @@
     const excludedImportIdentities = new Set(
       [...(excludedGlobalImportIdentities || [])]
         .map((identity) => String(identity || "").trim().toLowerCase())
-        .filter((identity) => identity.startsWith("key:"))
+        .filter((identity) => identity.startsWith("doi:") || identity.startsWith("key:"))
     );
     const locallyDeletedIdentities = new Set(
       [...(localDeletedGlobalIdentities === null
         ? managerPendingCentralDeletionIdentities
         : localDeletedGlobalIdentities || [])]
         .map((identity) => String(identity || "").trim().toLowerCase())
-        .filter((identity) => identity.startsWith("key:"))
+        .filter((identity) => identity.startsWith("doi:") || identity.startsWith("key:"))
     );
     const managerWasVisibleAtStart = bibManager.classList.contains("ctca-manager-visible");
     if (managerWasVisibleAtStart && !allowManagerSession) return null;
@@ -13997,7 +14074,8 @@
       event.preventDefault();
       event.stopPropagation();
       if (button.disabled) return;
-      openBibManager().catch((error) => {
+      const promptPendingActions = globalDocumentPendingCount > 0;
+      openBibManager({ promptPendingActions }).catch((error) => {
         const message = error?.message || String(error);
         managerSetStatus(message, true);
         showGlobalBanner(`Could not open the bibliography manager: ${message}`, {
@@ -17220,6 +17298,7 @@
 
               managerFiles = [];
               managerRecords = [];
+              managerParsedBibFingerprints = new Map();
               records = [];
               cachedFiles = [];
               resetManagerDrafts();
@@ -17285,37 +17364,42 @@
     return pageLoadBibliographyParsePromise;
   }
 
-  async function ensureBibliographyParsedForManagerOpen(requestedBibFile = "") {
-    const requested = normalizeBibFileName(requestedBibFile);
-    const requestedAlreadyLoaded = !requested || managerFiles.some((fileName) => bibSourceMatches(fileName, requested));
-    const needsFallback = !managerInitialOpenParsed || !managerFiles.length || !managerRecords.length || !requestedAlreadyLoaded;
+  function managerBibliographyParseIsStale() {
+    for (const fileName of managerFiles || []) {
+      const normalized = normalizeBibSourceName(fileName);
+      const parsedFingerprint = managerParsedBibFingerprints.get(normalized);
+      const observedEntry = [...observedBibTextByFile.entries()].find(([name]) => bibSourceMatches(name, fileName));
+      if (!observedEntry || !parsedFingerprint) continue;
+      if (contentFingerprint(String(observedEntry[1] || "")) !== parsedFingerprint) return true;
+    }
+    return false;
+  }
+
+  async function ensureBibliographyParsedForManagerOpen(_requestedBibFile = "") {
+    if (managerInitialParseState === "pending" && pageLoadBibliographyParsePromise) {
+      await pageLoadBibliographyParsePromise.catch(() => null);
+    }
+    const needsFallback = managerInitialParseState !== "success" || !managerInitialOpenParsed || managerBibliographyParseIsStale();
     if (!needsFallback) return true;
     if (managerOpenFallbackParseAttempted) return false;
 
     managerOpenFallbackParseAttempted = true;
     const returnTexFile = captureSelectedTexFile(managerReturnTexFile, managerOriginalFile, getMainDocumentName());
     try {
-      // Retry the preferred invisible reader once now that the explicit user
-      // action confirms that the editor has finished loading.
       await parseBibliographyOnPageLoad({ force: true, maxAttempts: 1 });
-      const requestedLoadedAfterRetry = !requested || managerFiles.some((fileName) => bibSourceMatches(fileName, requested));
-      if (managerInitialOpenParsed && managerFiles.length && managerRecords.length && requestedLoadedAfterRetry) {
+      if (managerInitialParseState === "success" && managerInitialOpenParsed) {
         await notifyPageLoadGlobalDiffs({ showBanner: false });
         return true;
       }
 
-      // Compatibility fallback: open the actual .bib file in the normal source
-      // editor, parse it, and unconditionally return to the prior TeX file. This
-      // path is used only on an explicit manager opening after background parsing
-      // failed; it is never triggered by ordinary editor activity.
       const discovery = await discoverBibliographyFilesForParsing({
-        requestedBibFile: requested,
         allowVisibleMainDocument: true
       });
       if (!discovery.files.length) {
         if (discovery.backgroundError) throw discovery.backgroundError;
         managerFiles = [];
         managerRecords = [];
+        managerParsedBibFingerprints = new Map();
         records = [];
         resetManagerDrafts();
         managerInitialOpenParsed = true;
@@ -17353,6 +17437,7 @@
       updateToolbarButtonState();
     }
   }
+
 
   async function initializeBackgroundBibWriteWorker(jobId) {
     const startedAt = Date.now();

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Smart Citations",
-  "version": "2.2.19",
-  "description": "Smart Citations provides citation autocomplete, BibTeX management, optional bibliography and PDF synchronization, and Collabtex/Overleaf integration.",
+  "version": "2.2.20",
+  "description": "Smart Citations provides citation autocomplete, BibTeX management, PDF synchronization, and Collabtex integration.",
   "permissions": [
     "storage",
     "tabs",
